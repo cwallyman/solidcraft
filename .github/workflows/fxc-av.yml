@@ -1,0 +1,62 @@
+name: FXC access violation hunt
+on:
+  push:
+    branches: [investigate-fxc-av]
+jobs:
+  hunt:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        threads: ["4", "1"]
+    env:
+      WGPU_BACKEND: dx12
+      WGPU_DX12_COMPILER: fxc
+      SOLIDCRAFT_REQUIRE_GPU: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-fxc
+      - name: Enable local crash dumps
+        shell: pwsh
+        run: |
+          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Force $k | Out-Null
+          New-Item -ItemType Directory -Force D:\dumps | Out-Null
+          Set-ItemProperty $k DumpFolder 'D:\dumps' -Type ExpandString
+          Set-ItemProperty $k DumpType 2 -Type DWord
+          Set-ItemProperty $k DumpCount 5 -Type DWord
+      - name: Build
+        run: cargo test -p solidcraft-gpu --profile ci --locked --no-run
+      - name: Loop
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem target\ci\deps\solidcraft_gpu-*.exe | Sort-Object LastWriteTime | Select-Object -Last 1
+          $fails = 0
+          for ($i = 1; $i -le 150; $i++) {
+            & $exe.FullName --test-threads=${{ matrix.threads }} --nocapture *> "D:\dumps\run-$i.log"
+            if ($LASTEXITCODE -ne 0) {
+              $fails++
+              Write-Host ("run {0}: exit 0x{1:x}" -f $i, $LASTEXITCODE)
+              Get-Content "D:\dumps\run-$i.log" | Select-Object -Last 30
+            }
+          }
+          Write-Host "failures: $fails / 150"
+      - name: Analyze dumps
+        if: always()
+        shell: pwsh
+        run: |
+          $cdb = Get-ChildItem -Recurse 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "cdb: $cdb"
+          Get-ChildItem D:\dumps\*.dmp -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "=== $($_.Name)"
+            if ($cdb) { & $cdb.FullName -z $_.FullName -y "srv*D:\sym*https://msdl.microsoft.com/download/symbols;$PWD\target\ci\deps" -c ".ecxr; kn 40; ~*kn 15; !analyze -v; q" | Select-Object -Last 400 }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dumps-${{ matrix.threads }}
+          path: D:\dumps
