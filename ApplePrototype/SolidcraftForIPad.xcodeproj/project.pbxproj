@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		114FF4F3CEAA0DFB1A934C0B /* SolidCraftTestApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33E04B5155B59B17796388FC /* SolidCraftTestApp.swift */; };
+		114FF4F3CEAA0DFB1A934C0B /* SolidcraftForIPadApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33E04B5155B59B17796388FC /* SolidcraftForIPadApp.swift */; };
 		490F6DF581CD92D13BFBF890 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 31B3554CD46870D02E2874BF /* Assets.xcassets */; };
 		5EA56C8A39F7DE3625B67945 /* Web in Resources */ = {isa = PBXBuildFile; fileRef = CCF4CCF0216BEA77F4EEC65A /* Web */; };
 		796DCFF10806486240B7E192 /* input.js in Resources */ = {isa = PBXBuildFile; fileRef = 57DF1F1DF59A1FA77DBDF371 /* input.js */; };
@@ -24,16 +24,16 @@
 			containerPortal = 12F7669DABEEBC0CF1F44B27 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 637BE2EC8A92BDB3E2878B16;
-			remoteInfo = SolidCraftTest;
+			remoteInfo = SolidcraftForIPad;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		31B3554CD46870D02E2874BF /* Assets.xcassets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		31DD8330276BEE09E6650C81 /* SolidCraftTest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SolidCraftTest.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		33E04B5155B59B17796388FC /* SolidCraftTestApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SolidCraftTestApp.swift; sourceTree = "<group>"; };
+		31DD8330276BEE09E6650C81 /* SolidcraftForIPad.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SolidcraftForIPad.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		33E04B5155B59B17796388FC /* SolidcraftForIPadApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SolidcraftForIPadApp.swift; sourceTree = "<group>"; };
 		57DF1F1DF59A1FA77DBDF371 /* input.js */ = {isa = PBXFileReference; includeInIndex = 1; path = input.js; sourceTree = "<group>"; };
-		658690B98BF8BD44B164B0F3 /* SolidCraftTestUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SolidCraftTestUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		658690B98BF8BD44B164B0F3 /* SolidcraftForIPadUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SolidcraftForIPadUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		6935AD452CF2D40EC605CDB5 /* RuntimeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RuntimeTests.swift; sourceTree = "<group>"; };
 		6CB1813EDA571148C6E3DD07 /* LocalWebServer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalWebServer.swift; sourceTree = "<group>"; };
 		B254DB6A11ED44C3ED476B68 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
@@ -64,24 +64,24 @@
 		1970DD7A2C2E263AF98F4B13 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				31DD8330276BEE09E6650C81 /* SolidCraftTest.app */,
-				658690B98BF8BD44B164B0F3 /* SolidCraftTestUITests.xctest */,
+				31DD8330276BEE09E6650C81 /* SolidcraftForIPad.app */,
+				658690B98BF8BD44B164B0F3 /* SolidcraftForIPadUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
-		25E03F0D52AF57DBEDEADE11 /* SolidCraftTest */ = {
+		25E03F0D52AF57DBEDEADE11 /* SolidcraftForIPad */ = {
 			isa = PBXGroup;
 			children = (
 				6CB1813EDA571148C6E3DD07 /* LocalWebServer.swift */,
-				33E04B5155B59B17796388FC /* SolidCraftTestApp.swift */,
+				33E04B5155B59B17796388FC /* SolidcraftForIPadApp.swift */,
 				57DF1F1DF59A1FA77DBDF371 /* input.js */,
 				BA1BADFFE320CB64B29E2CDD /* bridge.js */,
 				31B3554CD46870D02E2874BF /* Assets.xcassets */,
 				CCF4CCF0216BEA77F4EEC65A /* Web */,
 			);
-			name = SolidCraftTest;
-			path = SolidCraftTest;
+			name = SolidcraftForIPad;
+			path = SolidcraftForIPad;
 			sourceTree = "<group>";
 		};
 		3439C86292B7834B6BEE7F81 /* iOS */ = {
@@ -97,8 +97,8 @@
 			children = (
 				1970DD7A2C2E263AF98F4B13 /* Products */,
 				6734D96CA257B1F350C7A740 /* Frameworks */,
-				25E03F0D52AF57DBEDEADE11 /* SolidCraftTest */,
-				C393C09D6DD5D0BC5D4391BD /* SolidCraftTestUITests */,
+				25E03F0D52AF57DBEDEADE11 /* SolidcraftForIPad */,
+				C393C09D6DD5D0BC5D4391BD /* SolidcraftForIPadUITests */,
 			);
 			sourceTree = "<group>";
 		};
@@ -110,21 +110,21 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		C393C09D6DD5D0BC5D4391BD /* SolidCraftTestUITests */ = {
+		C393C09D6DD5D0BC5D4391BD /* SolidcraftForIPadUITests */ = {
 			isa = PBXGroup;
 			children = (
 				6935AD452CF2D40EC605CDB5 /* RuntimeTests.swift */,
 			);
-			name = SolidCraftTestUITests;
-			path = SolidCraftTestUITests;
+			name = SolidcraftForIPadUITests;
+			path = SolidcraftForIPadUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		637BE2EC8A92BDB3E2878B16 /* SolidCraftTest */ = {
+		637BE2EC8A92BDB3E2878B16 /* SolidcraftForIPad */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 864AEFD6CBD554E9B00884DE /* Build configuration list for PBXNativeTarget "SolidCraftTest" */;
+			buildConfigurationList = 864AEFD6CBD554E9B00884DE /* Build configuration list for PBXNativeTarget "SolidcraftForIPad" */;
 			buildPhases = (
 				4784F31C03B9CACE5B198010 /* Sources */,
 				F5DED4CFA9B5AD8358B5682E /* Frameworks */,
@@ -134,14 +134,14 @@
 			);
 			dependencies = (
 			);
-			name = SolidCraftTest;
-			productName = SolidCraftTest;
-			productReference = 31DD8330276BEE09E6650C81 /* SolidCraftTest.app */;
+			name = SolidcraftForIPad;
+			productName = SolidcraftForIPad;
+			productReference = 31DD8330276BEE09E6650C81 /* SolidcraftForIPad.app */;
 			productType = "com.apple.product-type.application";
 		};
-		8D5D68A45B0C7E56989B7E7C /* SolidCraftTestUITests */ = {
+		8D5D68A45B0C7E56989B7E7C /* SolidcraftForIPadUITests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 66292AC2827B0EC141C5FE13 /* Build configuration list for PBXNativeTarget "SolidCraftTestUITests" */;
+			buildConfigurationList = 66292AC2827B0EC141C5FE13 /* Build configuration list for PBXNativeTarget "SolidcraftForIPadUITests" */;
 			buildPhases = (
 				7D5564E3E7BD8566FE8421D5 /* Sources */,
 				425F6AB2B6C99830D36ADD0D /* Frameworks */,
@@ -152,9 +152,9 @@
 			dependencies = (
 				13DA9C16277364BAA26B5A7E /* PBXTargetDependency */,
 			);
-			name = SolidCraftTestUITests;
-			productName = SolidCraftTestUITests;
-			productReference = 658690B98BF8BD44B164B0F3 /* SolidCraftTestUITests.xctest */;
+			name = SolidcraftForIPadUITests;
+			productName = SolidcraftForIPadUITests;
+			productReference = 658690B98BF8BD44B164B0F3 /* SolidcraftForIPadUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
 /* End PBXNativeTarget section */
@@ -166,7 +166,7 @@
 				LastSwiftUpdateCheck = 1600;
 				LastUpgradeCheck = 1600;
 			};
-			buildConfigurationList = D80A3174332B0B5117A01559 /* Build configuration list for PBXProject "SolidCraftTest" */;
+			buildConfigurationList = D80A3174332B0B5117A01559 /* Build configuration list for PBXProject "SolidcraftForIPad" */;
 			compatibilityVersion = "Xcode 3.2";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -181,8 +181,8 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				637BE2EC8A92BDB3E2878B16 /* SolidCraftTest */,
-				8D5D68A45B0C7E56989B7E7C /* SolidCraftTestUITests */,
+				637BE2EC8A92BDB3E2878B16 /* SolidcraftForIPad */,
+				8D5D68A45B0C7E56989B7E7C /* SolidcraftForIPadUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -214,7 +214,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				EE3A9CC7872042F45F59AD2B /* LocalWebServer.swift in Sources */,
-				114FF4F3CEAA0DFB1A934C0B /* SolidCraftTestApp.swift in Sources */,
+				114FF4F3CEAA0DFB1A934C0B /* SolidcraftForIPadApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -231,8 +231,8 @@
 /* Begin PBXTargetDependency section */
 		13DA9C16277364BAA26B5A7E /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			name = SolidCraftTest;
-			target = 637BE2EC8A92BDB3E2878B16 /* SolidCraftTest */;
+			name = SolidcraftForIPad;
+			target = 637BE2EC8A92BDB3E2878B16 /* SolidcraftForIPad */;
 			targetProxy = 34E77FB31AAFDC3B4F75BD06 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -300,11 +300,11 @@
 				DEVELOPMENT_TEAM = D58RZM4K8N;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidCraftTestUITests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidcraftForIPadUITests;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 2;
-				TEST_TARGET_NAME = SolidCraftTest;
+				TEST_TARGET_NAME = SolidcraftForIPad;
 				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
@@ -378,11 +378,11 @@
 				DEVELOPMENT_TEAM = D58RZM4K8N;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidCraftTestUITests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidcraftForIPadUITests;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 2;
-				TEST_TARGET_NAME = SolidCraftTest;
+				TEST_TARGET_NAME = SolidcraftForIPad;
 			};
 			name = Debug;
 		};
@@ -398,13 +398,13 @@
 				DEVELOPMENT_TEAM = D58RZM4K8N;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = SolidCraftTest/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "SolidCraft Test";
+				INFOPLIST_FILE = SolidcraftForIPad/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Solidcraft for iPad";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidCraftTest;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidcraftForIPad;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = YES;
 				SWIFT_VERSION = 5.0;
@@ -424,13 +424,13 @@
 				DEVELOPMENT_TEAM = D58RZM4K8N;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = SolidCraftTest/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "SolidCraft Test";
+				INFOPLIST_FILE = SolidcraftForIPad/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Solidcraft for iPad";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidCraftTest;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cwallyman.SolidcraftForIPad;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = YES;
 				SWIFT_VERSION = 5.0;
@@ -442,7 +442,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		66292AC2827B0EC141C5FE13 /* Build configuration list for PBXNativeTarget "SolidCraftTestUITests" */ = {
+		66292AC2827B0EC141C5FE13 /* Build configuration list for PBXNativeTarget "SolidcraftForIPadUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				5EED397C7F43812CC0DA0869 /* Release */,
@@ -451,7 +451,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		864AEFD6CBD554E9B00884DE /* Build configuration list for PBXNativeTarget "SolidCraftTest" */ = {
+		864AEFD6CBD554E9B00884DE /* Build configuration list for PBXNativeTarget "SolidcraftForIPad" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				BC18669F231BC83BF83CDF7A /* Release */,
@@ -460,7 +460,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		D80A3174332B0B5117A01559 /* Build configuration list for PBXProject "SolidCraftTest" */ = {
+		D80A3174332B0B5117A01559 /* Build configuration list for PBXProject "SolidcraftForIPad" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				8D8255ADE974944C3740EE3C /* Debug */,

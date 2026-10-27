@@ -31,7 +31,7 @@ Goal: run SolidCraft on the iPad as native Rust that draws with Metal, with no W
   - It owns an `egui::Context`, `ui_egui::SolveApp`, and an `egui_wgpu::Renderer` on a wgpu Metal surface made from a `CAMetalLayer`.
   - It copies the per-frame logic from `apps/solidcraft-web/src/main.rs` (`logic()`, `apple_touch::update`, `apply_roll`). The JS and wasm parts are dropped.
   - It exposes a small C ABI, `sc_*`, declared in `solidcraft_ios.h`.
-- **Swift**: a new Xcode target, `SolidCraftNative`, with bundle id `com.cwallyman.SolidCraftNative`, so it installs beside the current app.
+- **Swift**: a new Xcode target, `SolidcraftForIPadNative`, with bundle id `com.cwallyman.SolidcraftForIPadNative`, so it installs beside the current app.
   - A `UIViewController` hosts a `CAMetalLayer` view, driven by `CADisplayLink`.
   - It turns UIKit touches, Pencil, hover, keyboard and document pickers into `sc_*` calls.
 - **Build**:
@@ -67,14 +67,14 @@ Each phase lists **who**, what to **read**, what to **do**, and what the **user 
   1. Create the `solidcraft-ios` crate with these functions: `sc_create(layer, width_px, height_px, scale) -> *mut App`, `sc_resize`, `sc_frame`, `sc_destroy`.
   2. Load the sample document the way `?sample` does.
   3. Write the build script.
-  4. Add the `SolidCraftNative` Xcode target: Swift host, a bridging header, and linking to the `.a` file plus the Metal and QuartzCore frameworks.
+  4. Add the `SolidcraftForIPadNative` Xcode target: Swift host, a bridging header, and linking to the `.a` file plus the Metal and QuartzCore frameworks.
   5. Build and install.
 - **User tests**: the app opens and shows the ribbon, browser and the sample model, correctly sized and sharp.
 
 ### Phase 2: fingers and Pencil
 - **Who**: Claude Code.
 - **Read**:
-  - `ApplePrototype/SolidCraftTest/input.js`: the gesture rules to port
+  - `ApplePrototype/SolidcraftForIPad/input.js`: the gesture rules to port
   - `crates/ui-egui/src/apple_touch.rs`
   - the Phase 1 Swift host
 - **Do**:
@@ -106,7 +106,7 @@ Each phase lists **who**, what to **read**, what to **do**, and what the **user 
 - **Read**:
   - `apps/solidcraft-web/src/files.rs`
   - the `ui-egui` `disk` module and its `FilePickerFuture`
-  - `ApplePrototype/SolidCraftTest/bridge.js`: what the current app supports
+  - `ApplePrototype/SolidcraftForIPad/bridge.js`: what the current app supports
 - **Do**:
   - Write a native `disk` backend:
     - Rust asks Swift through a callback to show a `UIDocumentPickerViewController` (open or import, with the allowed types).
@@ -152,7 +152,7 @@ Each phase lists **who**, what to **read**, what to **do**, and what the **user 
 ### Phase 8: switch over
 - **Who**: Codex.
 - **Do**:
-  - Make `SolidCraftNative` the main target.
+  - Make `SolidcraftForIPadNative` the main target.
   - Delete `LocalWebServer.swift`, the WKWebView view, `input.js`, `bridge.js`, the `Web/` bundle and the web build scripts.
   - Point `archive-release.sh` at the native target. Release builds use `lto = true` and `codegen-units = 1`.
   - Update the README, keeping the license notices.

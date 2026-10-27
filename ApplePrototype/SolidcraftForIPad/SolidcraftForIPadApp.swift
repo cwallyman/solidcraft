@@ -4,7 +4,7 @@ import Combine
 import UniformTypeIdentifiers
 
 @main
-struct SolidCraftTestApp: App {
+struct SolidcraftForIPadApp: App {
     @StateObject private var model = CADModel()
     var body: some Scene {
         WindowGroup { CADView(model: model) }

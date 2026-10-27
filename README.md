@@ -1,4 +1,4 @@
-# ipad-solidcraft
+# Solidcraft for iPad
 
 The maintained iPad branch is [cwallyman/solidcraft → ipad-solidcraft](https://github.com/cwallyman/solidcraft/tree/ipad-solidcraft), a fork of the original project. The separate `cwallyman/ipad-solidcraft` repository is retained as an archived backup.
 
@@ -8,7 +8,7 @@ Clone this branch to get the iPad app:
 git clone --branch ipad-solidcraft https://github.com/cwallyman/solidcraft.git
 ```
 
-An installed iPad prototype of [SolidCraft](https://github.com/tangency-labs/solidcraft), using a SwiftUI/WKWebView shell and a bundled Rust/WebAssembly CAD engine. Modeling runs locally on the iPad.
+**Solidcraft for iPad** is an iPad adaptation of [SolidCraft](https://github.com/tangency-labs/solidcraft), using a SwiftUI/WKWebView shell and a bundled Rust/WebAssembly CAD engine. Modeling runs locally on the iPad.
 
 [View the iPad screenshot gallery](docs/screenshots/ipad/README.md).
 
@@ -19,7 +19,7 @@ An installed iPad prototype of [SolidCraft](https://github.com/tangency-labs/sol
 - `ApplePrototype/`: Xcode app, Pencil/finger/mouse input bridge, native Files support, build scripts and implementation notes.
 - `upstream-solidcraft/`: the original SolidCraft source and our iPad adaptations, retained as a Git subtree with upstream history.
 
-Open `ApplePrototype/SolidCraftTest.xcodeproj` and select your own signing team to run on an iPad. A current bundled engine is included. Rebuild it after Rust changes:
+Open `ApplePrototype/SolidcraftForIPad.xcodeproj` and select your own signing team to run on an iPad. A current bundled engine is included. Rebuild it after Rust changes:
 
 ```sh
 bash ApplePrototype/scripts/build-local-web.sh
@@ -40,18 +40,19 @@ bash ApplePrototype/scripts/build-release-web.sh
 bash ApplePrototype/scripts/archive-release.sh
 ```
 
-The archive script refuses to run unless the App Store engine is bundled. It writes `ApplePrototype/build/SolidCraftTest.xcarchive`; open it in Xcode's Organizer to validate and upload. Bump `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` in Xcode before each upload, and run `build-local-web.sh` afterwards to return to the quick engine.
+The archive script refuses to run unless the App Store engine is bundled. It writes `ApplePrototype/build/SolidcraftForIPad.xcarchive`; open it in Xcode's Organizer to validate and upload. Bump `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` in Xcode before each upload, and run `build-local-web.sh` afterwards to return to the quick engine.
 
 ## Current iPad behavior
 
-- One finger orbits; two fingers pan and pinch to zoom. Finger gestures also operate interface controls.
+- One finger orbits, two fingers pan, pinch zooms and a two-finger twist rotates the view. These work whatever navigation preset is chosen; the **iPad Touch** preset (the default on iPad) describes them. Finger gestures also operate interface controls.
+- Swipe to scroll any scrollable panel or list; tapping outside the File menu or command search closes it.
 - Pencil hover shows button names. The user confirmed it works on the physical iPad.
 - Select a sketch tool, press and drag with Pencil, then lift to place the next point. Multi-point shapes retain their remaining stages.
 - Pencil taps add or remove individual selections; a tap in empty model space clears all selections. Mouse clicks replace selection; Shift-click adds/removes.
 - Toolbar dropdowns close on a second tap/click. The browser folder toggle has no B overlay.
-- Native Files handles supported imports; large DXFs can be split into editable layer parts. Faceted mesh conversion rebuilds accepted closed mesh shells as separate CAD bodies.
+- Native Files handles supported imports; large DXFs can be split into editable layer parts. Faceted mesh conversion (up to 25,000 triangles) rebuilds accepted closed mesh shells as separate CAD bodies.
 
-See [the full implementation handoff](ApplePrototype/IPAD_APP_IMPLEMENTATION.md), [app instructions](ApplePrototype/README.md), and [verification results](ApplePrototype/verification/RESULTS.md) for details and limitations. Build/install success does not establish physical validation of every interaction. This is a development prototype, not an App Store release.
+See [the full implementation handoff](ApplePrototype/IPAD_APP_IMPLEMENTATION.md), [app instructions](ApplePrototype/README.md), and [verification results](ApplePrototype/verification/RESULTS.md) for details and limitations. Build/install success does not establish physical validation of every interaction. This is a development build; App Store release scripts exist but nothing has been submitted. A move to a native Rust/Metal app (no WebView) is planned in [NATIVE_IOS_PLAN.md](ApplePrototype/NATIVE_IOS_PLAN.md), to be built on branch `native-ios-solidcraft`.
 
 ## Updating from the original developer
 

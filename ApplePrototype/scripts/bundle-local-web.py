@@ -9,7 +9,7 @@ import subprocess
 prototype = Path(__file__).resolve().parents[1]
 upstream = prototype.parent / "upstream-solidcraft"
 source = upstream / "dist/web"
-destination = prototype / "SolidCraftTest/Web"
+destination = prototype / "SolidcraftForIPad/Web"
 backup = prototype / "prebuilt-web-backup"
 if not (source / "index.html").is_file() or not list(source.glob("*.wasm")):
     raise SystemExit("Compile the local web target before bundling it.")

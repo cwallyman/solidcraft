@@ -24,7 +24,7 @@ function harness() {
   const window = {addEventListener(type, fn) { windowListeners.set(type,fn); }, solidcraftRequirePencil:true,
     wasmBindings:{touch_set_pencil:value => inputSources.push(value)},
     solidcraftIsModelPoint:p => modelHit(p), solidcraftAlignFace:p => aligned.push(p)};
-  vm.runInNewContext(fs.readFileSync(require('node:path').join(__dirname,'../SolidCraftTest/input.js'),'utf8'),
+  vm.runInNewContext(fs.readFileSync(require('node:path').join(__dirname,'../SolidcraftForIPad/input.js'),'utf8'),
     {window,MouseEvent:Event,PointerEvent:Event,WheelEvent:Event,Map,Math});
   window.installSolidcraftInput(canvas, report => reports.push(report));
   const input = (type, id, x, y, pointerType = 'touch') => canvas.dispatchEvent(new Event(type,

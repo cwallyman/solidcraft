@@ -1,4 +1,4 @@
-# SolidCraft iPad app — complete implementation handoff
+# Solidcraft for iPad — complete implementation handoff
 
 Documented October 13, 2026; updated October 14, 2026. This report describes the current local implementation, the changes recorded during development, the screen-layout correction, and the October 14 Pencil/mouse interaction updates. It is based on the source, build scripts, README, and `verification/RESULTS.md`. Historical test results below are recorded results; they were not all rerun when this document was written.
 
@@ -10,9 +10,9 @@ The app uses a small HTTP server bound to the iPad's own loopback address to loa
 
 | Item | Current implementation |
 | --- | --- |
-| App display name | SolidCraft Test |
-| Bundle identifier | `com.cwallyman.SolidCraftTest` |
-| Xcode project and scheme | `SolidCraftTest.xcodeproj` / `SolidCraftTest` |
+| App display name | Solidcraft for iPad |
+| Bundle identifier | `com.cwallyman.SolidcraftForIPad` |
+| Xcode project and scheme | `SolidcraftForIPad.xcodeproj` / `SolidcraftForIPad` |
 | Deployment target | iOS 17.0 |
 | Device family | iPad |
 | Physical development device | iPad Air 11-inch (M3) |
@@ -42,7 +42,7 @@ We retained the working Rust modeling engine and command architecture. The Apple
 
 ## 3. SwiftUI and WebKit shell
 
-`SolidCraftTest/SolidCraftTestApp.swift` defines the application, the SwiftUI CAD view, the `UIViewRepresentable` wrapper, and `CADModel`.
+`SolidcraftForIPad/SolidcraftForIPadApp.swift` defines the application, the SwiftUI CAD view, the `UIViewRepresentable` wrapper, and `CADModel`.
 
 The model creates and retains one WKWebView with a persistent WebKit data store. JavaScript injection happens at document start, before the web app initializes. The shell installs the `solidcraft` script-message handler and loads the two bundled bridge scripts.
 
@@ -60,7 +60,7 @@ The original native top bar was removed, including its title, instructions, stat
 
 ## 4. Local asset server and offline startup
 
-`SolidCraftTest/LocalWebServer.swift` uses Apple's Network framework to serve the bundled web assets from `127.0.0.1:18784`.
+`SolidcraftForIPad/LocalWebServer.swift` uses Apple's Network framework to serve the bundled web assets from `127.0.0.1:18784`.
 
 The launch URL is:
 
@@ -78,7 +78,7 @@ The Info.plist permits local networking and web-content loads needed by this HTT
 
 The prototype initially used the upstream published web build. That original asset set is preserved in `prebuilt-web-backup/`. We then moved to a locally compiled web target so the Apple-specific behavior could be changed in Rust.
 
-The recorded source base is upstream commit `2bb24d1`; the exact base revision and bundled file hashes are captured in `SolidCraftTest/Web/asset-manifest.json`. The manifest marks the build as modified source. A base commit alone does not reproduce the local modifications: retain the working source changes as well.
+The source was imported at upstream commit `2bb24d1` and merged with upstream release v0.24.0 (`5965439`); the exact base revision and bundled file hashes are captured in `SolidcraftForIPad/Web/asset-manifest.json`. The manifest marks the build as modified source. A base commit alone does not reproduce the local modifications: retain the working source changes as well.
 
 `scripts/build-local-web.sh`:
 
@@ -185,7 +185,7 @@ The export bridge intercepts Blob-backed download anchors, reads their bytes, an
 Documents/Exports/<unique-id>/<filename>
 ```
 
-Each export gets a unique folder to avoid collisions. The JavaScript export limit is 128 MB, and Swift also bounds encoded messages before decoding. Files sharing and document-opening support are enabled in Info.plist. Users can retrieve exports from Files under On My iPad → SolidCraft Test.
+Each export gets a unique folder to avoid collisions. The JavaScript export limit is 128 MB, and Swift also bounds encoded messages before decoding. Files sharing and document-opening support are enabled in Info.plist. Users can retrieve exports from Files under On My iPad → Solidcraft for iPad.
 
 The real engine workflow was verified by changing sample thickness from 8 to 16 mm, saving, reopening, and exporting JSON. The returned 9,341-byte JSON was parsed and contained `16 mm` exactly. This proves that recorded engine workflow; it does not establish every export format or every on-screen editing dialog.
 
@@ -249,19 +249,19 @@ Paths in this section are relative to the workspace root.
 
 | File or directory | Purpose/change |
 | --- | --- |
-| `ApplePrototype/SolidCraftTest/SolidCraftTestApp.swift` | SwiftUI shell, WebView, native picker/export, diagnostics, final safe-area behavior |
-| `ApplePrototype/SolidCraftTest/LocalWebServer.swift` | Loopback-only bundled asset service |
-| `ApplePrototype/SolidCraftTest/input.js` | Finger/Pencil routing and stable navigation gestures |
-| `ApplePrototype/SolidCraftTest/bridge.js` | Native Files shim, Blob exports, runtime/layout bridge, workflow harness |
-| `ApplePrototype/SolidCraftTest/Info.plist` | Files sharing, document access, orientations, web/local networking settings |
-| `ApplePrototype/SolidCraftTest/Web/` | Locally compiled web engine and licensed assets |
+| `ApplePrototype/SolidcraftForIPad/SolidcraftForIPadApp.swift` | SwiftUI shell, WebView, native picker/export, diagnostics, final safe-area behavior |
+| `ApplePrototype/SolidcraftForIPad/LocalWebServer.swift` | Loopback-only bundled asset service |
+| `ApplePrototype/SolidcraftForIPad/input.js` | Finger/Pencil routing and stable navigation gestures |
+| `ApplePrototype/SolidcraftForIPad/bridge.js` | Native Files shim, Blob exports, runtime/layout bridge, workflow harness |
+| `ApplePrototype/SolidcraftForIPad/Info.plist` | Files sharing, document access, orientations, web/local networking settings |
+| `ApplePrototype/SolidcraftForIPad/Web/` | Locally compiled web engine and licensed assets |
 | `ApplePrototype/prebuilt-web-backup/` | Original downloaded web asset backup |
 | `ApplePrototype/scripts/build-local-web.sh` | Trunk release build for the Apple bundle |
 | `ApplePrototype/scripts/bundle-local-web.py` | Resource replacement, license copying, asset hashes |
-| `ApplePrototype/scripts/build-and-install.sh` | Signed device build, install, launch |
+| `ApplePrototype/scripts/build-and-install.sh` | Signed device build and install (does not launch) |
 | `ApplePrototype/scripts/create-project.rb` | Initial Xcode project generator |
 | `ApplePrototype/scripts/input-tests.cjs` | JavaScript input regression coverage |
-| `ApplePrototype/SolidCraftTestUITests/RuntimeTests.swift` | Real-device runtime, UI, workflow, and import checks |
+| `ApplePrototype/SolidcraftForIPadUITests/RuntimeTests.swift` | Real-device runtime, UI, workflow, and import checks |
 | `ApplePrototype/verification/RESULTS.md` | Historical verification results and limits |
 | `upstream-solidcraft/apps/solidcraft-web/src/files.rs` | Native structural-handle validation and byte import |
 | `upstream-solidcraft/apps/solidcraft-web/src/main.rs` | Apple mode, WASM bridge exports, native Open/Insert routing, import warnings |
@@ -297,15 +297,15 @@ bash scripts/build-and-install.sh <IPAD_UDID>
 The installation script runs:
 
 ```bash
-xcodebuild -project SolidCraftTest.xcodeproj -scheme SolidCraftTest \
+xcodebuild -project SolidcraftForIPad.xcodeproj -scheme SolidcraftForIPad \
   -configuration Debug -destination "id=<IPAD_UDID>" \
   -derivedDataPath build -allowProvisioningUpdates build
 
 xcrun devicectl device install app --device <IPAD_UDID> \
-  build/Build/Products/Debug-iphoneos/SolidCraftTest.app
+  build/Build/Products/Debug-iphoneos/SolidcraftForIPad.app
 
 xcrun devicectl device process launch --device <IPAD_UDID> \
-  com.cwallyman.SolidCraftTest
+  com.cwallyman.SolidcraftForIPad
 ```
 
 For a Swift-only shell change, the existing bundled web output can be reused. Development signing and an available paired iPad are required. Avoid uninstalling the app when updating because saved work belongs to its existing container.
@@ -313,7 +313,7 @@ For a Swift-only shell change, the existing bundled web output can be reused. De
 Optional Mac Catalyst compilation check:
 
 ```bash
-xcodebuild -project SolidCraftTest.xcodeproj -scheme SolidCraftTest \
+xcodebuild -project SolidcraftForIPad.xcodeproj -scheme SolidcraftForIPad \
   -destination 'platform=macOS,variant=Mac Catalyst' \
   CODE_SIGNING_ALLOWED=NO REGISTER_APP_WITH_LAUNCH_SERVICES=NO build
 ```
@@ -378,7 +378,7 @@ For underlying historical evidence and revision-specific caveats, retain `verifi
 
 Convert Mesh now offers two methods. Prismatic retains the existing constant-section analytic reconstruction. Faceted repairs duplicate triangles, separates touching closed shells, normalizes shell directions, and rebuilds each accepted shell as its own CAD body. Adjacent coplanar triangles are merged; curved mesh regions retain planar facets. One timeline conversion feature owns all resulting bodies, and undo restores the original mesh.
 
-The new method handles up to 5,000 input triangles and 256 shells. It refuses open/non-manifold shells and potential nested inward cavity shells. It does not patch holes, fuse overlapping parts, or recreate the original modeling history. The source STL is not changed.
+The new method handles up to 25,000 input triangles and 256 shells. It refuses open/non-manifold shells and potential nested inward cavity shells. It does not patch holes, fuse overlapping parts, or recreate the original modeling history. The source STL is not changed.
 
 The supplied locomotive STL converted into 38 CAD bodies with 436 faces. Saved-design reopening preserved that result. STEP export produced 38 `MANIFOLD_SOLID_BREP` entries and no `BREP_WITH_VOIDS`; reimport returned 38 valid bodies without warnings. Five engine conversion tests passed, including that actual-file round trip. The sum of outward-shell volumes was approximately 216.368055 mm³; overlapping parts are not fused, so this is not a union-volume claim.
 
@@ -397,7 +397,7 @@ Pencil taps add sketch lines, edges and faces to the current selection without a
 
 Mouse clicks replace the selection. Shift-click adds or removes an item using the existing mouse modifier behavior. The former iPad mouse-selection gate was removed. Pencil identity is passed separately through the WASM bridge rather than emulating a held Shift key, preserving drawing and navigation behavior. Accepted mouse/finger input resets the source appropriately; ignored palm input during Pencil contact does not reset it.
 
-Implementation: `SolidCraftTest/input.js`, `apps/solidcraft-web/src/main.rs` (`touch_set_pencil`), `crates/ui-egui/src/apple_touch.rs`, and `crates/ui-egui/src/viewport.rs` (`select_input`). Rust paths are relative to the sibling `upstream-solidcraft` checkout.
+Implementation: `SolidcraftForIPad/input.js`, `apps/solidcraft-web/src/main.rs` (`touch_set_pencil`), `crates/ui-egui/src/apple_touch.rs`, and `crates/ui-egui/src/viewport.rs` (`select_input`). Rust paths are relative to the sibling `upstream-solidcraft` checkout.
 
 ### Pencil hover button names
 
@@ -405,7 +405,7 @@ The Swift shell installs a Pencil-only `UIHoverGestureRecognizer` and forwards i
 
 The first installed attempt did not work according to the user. After the routing, gesture-recognition and cursor-stability fixes, the user explicitly reported **“works now.”** This confirms physical Pencil hover button labels for that revision; it does not establish pressure-sensitive tools or every subsequent interaction change.
 
-A first hover event reaching the input bridge writes `Documents/pencil-hover-check.txt`. This diagnostic is event-delivery evidence, not proof that a particular tooltip rendered. Implementation: `SolidCraftTestApp.swift`, `input.js`, and `scripts/input-tests.cjs`.
+A first hover event reaching the input bridge writes `Documents/pencil-hover-check.txt`. This diagnostic is event-delivery evidence, not proof that a particular tooltip rendered. Implementation: `SolidcraftForIPadApp.swift`, `input.js`, and `scripts/input-tests.cjs`.
 
 ### Toolbar dropdown toggling
 
@@ -465,3 +465,21 @@ The maintained home is [cwallyman/solidcraft, branch ipad-solidcraft](https://gi
 The local branch is named `ipad-solidcraft` and tracks `origin/ipad-solidcraft`. `origin` points to the fork, `upstream` points to the original developer, and the read-only `archive` remote points to `cwallyman/ipad-solidcraft`. The duplicate standalone repository is archived rather than deleted, retaining its original commits and links as a backup. Future changes are pushed to the fork. The root README contains branch-specific clone and subtree-update commands.
 
 This is repository/documentation maintenance. No app source, bundled assets, user designs or original-developer branches were changed. The screenshot gallery remains in `docs/screenshots/ipad/` on the maintained branch.
+
+## 24. Upstream v0.24.0 sync, iPad fixes and rename — October 2026
+
+The subtree was merged with upstream release v0.24.0 (`5965439`; the project now lives at `tangency-labs/solidcraft`). Upstream redesigned the shell as a full-bleed viewport with floating cards, async file pickers and a separate navigation module; the iPad changes were re-applied on top. Fixes after the merge:
+
+- `LocalWebServer.swift` serves CSS, SVG, PNG and manifest files with their real MIME types; WebKit ignored the stylesheet when it was `text/plain`, which left a black screen.
+- Finger taps on the floating ribbon and History cards are routed to the interface (`shell::covered_rects` in `apple_touch.rs`).
+- Faceted mesh conversion accepts up to 25,000 triangles.
+- An **iPad Touch** navigation preset is the default on iPad. Finger gestures (one-finger orbit, two-finger pan, pinch zoom, two-finger twist roll) work whatever preset is chosen; a connected mouse follows the chosen preset.
+- A tap on the model closes the File menu and command search.
+- Swipes on the interface scroll with momentum; holding 200 ms before moving drags instead.
+- `build-and-install.sh` installs only; it no longer launches the app.
+
+Release scripts: `build-release-web.sh` bundles the size-optimized engine (full LTO, `wasm-opt -Oz`, no debug info) and `archive-release.sh` makes a Release archive for the Xcode Organizer.
+
+The app was renamed **Solidcraft for iPad**: Xcode project, target, scheme and source folder `SolidcraftForIPad`, bundle identifier `com.cwallyman.SolidcraftForIPad`. The earlier `com.cwallyman.SolidCraftTest` build is a different app on the device. Records in `verification/` keep the old names.
+
+The planned move to a native Rust/Metal app is in [NATIVE_IOS_PLAN.md](NATIVE_IOS_PLAN.md).

@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "637BE2EC8A92BDB3E2878B16"
-               BuildableName = "SolidCraftTest.app"
-               BlueprintName = "SolidCraftTest"
-               ReferencedContainer = "container:SolidCraftTest.xcodeproj">
+               BuildableName = "SolidcraftForIPad.app"
+               BlueprintName = "SolidcraftForIPad"
+               ReferencedContainer = "container:SolidcraftForIPad.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -31,9 +31,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "637BE2EC8A92BDB3E2878B16"
-            BuildableName = "SolidCraftTest.app"
-            BlueprintName = "SolidCraftTest"
-            ReferencedContainer = "container:SolidCraftTest.xcodeproj">
+            BuildableName = "SolidcraftForIPad.app"
+            BlueprintName = "SolidcraftForIPad"
+            ReferencedContainer = "container:SolidcraftForIPad.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <Testables>
@@ -42,9 +42,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "8D5D68A45B0C7E56989B7E7C"
-               BuildableName = "SolidCraftTestUITests.xctest"
-               BlueprintName = "SolidCraftTestUITests"
-               ReferencedContainer = "container:SolidCraftTest.xcodeproj">
+               BuildableName = "SolidcraftForIPadUITests.xctest"
+               BlueprintName = "SolidcraftForIPadUITests"
+               ReferencedContainer = "container:SolidcraftForIPad.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -64,9 +64,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "637BE2EC8A92BDB3E2878B16"
-            BuildableName = "SolidCraftTest.app"
-            BlueprintName = "SolidCraftTest"
-            ReferencedContainer = "container:SolidCraftTest.xcodeproj">
+            BuildableName = "SolidcraftForIPad.app"
+            BlueprintName = "SolidcraftForIPad"
+            ReferencedContainer = "container:SolidcraftForIPad.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -81,9 +81,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "637BE2EC8A92BDB3E2878B16"
-            BuildableName = "SolidCraftTest.app"
-            BlueprintName = "SolidCraftTest"
-            ReferencedContainer = "container:SolidCraftTest.xcodeproj">
+            BuildableName = "SolidcraftForIPad.app"
+            BlueprintName = "SolidcraftForIPad"
+            ReferencedContainer = "container:SolidcraftForIPad.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

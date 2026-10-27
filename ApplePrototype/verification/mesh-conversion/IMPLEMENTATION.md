@@ -6,7 +6,7 @@ The new path is written locally in Rust using SolidCraft's existing mesh and pla
 
 ## Conversion behavior
 
-1. Validate tolerance and enforce a 5,000-triangle input budget.
+1. Validate tolerance and enforce a 25,000-triangle input budget.
 2. Weld nearly coincident vertices using the existing conservative weld tolerance.
 3. Remove duplicate triangle faces using their welded vertex identities.
 4. Traverse adjacency only across edges used by exactly two triangles. Touching parts sharing an edge with four triangles can therefore become separate shells.
@@ -16,7 +16,7 @@ The new path is written locally in Rust using SolidCraft's existing mesh and pla
 8. Rebuild planar B-rep faces with the existing polygon topology builder. Coplanar triangles merge; curved regions retain planar facets.
 9. Validate each rebuilt shell and return it as a separate CAD body under one conversion feature.
 
-Limits are 5,000 input triangles and 256 shells. Invalid input returns an error through the existing transactional command path. The source mesh remains embedded upstream in the timeline; undo restores it. Saved documents record the method, and older conversion features default to Prismatic when the new field is absent.
+Limits are 25,000 input triangles and 256 shells. Invalid input returns an error through the existing transactional command path. The source mesh remains embedded upstream in the timeline; undo restores it. Saved documents record the method, and older conversion features default to Prismatic when the new field is absent.
 
 ## What this does not do
 
