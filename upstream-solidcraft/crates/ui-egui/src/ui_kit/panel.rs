@@ -525,6 +525,11 @@ impl<'a> Window<'a> {
         self.surface(ctx, false, |ui| self.content(ui, valid, body, |_| {}))
     }
 
+    /// `show` as a modal card, centred above everything else.
+    pub(crate) fn show_modal(self, ctx: &egui::Context, valid: bool, body: impl FnOnce(&mut Ui)) -> (bool, super::Action) {
+        self.surface(ctx, true, |ui| self.content(ui, valid, body, |_| {}))
+    }
+
     /// A pinned left action slot, independent of the right-aligned footer buttons.
     pub(crate) fn show_with_left(
         mut self,

@@ -308,16 +308,26 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
             let c = pos2(left + 20.0, r.center().y);
             crate::icons::glyphs::brand_mark(ui.painter(), c);
         }
+        let mut x = left + if compact_actions { 56.0 } else { 128.0 };
         if !compact_actions {
-            ui.painter().text(
+            let name = ui.painter().text(
                 pos2(left + 36.0, r.center().y),
                 Align2::LEFT_CENTER,
                 "SolidCraft",
                 crate::fonts::semibold(t.font_heading),
                 t.app_bar_text,
             );
+            if app.ui.apple_touch {
+                let suffix = ui.painter().text(
+                    pos2(name.right() + 6.0, r.center().y),
+                    Align2::LEFT_CENTER,
+                    "for iPad",
+                    FontId::proportional(t.font_heading),
+                    t.app_bar_text,
+                );
+                x = x.max(suffix.right() + 24.0);
+            }
         }
-        let mut x = left + if compact_actions { 56.0 } else { 128.0 };
         let home = Rect::from_center_size(pos2(x - 4.0, r.center().y), vec2(32.0, 32.0));
         let idle = !app.file_load.busy();
         let home_response = ui.interact(home, ui.id().with("appbar_home"), if idle { Sense::click() } else { Sense::hover() });
@@ -418,6 +428,8 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
         let report_font = FontId::proportional(t.font_button);
         let label_width = ui.painter().layout_no_wrap(report_text.to_string(), report_font.clone(), t.app_bar_text).size().x;
         let (report, report_label) = report_rect(r, captions, tabs_start, label_width);
+        // The iPad build has no Report a bug button: the cluster closes up to the right edge.
+        let report = if app.ui.apple_touch { Rect::from_min_max(pos2(report.right() - 4.0, report.top()), report.max) } else { report };
         // Assistant, Settings, Help and Report a bug form the right-hand cluster.
         if click(ui, help_x(report), "help", app.tr("ui.help"), true) {
             app.help.menu = !app.help.menu;
@@ -440,18 +452,20 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
         let mut tabs_ui = ui.new_child(egui::UiBuilder::new().max_rect(tabs_rect));
         tabs_ui.set_clip_rect(tabs_rect.intersect(ui.clip_rect()));
         crate::documents::tabs(app, &mut tabs_ui, r, tabs_start, tabs_end);
-        let response = ui.interact(report, ui.id().with("sc_report_button"), Sense::click());
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), report_text));
-        crate::scenario::publish_target("titlebar:report", report);
-        ui.painter().rect_filled(report, t.radius_sm, if response.hovered() || response.has_focus() { t.app_bar_hover_button } else { t.app_bar });
-        ui.painter().rect_stroke(report, t.radius_sm, Stroke::new(1.0, t.app_bar_separator), egui::StrokeKind::Inside);
-        let icon = Rect::from_center_size(pos2(report.left() + 14.0, report.center().y), vec2(18.0, 18.0));
-        icons::paint_app_bar(ui.painter(), icon, "bug_report", 1.0);
-        if report_label {
-            ui.painter().text(pos2(report.left() + REPORT_TEXT_X, report.center().y), Align2::LEFT_CENTER, report_text, report_font, t.app_bar_text);
-        }
-        if response.on_hover_text(crate::i18n::tr_label("Report a bug — review a screenshot and open a GitHub draft")).clicked() {
-            crate::help::run(app, &ui.ctx().clone(), "report");
+        if !app.ui.apple_touch {
+            let response = ui.interact(report, ui.id().with("sc_report_button"), Sense::click());
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), report_text));
+            crate::scenario::publish_target("titlebar:report", report);
+            ui.painter().rect_filled(report, t.radius_sm, if response.hovered() || response.has_focus() { t.app_bar_hover_button } else { t.app_bar });
+            ui.painter().rect_stroke(report, t.radius_sm, Stroke::new(1.0, t.app_bar_separator), egui::StrokeKind::Inside);
+            let icon = Rect::from_center_size(pos2(report.left() + 14.0, report.center().y), vec2(18.0, 18.0));
+            icons::paint_app_bar(ui.painter(), icon, "bug_report", 1.0);
+            if report_label {
+                ui.painter().text(pos2(report.left() + REPORT_TEXT_X, report.center().y), Align2::LEFT_CENTER, report_text, report_font, t.app_bar_text);
+            }
+            if response.on_hover_text(crate::i18n::tr_label("Report a bug — review a screenshot and open a GitHub draft")).clicked() {
+                crate::help::run(app, &ui.ctx().clone(), "report");
+            }
         }
         // Settings sits immediately left of Help (also Ctrl+,).
         let gear = Rect::from_center_size(pos2(report.left() - 52.0, r.center().y), vec2(32.0, 32.0));

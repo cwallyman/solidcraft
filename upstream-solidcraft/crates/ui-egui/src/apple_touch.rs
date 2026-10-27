@@ -18,6 +18,7 @@ thread_local! {
     static PENCIL_INPUT: Cell<bool> = const { Cell::new(false) };
     static FINGER_NAVIGATION: Cell<bool> = const { Cell::new(false) };
     static PENDING_ROLL: Cell<f64> = const { Cell::new(0.0) };
+    static PENDING_ZOOM: Cell<Option<(f64, Pos2)>> = const { Cell::new(None) };
     static HIT: RefCell<Option<HitState>> = const { RefCell::new(None) };
     static LAYOUT: RefCell<Value> = const { RefCell::new(Value::Null) };
     static NUMBER_FOCUS: Cell<Option<(Id, Rect)>> = const { Cell::new(None) };
@@ -186,6 +187,31 @@ pub fn add_roll(radians: f64) {
     if radians.is_finite() {
         PENDING_ROLL.with(|roll| roll.set(roll.get() + radians));
     }
+}
+
+/// A pinch from the host: the change in finger spread (above 1 spreads) about a point in CSS
+/// pixels; applied on the next frame.
+pub fn add_zoom(ratio: f64, x: f32, y: f32) {
+    if ratio.is_finite() && ratio > 0.0 {
+        PENDING_ZOOM.with(|zoom| {
+            let total = zoom.get().map_or(1.0, |(r, _)| r);
+            zoom.set(Some((total * ratio, pos2(x, y))));
+        });
+    }
+}
+
+/// Zoom the view by the pinch gathered since the last frame. Spreading zooms in, toward the
+/// model point between the fingers.
+pub fn apply_zoom(app: &mut SolveApp, zoom_factor: f32) -> bool {
+    let Some((ratio, at)) = PENDING_ZOOM.with(|zoom| zoom.take()) else { return false };
+    let Some(rect) = app.viewport.rect else { return false };
+    let at = at / zoom_factor;
+    let f = ratio.powf(-crate::prefs::zoom_sign(app)).clamp(0.05, 20.0);
+    let anchor = crate::navigation::zoom_anchor(app, rect, rect.contains(at).then_some(at), true);
+    app.viewport.orbit_free = None;
+    app.cancel_view_animation();
+    app.cam.zoom_at(f, anchor);
+    true
 }
 
 /// Roll the view by the twist gathered since the last frame.

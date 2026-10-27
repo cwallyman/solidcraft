@@ -229,7 +229,9 @@ window.installSolidcraftInput = (canvas, report) => {
         if (next.mode === 'pan' && navigation.distance > 0 && next.distance > 0) {
           const ratio = next.distance/navigation.distance;
           if (Math.abs(Math.log(ratio)) > 0.0001) {
-            canvas.dispatchEvent(new WheelEvent('wheel',{bubbles:true,cancelable:true,
+            // Straight to the camera: as wheel input, small pinch steps read as trackpad scrolls.
+            if (window.wasmBindings?.touch_zoom) window.wasmBindings.touch_zoom(ratio,next.point.clientX,next.point.clientY);
+            else canvas.dispatchEvent(new WheelEvent('wheel',{bubbles:true,cancelable:true,
               clientX:next.point.clientX,clientY:next.point.clientY,deltaY:-Math.log(ratio)/0.0015,deltaMode:0}));
             zoomMoves++;
           }

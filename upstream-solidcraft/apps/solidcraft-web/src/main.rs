@@ -181,6 +181,12 @@ mod web {
     }
 
     #[wasm_bindgen::prelude::wasm_bindgen]
+    pub fn touch_zoom(ratio: f64, x: f32, y: f32) {
+        solidcraft_ui_egui::apple_touch::add_zoom(ratio, x, y);
+        solidcraft_ui_egui::apple_touch::request_repaint();
+    }
+
+    #[wasm_bindgen::prelude::wasm_bindgen]
     pub fn touch_is_model(x: f32, y: f32) -> bool {
         solidcraft_ui_egui::apple_touch::is_model_point(x, y)
     }
@@ -671,7 +677,8 @@ mod web {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.tick_font(ctx);
             self.app.logic(ctx);
-            if solidcraft_ui_egui::apple_touch::apply_roll(&mut self.app) {
+            let zoomed = solidcraft_ui_egui::apple_touch::apply_zoom(&mut self.app, ctx.zoom_factor());
+            if solidcraft_ui_egui::apple_touch::apply_roll(&mut self.app) || zoomed {
                 ctx.request_repaint();
             }
             if let Some((x, y)) = ALIGN.with(|at| at.borrow_mut().take()) {

@@ -14,9 +14,13 @@ struct SolidcraftForIPadApp: App {
 struct CADView: View {
     @ObservedObject var model: CADModel
     var body: some View {
+        // On a Mac the window's title bar is outside the content, so the top inset would only
+        // leave an empty band under it.
+        let mac = ProcessInfo.processInfo.isiOSAppOnMac
         CADWebView(webView: model.webView)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .ignoresSafeArea(.container, edges: [.horizontal, .bottom])
+            .ignoresSafeArea(.container, edges: mac ? .all : [.horizontal, .bottom])
+            .background(mac ? Color(red: 0.11, green: 0.12, blue: 0.15).ignoresSafeArea() : nil)
     }
 }
 

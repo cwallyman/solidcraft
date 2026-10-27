@@ -118,9 +118,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context, anchor: egui::Pos2) {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 crate::context_menu::menu_frame(ui, |ui| {
+                    let ipad = app.ui.apple_touch;
                     for (id, label, icon) in [
                         ("docs", "Documentation", "library"),
-                        ("about", "About SolidCraft", "help"),
+                        ("about", if ipad { "About Solidcraft for iPad" } else { "About SolidCraft" }, "help"),
                         ("shortcuts", "Keyboard Shortcuts", "list"),
                         ("messages", "Messages…", "list"),
                         ("report", "Report an Issue…", "bug_report"),
@@ -130,6 +131,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context, anchor: egui::Pos2) {
                     ]
                     .into_iter()
                     .filter(|(id, ..)| *id != "install_cli" || cfg!(target_os = "macos"))
+                    // The iPad build files no issues upstream.
+                    .filter(|(id, ..)| !(ipad && *id == "report"))
                     {
                         if crate::context_menu::list_row(ui, &crate::context_menu::Item::action(id, label, icon)).is_some() {
                             pick = Some(id);
@@ -137,9 +140,20 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context, anchor: egui::Pos2) {
                     }
                 })
             });
-        if let Some(p) = pick {
+        // A finger tap arrives with no hover before it, so test the press against the menu's
+        // own rectangle rather than egui's hover state.
+        let on_menu = ctx.input(|i| i.pointer.press_origin().or(i.pointer.latest_pos())).is_some_and(|p| resp.response.rect.contains(p));
+        if pick == Some("about") && app.ui.apple_touch {
+            // Open About once the tap has ended, so the same tap is not a press outside it.
+            app.help.menu = false;
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("sc_about_pending"), true));
+            ctx.request_repaint();
+        } else if let Some(p) = pick {
             run(app, ctx, p);
-        } else if ctx.input(|i| i.pointer.any_pressed() || i.key_pressed(egui::Key::Escape)) && !resp.response.contains_pointer() {
+        } else if ctx.input(|i| i.pointer.any_pressed() || i.key_pressed(egui::Key::Escape))
+            && !resp.response.contains_pointer()
+            && !(app.ui.apple_touch && on_menu)
+        {
             // Pressed elsewhere (the ? button toggles it itself).
             if !ctx.data(|d| d.get_temp::<bool>(egui::Id::new("sc_help_opened")).unwrap_or(false)) {
                 app.help.menu = false;
@@ -154,52 +168,63 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context, anchor: egui::Pos2) {
 }
 
 fn about(app: &mut SolveApp, ctx: &egui::Context) {
+    let pending = egui::Id::new("sc_about_pending");
+    if ctx.data(|d| d.get_temp::<bool>(pending).unwrap_or(false)) {
+        if ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_pressed() && !i.pointer.any_released()) {
+            ctx.data_mut(|d| d.remove::<bool>(pending));
+            app.help.about = true;
+        }
+        ctx.request_repaint();
+    }
     if !app.help.about {
         return;
     }
-    let (closed, action) = ui_kit::Window::new(egui::Id::new("sc_about"), "help", crate::i18n::tr_label("About SolidCraft"))
-        .cards(2.0)
-        .actions("", "Close", None)
-        .show(ctx, true, |ui| {
-            ui_kit::text(
-                ui,
-                &crate::i18n::format("help.build", &[("version", VERSION), ("commit", COMMIT), ("date", BUILD_DATE)]),
-                ui_kit::Text::Report("version", false),
-            );
-            ui_kit::text(
-                ui,
-                crate::i18n::tr_label("Open-source parametric 3D CAD in Rust. Licensed MIT OR Apache-2.0."),
-                ui_kit::Text::Note("description"),
-            );
-            let copy = ui_kit::button(ui, crate::i18n::tr_label("Copy diagnostic information"), ui_kit::Button::Normal);
-            crate::scenario::publish_target("about:copy_diagnostics", copy.rect);
-            if copy.clicked() {
-                ctx.copy_text(diagnostics(app));
-            }
-            egui::ScrollArea::vertical().max_height(crate::theme::Tokens::get().control_height * 15.0).show(ui, |ui| {
-                ui_kit::section(ui, "attributions", crate::i18n::tr("help.attributions"), false, |ui| {
-                    ui_kit::text(ui, ATTRIBUTION, ui_kit::Text::Report("attributions", false));
-                });
-                ui_kit::section(ui, "fonts", crate::i18n::tr("help.fonts"), false, |ui| {
-                    ui_kit::text(ui, crate::i18n::tr("help.font_details"), ui_kit::Text::Report("fonts", false));
-                });
-                ui_kit::section(ui, "licences", crate::i18n::tr("help.licences"), false, |ui| {
-                    for (id, title, text) in
-                        [("notice", "help.notice", NOTICE), ("mit", "help.mit", LICENSE_MIT), ("apache", "help.apache", LICENSE_APACHE)]
-                    {
-                        ui_kit::section(ui, id, crate::i18n::tr(title), false, |ui| {
-                            ui_kit::text(ui, text, ui_kit::Text::Report(id, false));
-                        });
-                    }
-                    ui_kit::section(ui, "third_party", crate::i18n::tr("help.third_party"), false, |ui| {
-                        if ui_kit::button(ui, crate::i18n::tr_label("Copy all licences"), ui_kit::Button::Normal).clicked() {
-                            ctx.copy_text(solidcraft_engine::licences::all());
-                        }
-                        ui_kit::text_lines(ui, "sc_third_party", THIRD_PARTY);
+    let title = if app.ui.apple_touch { "About Solidcraft for iPad" } else { crate::i18n::tr_label("About SolidCraft") };
+    // On iPad a modal card, so it opens above the full-screen model and floating cards.
+    let ipad = app.ui.apple_touch;
+    let window = ui_kit::Window::new(egui::Id::new("sc_about"), "help", title).cards(2.0).actions("", "Close", None);
+    let body = |ui: &mut egui::Ui| {
+        let version = if app.ui.apple_touch {
+            format!("Based on version {VERSION} of SolidCraft")
+        } else {
+            crate::i18n::format("help.build", &[("version", VERSION), ("commit", COMMIT), ("date", BUILD_DATE)])
+        };
+        ui_kit::text(ui, &version, ui_kit::Text::Report("version", false));
+        ui_kit::text(
+            ui,
+            crate::i18n::tr_label("Open-source parametric 3D CAD in Rust. Licensed MIT OR Apache-2.0."),
+            ui_kit::Text::Note("description"),
+        );
+        let copy = ui_kit::button(ui, crate::i18n::tr_label("Copy diagnostic information"), ui_kit::Button::Normal);
+        crate::scenario::publish_target("about:copy_diagnostics", copy.rect);
+        if copy.clicked() {
+            ctx.copy_text(diagnostics(app));
+        }
+        egui::ScrollArea::vertical().max_height(crate::theme::Tokens::get().control_height * 15.0).show(ui, |ui| {
+            ui_kit::section(ui, "attributions", crate::i18n::tr("help.attributions"), false, |ui| {
+                ui_kit::text(ui, ATTRIBUTION, ui_kit::Text::Report("attributions", false));
+            });
+            ui_kit::section(ui, "fonts", crate::i18n::tr("help.fonts"), false, |ui| {
+                ui_kit::text(ui, crate::i18n::tr("help.font_details"), ui_kit::Text::Report("fonts", false));
+            });
+            ui_kit::section(ui, "licences", crate::i18n::tr("help.licences"), false, |ui| {
+                for (id, title, text) in
+                    [("notice", "help.notice", NOTICE), ("mit", "help.mit", LICENSE_MIT), ("apache", "help.apache", LICENSE_APACHE)]
+                {
+                    ui_kit::section(ui, id, crate::i18n::tr(title), false, |ui| {
+                        ui_kit::text(ui, text, ui_kit::Text::Report(id, false));
                     });
+                }
+                ui_kit::section(ui, "third_party", crate::i18n::tr("help.third_party"), false, |ui| {
+                    if ui_kit::button(ui, crate::i18n::tr_label("Copy all licences"), ui_kit::Button::Normal).clicked() {
+                        ctx.copy_text(solidcraft_engine::licences::all());
+                    }
+                    ui_kit::text_lines(ui, "sc_third_party", THIRD_PARTY);
                 });
             });
         });
+    };
+    let (closed, action) = if ipad { window.show_modal(ctx, true, body) } else { window.show(ctx, true, body) };
     if closed || action == ui_kit::Action::Cancel {
         app.help.about = false;
     }
