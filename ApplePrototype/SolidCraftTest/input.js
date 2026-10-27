@@ -6,6 +6,12 @@ window.installSolidcraftInput = (canvas, report) => {
   const ORBIT_SLOP = 6;
   // A two-finger twist must pass this angle before it rolls, so pans and pinches stay level.
   const TWIST_START = 0.1;
+  // A finger on the UI: a quick swipe scrolls what is under it (with a short glide after it
+  // lifts), a tap clicks, and a touch held this long before moving drags (sliders, handles).
+  const UI_HOLD_MS = 200;
+  const UI_SLOP = 8;
+  const GLIDE_FRICTION = 0.95; // velocity kept per 16 ms
+  let glide = null;
   const debug = {modelTaps:0,alignRequests:0,lastTapGap:0,lastRoute:''};
   window.solidcraftInputDiagnostics = debug;
   let orbitMoves = 0, panMoves = 0, zoomMoves = 0, rollMoves = 0, pencilStrokes = 0;
@@ -72,6 +78,39 @@ window.installSolidcraftInput = (canvas, report) => {
   const reportNavigation = () => report({kind:'navigation',text:
     `Touch navigation moves: ${orbitMoves+panMoves}; orbit: ${orbitMoves}; pan: ${panMoves}; pinch: ${zoomMoves}; rotate: ${rollMoves}; Pencil strokes: ${pencilStrokes}`});
   const modelPoint = p => window.solidcraftIsModelPoint ? window.solidcraftIsModelPoint(p) : true;
+  const wheel = (p, dx, dy) => canvas.dispatchEvent(new WheelEvent('wheel',{bubbles:true,cancelable:true,
+    clientX:p.clientX,clientY:p.clientY,deltaX:dx,deltaY:dy,deltaMode:0}));
+  const stopGlide = () => {
+    if (glide) cancelAnimationFrame(glide.frame);
+    glide = null;
+  };
+  const startGlide = (at, vx, vy) => {
+    stopGlide();
+    if (Math.hypot(vx,vy) < 0.05) return;
+    let last = performance.now();
+    const step = now => {
+      const dt = Math.min(now-last,50); last = now;
+      const keep = Math.pow(GLIDE_FRICTION,dt/16);
+      vx *= keep; vy *= keep;
+      if (Math.hypot(vx,vy) < 0.02) { glide = null; return; }
+      wheel(at,-vx*dt,-vy*dt);
+      glide.frame = requestAnimationFrame(step);
+    };
+    glide = {frame:requestAnimationFrame(step)};
+  };
+  // A held UI touch becomes a press at its origin, then follows the finger as a drag.
+  const pressUi = contact => {
+    clearTimeout(contact.timer);
+    contact.phase = 'drag';
+    emit('mousemove',contact.origin,'ui',false);
+    emit('pointerup',contact.origin,'ui',false);
+    emit('pointerdown',contact.origin,'ui',true);
+  };
+  const releaseUi = () => {
+    if (uiContact?.phase === 'drag') emit('pointerup',uiContact.point,'ui',false);
+    if (uiContact) clearTimeout(uiContact.timer);
+    uiContact = null;
+  };
   // Menus and the command search close on a press outside them. A finger tap on the model is
   // navigation, not a press, so it also presses just off the canvas, where nothing is picked.
   const dismissOverlays = () => {
@@ -101,8 +140,7 @@ window.installSolidcraftInput = (canvas, report) => {
       if (event.pointerType === 'pen') {
         if (type === 'pointerdown') {
           window.wasmBindings?.touch_set_pencil?.(true);
-          if (uiContact) emit('pointerup',uiContact.point,'ui',false);
-          uiContact = null; lastTap = null;
+          releaseUi(); stopGlide(); lastTap = null;
           releaseNavigation(); fingers.clear(); suspended = false; pendingOrbit = null;
           hoverPoint = null;
           pencil = {id:event.pointerId,point:p}; pencilStrokes++;
@@ -121,12 +159,35 @@ window.installSolidcraftInput = (canvas, report) => {
       }
       if (event.pointerType !== 'touch' || pencil) return;
       if (type === 'pointerdown') window.wasmBindings?.touch_set_pencil?.(false);
+      if (type === 'pointerdown') stopGlide();
       if (uiContact) {
         if (uiContact.id === event.pointerId) {
+          const c = uiContact;
           if (type === 'pointermove') {
-            uiContact.point = p; emit('mousemove',p,'ui',true);
+            if (c.phase === 'pending' && Math.hypot(p.clientX-c.origin.clientX,p.clientY-c.origin.clientY) > UI_SLOP) {
+              clearTimeout(c.timer);
+              c.phase = 'scroll';
+              c.last = c.origin; c.lastTime = event.timeStamp; c.vx = 0; c.vy = 0;
+            }
+            if (c.phase === 'scroll') {
+              const dx = p.clientX-c.last.clientX, dy = p.clientY-c.last.clientY;
+              const dt = Math.max(event.timeStamp-c.lastTime,1);
+              // The content follows the finger: moving up reveals what is below.
+              wheel(c.origin,-dx,-dy);
+              c.vx = 0.7*c.vx+0.3*dx/dt; c.vy = 0.7*c.vy+0.3*dy/dt;
+              c.last = p; c.lastTime = event.timeStamp;
+            } else if (c.phase === 'drag') emit('mousemove',p,'ui',true);
+            c.point = p;
           } else if (type === 'pointerup' || type === 'pointercancel') {
-            emit('pointerup',p,'ui',false); uiContact = null;
+            if (c.phase === 'pending' && type === 'pointerup') {
+              // A tap: press and let go where it landed.
+              pressUi(c);
+              emit('pointerup',c.origin,'ui',false);
+              c.phase = 'done';
+            } else if (c.phase === 'scroll' && type === 'pointerup' && event.timeStamp-c.lastTime < 80) {
+              startGlide(c.origin,c.vx,c.vy);
+            }
+            releaseUi();
             if (window.solidcraftReportLayout) window.solidcraftReportLayout();
           }
         }
@@ -134,10 +195,11 @@ window.installSolidcraftInput = (canvas, report) => {
       }
       if (type === 'pointerdown' && !modelPoint(p)) {
         releaseNavigation(); fingers.clear(); pendingOrbit = null; lastTap = null; suspended = false;
-        uiContact = {id:event.pointerId,point:p};
+        const contact = {id:event.pointerId,point:p,origin:p,phase:'pending'};
+        contact.timer = setTimeout(() => { if (uiContact === contact && contact.phase === 'pending') pressUi(contact); },UI_HOLD_MS);
+        uiContact = contact;
+        // Hover first, so what is under the finger highlights and a swipe scrolls it.
         emit('mousemove',p,'ui',false);
-        emit('pointerup',p,'ui',false);
-        emit('pointerdown',p,'ui',true);
         return;
       }
       if (type === 'pointerdown') {
@@ -233,8 +295,8 @@ window.installSolidcraftInput = (canvas, report) => {
   window.addEventListener('blur',() => {
     releaseNavigation();
     if (pencil) emit('pointerup',pencil.point,'pencil',false);
-    if (uiContact) emit('pointerup',uiContact.point,'ui',false);
+    releaseUi(); stopGlide();
     hoverPoint = null;
-    pencil = null; uiContact = null; fingers.clear(); suspended = false; pendingOrbit = null; lastTap = null;
+    pencil = null; fingers.clear(); suspended = false; pendingOrbit = null; lastTap = null;
   });
 };
