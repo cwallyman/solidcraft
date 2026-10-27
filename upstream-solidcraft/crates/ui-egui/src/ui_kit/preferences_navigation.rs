@@ -165,6 +165,7 @@ pub(crate) fn live_axis_bar_in(ui: &Ui, live_rect: Rect, value: f32, dead_zone: 
 pub(crate) fn settings_axis_gain(ui: &mut Ui, gain: &mut f32) -> egui::Response {
     let response =
         ui.add(egui::DragValue::new(gain).range(0.0..=3.0).speed(0.05).suffix("×").fixed_decimals(2).custom_parser(crate::prefs::parse_number));
+    crate::apple_touch::number_input(&response);
     response.widget_info(|| {
         let mut info = egui::WidgetInfo::drag_value(ui.is_enabled(), f64::from(*gain));
         info.label = Some(super::layout::label(ui).to_owned());

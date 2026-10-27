@@ -110,6 +110,7 @@ pub(crate) fn color_popover(ui: &mut Ui, rgb: &mut [u8; 3]) -> bool {
                             .custom_parser(crate::prefs::parse_number)
                             .custom_formatter(move |v, _| if linear { format!("{v:.03}") } else { format!("{v:.0}") }),
                     );
+                    crate::apple_touch::number_input(&response);
                     response.widget_info(|| {
                         let mut info = egui::WidgetInfo::drag_value(ui.is_enabled(), *channel);
                         info.label = Some(name.into());

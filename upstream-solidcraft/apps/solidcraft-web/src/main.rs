@@ -695,6 +695,9 @@ mod web {
             }
             // Before the app's own hook, which adds the control channel's events.
             self.space_mouse.raw_input_hook(ctx, self.app.preferences.space_mouse_enabled, raw);
+            if self.app.ui.apple_touch {
+                solidcraft_ui_egui::apple_touch::keypad_input(ctx, raw);
+            }
             self.app.raw_input_hook(raw);
         }
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

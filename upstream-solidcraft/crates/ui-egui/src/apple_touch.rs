@@ -1,7 +1,7 @@
 //! Host touch routing uses actual egui regions, including menus and resized panels.
 use std::cell::{Cell, RefCell};
 
-use egui::{Context, Pos2, Rect, pos2};
+use egui::{Context, Event, Id, Key, Modifiers, Pos2, Rect, pos2, vec2};
 use serde_json::{Value, json};
 use solidcraft_engine::geom::Vec3;
 
@@ -20,6 +20,146 @@ thread_local! {
     static PENDING_ROLL: Cell<f64> = const { Cell::new(0.0) };
     static HIT: RefCell<Option<HitState>> = const { RefCell::new(None) };
     static LAYOUT: RefCell<Value> = const { RefCell::new(Value::Null) };
+    static NUMBER_FOCUS: Cell<Option<(Id, Rect)>> = const { Cell::new(None) };
+    static KEYPAD_RECT: Cell<Option<Rect>> = const { Cell::new(None) };
+    static KEYPAD_EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
+    static SYSTEM_KEYBOARD: Cell<Option<Id>> = const { Cell::new(None) };
+    static KEYPAD_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static FIELD_UNIT: RefCell<Option<(Id, String)>> = const { RefCell::new(None) };
+}
+
+/// The unit of a plain value such as "20 mm" or "45 deg"; none for expressions.
+fn plain_unit(text: &str) -> Option<String> {
+    let text = text.trim();
+    let split = text.find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+')))?;
+    let (number, unit) = text.split_at(split);
+    let unit = unit.trim();
+    (number.chars().any(|c| c.is_ascii_digit()) && !unit.is_empty() && unit.chars().all(|c| c.is_alphabetic() || matches!(c, '°' | '"' | '\'')))
+        .then(|| unit.to_owned())
+}
+
+/// A number field whose text carries its unit. A bare number typed on the pad gets the unit the
+/// field had when it was focused ("20 mm", typed "25", becomes "25 mm").
+pub fn number_text(response: &egui::Response, value: &mut String) {
+    number_input(response);
+    if !KEYPAD_ENABLED.with(Cell::get) {
+        return;
+    }
+    if response.has_focus() {
+        FIELD_UNIT.with(|unit| {
+            let mut unit = unit.borrow_mut();
+            if unit.as_ref().is_none_or(|(id, _)| *id != response.id) {
+                *unit = Some((response.id, plain_unit(value).unwrap_or_default()));
+            }
+        });
+    } else if response.lost_focus() {
+        let unit = FIELD_UNIT.with(|unit| unit.borrow_mut().take_if(|(id, _)| *id == response.id)).map(|(_, unit)| unit);
+        let bare = value.chars().any(|c| c.is_ascii_digit()) && value.chars().all(|c| c.is_ascii_digit() || " .+-*/()".contains(c));
+        if let Some(unit) = unit.filter(|unit| bare && !unit.is_empty()) {
+            *value = format!("{} {unit}", value.trim());
+        }
+    }
+}
+
+/// Marks a number field; while it has focus the iPad shows the ten-key pad instead of the
+/// system keyboard.
+pub fn number_input(response: &egui::Response) {
+    if response.has_focus() {
+        NUMBER_FOCUS.with(|focus| focus.set(Some((response.id, response.rect))));
+    }
+}
+
+/// Feeds the keys tapped on the pad to the focused field, and keeps that field focused while
+/// the pad itself is pressed.
+pub fn keypad_input(ctx: &Context, raw: &mut egui::RawInput) {
+    KEYPAD_ENABLED.with(|enabled| enabled.set(true));
+    raw.events.extend(KEYPAD_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut())));
+    let on_pad = KEYPAD_RECT.with(Cell::get).is_some_and(|pad| {
+        let points = raw.events.iter().filter_map(|event| match event {
+            Event::PointerMoved(pos) | Event::PointerButton { pos, .. } => Some(*pos),
+            _ => None,
+        });
+        points.chain(ctx.input(|i| i.pointer.latest_pos())).any(|pos| pad.contains(pos / ctx.zoom_factor()) || pad.contains(pos))
+    });
+    ctx.options_mut(|options| {
+        options.input_options.surrender_focus_on = if on_pad { egui::SurrenderFocusOn::Never } else { egui::SurrenderFocusOn::Clicks };
+    });
+}
+
+fn press(key: Key, modifiers: Modifiers) -> [Event; 2] {
+    [true, false].map(|pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers })
+}
+
+/// The backspace symbol: a left-pointing tag with a cross in it.
+fn paint_backspace(ui: &egui::Ui, rect: Rect, color: egui::Color32) {
+    let c = rect.center();
+    let (w, h) = (26.0, 18.0);
+    let (left, right, top, bottom) = (c.x - w / 2.0, c.x + w / 2.0, c.y - h / 2.0, c.y + h / 2.0);
+    let tag = vec![pos2(left, c.y), pos2(left + 8.0, top), pos2(right, top), pos2(right, bottom), pos2(left + 8.0, bottom)];
+    let stroke = egui::Stroke::new(2.0, color);
+    ui.painter().add(egui::Shape::closed_line(tag, stroke));
+    let x = c.x + 3.0;
+    for (a, b) in [(vec2(-4.0, -4.0), vec2(4.0, 4.0)), (vec2(-4.0, 4.0), vec2(4.0, -4.0))] {
+        ui.painter().line_segment([pos2(x, c.y) + a, pos2(x, c.y) + b], stroke);
+    }
+}
+
+/// The ten-key pad beside a focused number field. Values are expressions ("20 mm", "w/2"),
+/// so the pad also offers the arithmetic operators; ABC hands the field to the system keyboard.
+fn keypad(ctx: &Context) -> Option<Rect> {
+    let focus = NUMBER_FOCUS.with(|focus| focus.take()).filter(|(id, _)| ctx.memory(|m| m.has_focus(*id)));
+    let Some((id, field)) = focus else {
+        SYSTEM_KEYBOARD.with(|system| system.set(None));
+        return None;
+    };
+    if SYSTEM_KEYBOARD.with(Cell::get) == Some(id) {
+        return None;
+    }
+    SYSTEM_KEYBOARD.with(|system| system.set(None));
+    // No text agent focus, so the system keyboard stays down.
+    ctx.output_mut(|output| output.ime = None);
+
+    const KEYS: [&str; 20] = ["7", "8", "9", "/", "⌫", "4", "5", "6", "*", "C", "1", "2", "3", "-", "Next", "ABC", "0", ".", "+", "Enter"];
+    let key = vec2(60.0, 50.0);
+    let gap = 6.0;
+    let size = vec2(5.0 * key.x + 6.0 * gap, 4.0 * key.y + 5.0 * gap);
+    let screen = ctx.content_rect();
+    let below = field.bottom() + gap;
+    let y = if below + size.y <= screen.bottom() { below } else { (field.top() - gap - size.y).max(screen.top()) };
+    let x = field.left().clamp(screen.left(), (screen.right() - size.x).max(screen.left()));
+    let area = egui::Area::new(Id::new("sc_keypad")).order(egui::Order::Foreground).fixed_pos(pos2(x, y)).show(ctx, |ui| {
+        egui::Frame::popup(ui.style()).inner_margin(gap).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(gap, gap);
+            egui::Grid::new("sc_keypad_grid").spacing(vec2(gap, gap)).show(ui, |ui| {
+                for (i, label) in KEYS.into_iter().enumerate() {
+                    let text = egui::RichText::new(match label { "/" => "÷", "*" => "×", "-" => "−", "⌫" => "", other => other }).size(22.0);
+                    let button = ui.add(egui::Button::new(text).min_size(key));
+                    if label == "⌫" {
+                        paint_backspace(ui, button.rect, ui.style().interact(&button).fg_stroke.color);
+                    }
+                    if button.clicked() {
+                        let events: Vec<Event> = match label {
+                            "⌫" => press(Key::Backspace, Modifiers::NONE).into(),
+                            "C" => [press(Key::A, Modifiers::COMMAND), press(Key::Backspace, Modifiers::NONE)].concat(),
+                            "Next" => press(Key::Tab, Modifiers::NONE).into(),
+                            "Enter" => press(Key::Enter, Modifiers::NONE).into(),
+                            "ABC" => {
+                                SYSTEM_KEYBOARD.with(|system| system.set(Some(id)));
+                                Vec::new()
+                            }
+                            text => vec![Event::Text(text.into())],
+                        };
+                        KEYPAD_EVENTS.with(|pending| pending.borrow_mut().extend(events));
+                        ctx.request_repaint();
+                    }
+                    if i % 5 == 4 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
+    });
+    Some(area.response.rect)
 }
 
 /// The host identifies real Pencil contact separately from translated mouse events.
@@ -64,11 +204,14 @@ fn rect_json(rect: Rect) -> Value {
 }
 
 pub fn update(app: &SolveApp, ctx: &Context) {
+    let pad = keypad(ctx);
+    KEYPAD_RECT.with(|rect| rect.set(pad));
     let view = if app.home.open { None } else { app.viewport.rect };
     // Floating shell cards (ribbon, History, browser, palettes, dialogs) sit over the full-bleed
     // viewport on its own layer, so they are listed explicitly rather than found by layer.
     let mut controls: Vec<_> = ["nav:outer", "axis_view:outer"].into_iter().filter_map(scenario::rect_of).collect();
     controls.extend(crate::shell::covered_rects(app));
+    controls.extend(pad);
     HIT.with(|h| {
         *h.borrow_mut() = Some(HitState { ctx: ctx.clone(), viewport: view, controls, projection: view.map(|r| viewport::projection(app, r)) })
     });
