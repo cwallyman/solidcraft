@@ -8,7 +8,7 @@ Clone this branch to get the iPad app:
 git clone --branch ipad-solidcraft https://github.com/cwallyman/solidcraft.git
 ```
 
-An installed iPad prototype of [SolidCraft](https://github.com/bherbruck/solidcraft), using a SwiftUI/WKWebView shell and a bundled Rust/WebAssembly CAD engine. Modeling runs locally on the iPad.
+An installed iPad prototype of [SolidCraft](https://github.com/tangency-labs/solidcraft), using a SwiftUI/WKWebView shell and a bundled Rust/WebAssembly CAD engine. Modeling runs locally on the iPad.
 
 [View the iPad screenshot gallery](docs/screenshots/ipad/README.md).
 
@@ -44,7 +44,7 @@ See [the full implementation handoff](ApplePrototype/IPAD_APP_IMPLEMENTATION.md)
 
 ## Updating from the original developer
 
-The initial subtree is based on upstream commit `2bb24d1`. The `upstream` remote points to `bherbruck/solidcraft`; `origin` points to `cwallyman/solidcraft`. The maintained branch is `ipad-solidcraft` (also the fork's default branch). The optional `archive` remote identifies the archived standalone repository. Work on an update branch from a clean checkout:
+The subtree was imported at upstream commit `2bb24d1` (v0.8.0) and has since been merged with upstream release v0.24.0 (`5965439`). The `upstream` remote points to `tangency-labs/solidcraft` (formerly `bherbruck/solidcraft`, which GitHub redirects); `origin` points to `cwallyman/solidcraft`. The maintained branch is `ipad-solidcraft` (also the fork's default branch). The optional `archive` remote identifies the archived standalone repository. Work on an update branch from a clean checkout:
 
 ```sh
 git fetch origin
