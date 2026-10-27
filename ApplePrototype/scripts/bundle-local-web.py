@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+import os
 import shutil
 import subprocess
 
@@ -22,5 +23,5 @@ files = [{"file": str(p.relative_to(destination)), "sha256": hashlib.sha256(p.re
          for p in sorted(destination.rglob("*")) if p.is_file()]
 revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=upstream, text=True).strip()
 (destination / "asset-manifest.json").write_text(json.dumps({"origin": "local source build", "base_revision": revision,
-    "modified_source": True, "profile": "release, Rust optimization enabled, wasm-opt disabled for prototype iteration", "files": files}, indent=2))
+    "modified_source": True, "profile": os.environ.get("SOLIDCRAFT_BUNDLE_PROFILE", "release, Rust optimization enabled, wasm-opt disabled for prototype iteration"), "files": files}, indent=2))
 print(f"Bundled {len(files)} files from the local source build.")

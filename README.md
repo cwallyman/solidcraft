@@ -31,6 +31,17 @@ The script requires Rust with the `wasm32-unknown-unknown` target, Trunk, and th
 bash ApplePrototype/scripts/build-and-install.sh YOUR_IPAD_UDID
 ```
 
+### App Store build
+
+`build-local-web.sh` skips wasm-opt and LTO so iteration stays fast. For an App Store submission, bundle the size-optimized engine (full LTO, `wasm-opt -Oz`, no debug info; much slower, and it uses its own `target/appstore` cache), then archive a Release build:
+
+```sh
+bash ApplePrototype/scripts/build-release-web.sh
+bash ApplePrototype/scripts/archive-release.sh
+```
+
+The archive script refuses to run unless the App Store engine is bundled. It writes `ApplePrototype/build/SolidCraftTest.xcarchive`; open it in Xcode's Organizer to validate and upload. Bump `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` in Xcode before each upload, and run `build-local-web.sh` afterwards to return to the quick engine.
+
 ## Current iPad behavior
 
 - One finger orbits; two fingers pan and pinch to zoom. Finger gestures also operate interface controls.
