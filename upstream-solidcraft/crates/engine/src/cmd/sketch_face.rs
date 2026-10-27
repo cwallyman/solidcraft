@@ -123,10 +123,14 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
             }
             let faces = body.body.faces(tolerance)?;
             let mesh = body.body.tessellate(tolerance)?;
-            work = work.saturating_add(mesh.triangles.len().saturating_mul(if requested_index.is_some() { 1 } else { faces.len() }));
+            // The triangles are grouped by face once, and a face's test reads only its own: the
+            // work is the mesh plus one plane test per face, not the mesh once per face (a
+            // modelled thread leaves thousands of faces, #6720).
+            work = work.saturating_add(mesh.triangles.len()).saturating_add(faces.len());
             if work > 2_000_000 {
                 return Err(bad(cmd, "face capture work limit exceeded; use an exact body and face index"));
             }
+            let by_face = super::face_triangles(&mesh, faces.iter().map(|face| face.index.saturating_add(1)).max().unwrap_or(0));
             for face in faces {
                 if requested_index.is_some_and(|index| index != face.index) {
                     continue;
@@ -140,7 +144,7 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
                 };
                 let normal = exact_plane.normal();
                 if (local_point - face.centroid).dot(normal).abs() > tolerance * 10.0
-                    || !super::face_contains(&mesh, face.index, local_point, tolerance * 10.0)
+                    || !super::face_contains(&mesh, by_face.get(face.index).map_or(&[][..], Vec::as_slice), local_point, tolerance * 10.0)
                 {
                     continue;
                 }
@@ -192,7 +196,8 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
         {
             return Err(bad(
                 cmd,
-                "this face can't keep an attachment: it was merged from more than one feature's faces or reshaped by an edit. \
+                "this face can't keep an attachment: its history can't tell it apart from other faces (an edit reshaped it, \
+                 or more than one face could claim its name). \
                  Pick another face, or use a fixed plane here (fixed:true), which won't follow later changes to the face",
             ));
         }
@@ -205,7 +210,9 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
 pub(in crate::cmd) fn anchor(mut plane: &PlaneRef) -> Option<&solidcraft_doc::FaceAnchor> {
     loop {
         match plane {
-            PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => plane = base,
+            PlaneRef::Offset { base, .. } | PlaneRef::ThroughPoint { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => {
+                plane = base
+            }
             PlaneRef::Face { anchor, .. } => return anchor.as_deref(),
             _ => return None,
         }
@@ -215,7 +222,9 @@ pub(in crate::cmd) fn anchor(mut plane: &PlaneRef) -> Option<&solidcraft_doc::Fa
 pub(in crate::cmd) fn anchor_mut(mut plane: &mut PlaneRef) -> Option<&mut solidcraft_doc::FaceAnchor> {
     loop {
         match plane {
-            PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => plane = base,
+            PlaneRef::Offset { base, .. } | PlaneRef::ThroughPoint { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => {
+                plane = base
+            }
             PlaneRef::Face { anchor, .. } => return anchor.as_deref_mut(),
             _ => return None,
         }

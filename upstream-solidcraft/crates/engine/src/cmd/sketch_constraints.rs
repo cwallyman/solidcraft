@@ -41,14 +41,14 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("constrainer")
         .enabled(in_sketch)
         .params("entities: [one or two sketch entity ids]: applies the constraint the geometry nearly has (horizontal/vertical, parallel, perpendicular, collinear, coincident, concentric, equal, tangent)"),
-    CommandSpec::new("sketch.toggle_driven", "Toggle Driven Dimension", toggle_driven)
+    CommandSpec::new("sketch.toggle_driven", "Toggle Driven Dimension", toggle_driven).icon("dimension")
         .enabled(in_sketch)
         .params("constraint: dimension id, driven?: bool (default toggles); a driving dimension gets a parameter with its current value"),
-    CommandSpec::new("sketch.glyphs", "Constraint Glyphs", glyphs)
+    CommandSpec::new("sketch.glyphs", "Constraint Glyphs", glyphs).icon("eye")
         .enabled(in_sketch)
         .noundo()
         .params("sketch?: id|name: every constraint with where to draw its glyph (sketch coordinates)"),
-    CommandSpec::new("sketch.snap", "Snap Inference", snap)
+    CommandSpec::new("sketch.snap", "Snap Inference", snap).icon("snap")
         .enabled(in_sketch)
         .noundo()
         .params("at: [x,y], from?: [x,y] (previous click), radius?: mm (snap distance, default 1): what a click there would snap to and infer"),
@@ -126,8 +126,8 @@ fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKin
     let saved = sk.clone();
     let param = if dim {
         let v = k.value()?;
-        let e = if k.is_angle() { format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6) } else { format!("{} mm", (v * 1e6).round() / 1e6) };
-        Some(doc.new_model_param(&e, if k.is_angle() { "deg" } else { "mm" }))
+        let (unit, e) = if k.is_angle() { ("deg".into(), format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6)) } else { doc.design_length(v) };
+        Some(doc.new_model_param(&e, &unit))
     } else {
         None
     };
@@ -138,7 +138,7 @@ fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKin
         return None;
     }
     let mut trial = sk.clone();
-    let rep = solidcraft_sketch::solve(&mut trial);
+    let rep = solidcraft_sketch::solve_with(&mut trial, &solidcraft_sketch::Hold::default(), None, solidcraft_sketch::Analysis::Freedom, None);
     if rep.ok() && rep.dof < dof {
         *sk = trial;
         return Some(rep.dof);
@@ -150,13 +150,12 @@ fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKin
     None
 }
 
-fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datum: usize) -> (Vec<String>, usize) {
+fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datum: usize, mut dof: usize) -> (Vec<String>, usize) {
     use ConstraintKind::*;
     let tol = num(p, "tolerance").filter(|t| *t > 0.0).unwrap_or(0.01);
     let atol = num(p, "angle_tolerance").filter(|t| *t > 0.0).unwrap_or(1.0).to_radians();
     let dims = crate::params::bool_(p, "dimensions").unwrap_or(true);
     let n0 = sk.constraints.len();
-    let mut dof = dof_now(sk);
     let mut trials = 0;
     let mut attempt = |sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKind, dim: bool, dof: &mut usize| {
         if *dof == 0 || trials >= MAX_TRIALS {
@@ -219,13 +218,13 @@ fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datu
         }
     }
     if dims {
+        // Construction curves have degrees of freedom too: locating a circle's centre
+        // does not constrain its radius. Dimension them just like profile curves.
         for i in 0..nc {
-            let k = match sk.curves.get(i).map(|c| (c.kind.clone(), c.construction)) {
-                Some((CurveKind::Circle { r, .. }, false)) => Diameter { c: i, value: 2.0 * r },
-                Some((CurveKind::Arc { .. }, false)) => Radius { c: i, value: sk.radius(i).unwrap_or(1.0) },
-                Some((CurveKind::Line { a, b }, false)) => {
-                    Length { l: i, value: sk.point(a).zip(sk.point(b)).map(|(x, y)| x.dist(y)).unwrap_or(1.0) }
-                }
+            let k = match sk.curves.get(i).map(|c| c.kind.clone()) {
+                Some(CurveKind::Circle { r, .. }) => Diameter { c: i, value: 2.0 * r },
+                Some(CurveKind::Arc { .. }) => Radius { c: i, value: sk.radius(i).unwrap_or(1.0) },
+                Some(CurveKind::Line { a, b }) => Length { l: i, value: sk.point(a).zip(sk.point(b)).map(|(x, y)| x.dist(y)).unwrap_or(1.0) },
                 _ => continue,
             };
             attempt(sk, doc, k, true, &mut dof);
@@ -258,7 +257,9 @@ fn auto(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         if !rep.keeps_orientation() {
             return Err(bad(cmd, rep.failure(|f| format!("the sketch constraints conflict ({f})"))));
         }
-        Ok(run_auto(sk, doc, p, datum))
+        // This is the exact state just solved for the current parameter values. Trials update
+        // its freedom whenever they change constraints; no separate initial solve is needed.
+        Ok(run_auto(sk, doc, p, datum, rep.dof))
     })?;
     Ok(json!({"added": added, "dof": dof, "sketch": info}))
 }
@@ -382,13 +383,10 @@ fn toggle_driven(s: &mut Session, p: &Value) -> Result<Value> {
             slot.driven = true;
             slot.param = None;
         } else {
-            let (unit, e) = if c.kind.is_angle() {
-                ("deg", format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6))
-            } else {
-                ("mm", format!("{} mm", (v * 1e6).round() / 1e6))
-            };
+            let (unit, e) =
+                if c.kind.is_angle() { ("deg".into(), format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6)) } else { doc.design_length(v) };
             slot.driven = false;
-            slot.param = Some(doc.new_model_param(&e, unit));
+            slot.param = Some(doc.new_model_param(&e, &unit));
             before = None;
         }
         Ok(driven)
@@ -430,6 +428,9 @@ fn anchor(sk: &Sketch, k: &ConstraintKind) -> Option<Vec2> {
     };
     let pt = |p: usize| sk.point(p);
     match *k {
+        OffsetDistance { ref output, .. } => sk.offset_dimension_points(output).map(|(a, b)| (a + b) * 0.5),
+        PatternPoint { q, center, .. } => pt(center.unwrap_or(q)),
+        PatternRadius { b, .. } => mid(b),
         Coincident { p, .. } | Fix { p } | Midpoint { p, .. } => pt(p),
         PointOnCurve { p, .. } => pt(p),
         HorizontalPoints { p, q } | VerticalPoints { p, q } | Symmetric { p, q, .. } => Some((pt(p)? + pt(q)?) * 0.5),
@@ -445,6 +446,9 @@ fn anchor(sk: &Sketch, k: &ConstraintKind) -> Option<Vec2> {
         }
         Distance { p, q, .. } | DistanceX { p, q, .. } | DistanceY { p, q, .. } => Some((pt(p)? + pt(q)?) * 0.5),
         PointLineDistance { p, .. } | LinearDiameter { p, .. } => pt(p),
+        LineCircleDistance { c, .. } => sk.center(c),
+        PointCircleDistance { p, .. } => pt(p),
+        CircleCircleDistance { a, b, .. } => Some((sk.center(a)? + sk.center(b)?) * 0.5),
         Length { l, .. } | LineAngle { l, .. } => mid(l),
         Radius { c, .. } | Diameter { c, .. } | ArcLength { c, .. } | ArcSweep { c, .. } => mid(c),
         SlotOverallLength { a, b, .. } => Some((sk.center(a)? + sk.center(b)?) * 0.5),

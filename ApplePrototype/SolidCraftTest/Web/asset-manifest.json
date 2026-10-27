@@ -1,13 +1,13 @@
 {
   "origin": "local source build",
-  "base_revision": "2bb24d1d2ab3c06bac41265716b6e4b3801fa857",
+  "base_revision": "c2a57a44ab812f929ecf18eb536d2e22fcd2ff53",
   "modified_source": true,
   "profile": "release, Rust optimization enabled, wasm-opt disabled for prototype iteration",
   "files": [
     {
       "file": "ATTRIBUTION.md",
-      "sha256": "645a44a9972ff398066669764ef9e44c2ecb9f7ce10cad9bfc1060013bd9e203",
-      "bytes": 16182
+      "sha256": "7cdbebb11c06377e9ab31483da7d0cf2fe7ed57da57f900888494937ea5611d8",
+      "bytes": 202896
     },
     {
       "file": "LICENSE-APACHE",
@@ -21,13 +21,18 @@
     },
     {
       "file": "NOTICE",
-      "sha256": "aaeb733fb3e10751329eeedae8f16386dd1a9cd320d7037f3d63e9ff1a74a66d",
-      "bytes": 1648
+      "sha256": "09464b0c8f495c9e3c80d93fccf667056d1c2c306445d66101e4bed49494c54d",
+      "bytes": 2297
     },
     {
       "file": "THIRD-PARTY-LICENSES.txt",
-      "sha256": "fa8d1f505f68267e8a68ec075ddd09500454ef3f212b27f59506f95f5a182d6e",
-      "bytes": 726894
+      "sha256": "e97519baf3b1f9eef34f918b2e197b61f0f4f8e421726bbf8f4177a8eb5fe04d",
+      "bytes": 900646
+    },
+    {
+      "file": "build.json",
+      "sha256": "86486d932d71d20353c51a2f79408d73f5474e321b35be18b2922230bc17bb83",
+      "bytes": 1113
     },
     {
       "file": "fonts/BIZUDPGothic-Regular.ttf",
@@ -40,19 +45,54 @@
       "bytes": 4408
     },
     {
+      "file": "icons/256x256/ai.storyteller.solidcraft.png",
+      "sha256": "71a3e492720571cf572faa51d86a7ff75e9d7dea0916142b51de835bf857c5af",
+      "bytes": 21402
+    },
+    {
+      "file": "icons/32x32/ai.storyteller.solidcraft.png",
+      "sha256": "894552719c6bf8aa91f9d3ab3f1cb61836708f9ba00daf0324175ac82f16dfab",
+      "bytes": 1615
+    },
+    {
+      "file": "icons/512x512/ai.storyteller.solidcraft.png",
+      "sha256": "84fde8ef270f5b32afa2d661749b4778a205e7df980dd67795c10f7f4a69e15d",
+      "bytes": 48726
+    },
+    {
       "file": "index.html",
-      "sha256": "d97e4df3e3fcc596af0f2ce7819a014cc8b5a7a6531b3517fc419e1f8493d480",
-      "bytes": 2541
+      "sha256": "68330028e279d472a6353e80ca35bc1b119cacd118e1b555eabf2bc3622705f2",
+      "bytes": 3252
     },
     {
-      "file": "solidcraft-web-3967bd64c0cae432.js",
-      "sha256": "4aa591b8007798022ed2cc05528f43bbcb7652f840957bfb3681f06b81b95e54",
-      "bytes": 160143
+      "file": "loading-fa23566dd89fa92b.css",
+      "sha256": "6beeebe803106340480ebee6554cf7c1c33a2ce0410bcb42d7fd4f78e3dee7f2",
+      "bytes": 735
     },
     {
-      "file": "solidcraft-web-3967bd64c0cae432_bg.wasm",
-      "sha256": "ebd60fe268e695863b4d7c58f9ab295a9e1760ec11ab839d7cf691d621a27266",
-      "bytes": 34814487
+      "file": "loading-logo.svg",
+      "sha256": "31d87162bb6a5a189bf60575981a1ef24c245d209783d9ad08b8318f66146e3d",
+      "bytes": 13375
+    },
+    {
+      "file": "manifest.webmanifest",
+      "sha256": "5e7f98b21b14062b83141e3d751a1e8fe5d85eb9a0496e464c1ed1cb5029aef1",
+      "bytes": 614
+    },
+    {
+      "file": "solidcraft-web-7dc756c37282812f.js",
+      "sha256": "20f7c1470a38abef8e1524ae97289811fc1c1c1973b99d52cccdbd4b10a261c3",
+      "bytes": 180544
+    },
+    {
+      "file": "solidcraft-web-7dc756c37282812f_bg.wasm",
+      "sha256": "f65b52bdb08896355722c798fcc263a6d8f678138de7c19059178b3d776b40da",
+      "bytes": 90928956
+    },
+    {
+      "file": "sw.js",
+      "sha256": "921957ac9e25f73b1c79d752db839af867c55d88e76a39d78e5bc88a673491c9",
+      "bytes": 12682
     }
   ]
 }

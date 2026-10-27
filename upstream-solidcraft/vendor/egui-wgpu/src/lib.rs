@@ -41,6 +41,35 @@ use std::sync::Arc;
 
 use epaint::mutex::RwLock;
 
+/// SolidCraft: what [`set_startup_hook`] is told before each step of getting the graphics
+/// device and the window's surface up, so a crash inside the driver (with no Rust panic) can
+/// still say which step it died in. `detail` is empty except for [`STEP_ADAPTER_CHOSEN`].
+pub type StartupHook = fn(step: &'static str, detail: &str);
+
+static STARTUP_HOOK: std::sync::OnceLock<StartupHook> = std::sync::OnceLock::new();
+
+/// SolidCraft: the steps [`StartupHook`] is told about, in order.
+pub const STEP_INSTANCE: &str = "graphics instance";
+pub const STEP_SURFACE: &str = "window surface";
+pub const STEP_ADAPTER: &str = "adapter request";
+/// The adapter was picked; `detail` names it, its backend and driver.
+pub const STEP_ADAPTER_CHOSEN: &str = "adapter chosen";
+pub const STEP_DEVICE: &str = "device creation";
+pub const STEP_RENDERER: &str = "egui renderer (shader compile)";
+pub const STEP_SURFACE_CONFIGURE: &str = "surface configure";
+pub const STEP_FIRST_PRESENT: &str = "first frame (present)";
+
+/// SolidCraft: install the startup hook (once; later calls are ignored).
+pub fn set_startup_hook(hook: StartupHook) {
+    let _ = STARTUP_HOOK.set(hook);
+}
+
+pub(crate) fn startup_step(step: &'static str, detail: &str) {
+    if let Some(hook) = STARTUP_HOOK.get() {
+        hook(step, detail);
+    }
+}
+
 /// An error produced by egui-wgpu.
 #[derive(thiserror::Error, Debug)]
 pub enum WgpuError {
@@ -55,6 +84,10 @@ pub enum WgpuError {
 
     #[error(transparent)]
     RequestDeviceError(#[from] wgpu::RequestDeviceError),
+
+    /// SolidCraft: pipeline validation must return to the startup retry.
+    #[error("Could not create the egui renderer: {0}")]
+    CreateRendererError(wgpu::Error),
 
     #[error(transparent)]
     CreateSurfaceError(#[from] wgpu::CreateSurfaceError),
@@ -102,6 +135,65 @@ impl SurfaceConfig {
     };
 }
 
+/// SolidCraft: whether a device was lost (the driver reset it, Windows' TDR among others, #4172).
+///
+/// A lost device can't be used again. wgpu only learns of the loss when a call into the driver
+/// fails: from then on every call on the device fails quietly, and the device's lost callback
+/// marks this. But a queue write that is the first call to meet the loss panics inside wgpu
+/// (`PendingWrites::activate`), so the painter first submits nothing ([`DeviceLost::probe`]):
+/// that submission meets the loss instead, and the frame's uploads are skipped.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceLost {
+    lost: Arc<std::sync::atomic::AtomicBool>,
+    reason: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl DeviceLost {
+    /// Watch `device`: its lost callback marks the loss. A device has one lost callback, so this
+    /// replaces any set before.
+    pub fn watch(device: &wgpu::Device) -> Self {
+        let lost = Self::default();
+        let seen = lost.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            seen.mark(&format!("{reason:?}: {message}"));
+        });
+        lost
+    }
+
+    /// Mark the device lost, for `reason` (the first reason is kept).
+    pub fn mark(&self, reason: &str) {
+        if let Ok(mut kept) = self.reason.lock() {
+            kept.get_or_insert_with(|| reason.to_owned());
+        }
+        self.lost.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The device was lost.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Why the device was lost, as wgpu said it.
+    pub fn reason(&self) -> Option<String> {
+        self.reason.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// The flag [`DeviceLost::is_lost`] reads, for others drawing on the same device.
+    pub fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.lost.clone()
+    }
+
+    /// Whether the device is lost, asking the driver first: an empty submission reaches the
+    /// driver, so a loss it reports is marked here rather than met by the next upload.
+    pub fn probe(&self, queue: &wgpu::Queue) -> bool {
+        if self.is_lost() {
+            return true;
+        }
+        queue.submit([]);
+        self.is_lost()
+    }
+}
+
 /// Access to the render state for egui.
 #[derive(Clone)]
 pub struct RenderState {
@@ -142,6 +234,9 @@ pub struct RenderState {
     ///
     /// Update this to have the surface reconfigured on the next paint.
     pub surface_config: SurfaceConfig,
+
+    /// SolidCraft: the device was lost; the painter draws nothing more (#4172).
+    pub device_lost: DeviceLost,
 }
 
 async fn request_adapter(
@@ -226,6 +321,7 @@ impl RenderState {
                 wgpu::Backends::all()
             };
 
+            startup_step(STEP_ADAPTER, ""); // SolidCraft
             instance.enumerate_adapters(backends).await
         };
 
@@ -243,20 +339,36 @@ impl RenderState {
                         request_adapter(instance, power_preference, compatible_surface, &[]).await
                     }
                     #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(native_adapter_selector) = _native_adapter_selector {
-                        native_adapter_selector(&available_adapters, compatible_surface)
-                            .map_err(WgpuError::CustomNativeAdapterSelectionError)
-                    } else {
-                        request_adapter(
-                            instance,
-                            power_preference,
-                            compatible_surface,
-                            &available_adapters,
-                        )
-                        .await
+                    {
+                        let selected = _native_adapter_selector
+                            .map(|select| select(&available_adapters, compatible_surface))
+                            .transpose()
+                            .map_err(WgpuError::CustomNativeAdapterSelectionError)?
+                            .flatten();
+                        if let Some(adapter) = selected {
+                            Ok(adapter)
+                        } else {
+                            request_adapter(
+                                instance,
+                                power_preference,
+                                compatible_surface,
+                                &available_adapters,
+                            )
+                            .await
+                        }
                     }
                 }?;
 
+                // SolidCraft: name the adapter before the driver is asked for a device.
+                let info = adapter.get_info();
+                startup_step(
+                    STEP_ADAPTER_CHOSEN,
+                    &format!(
+                        "{:?} {} ({:?}, driver {} {})",
+                        info.backend, info.name, info.device_type, info.driver, info.driver_info
+                    ),
+                );
+                startup_step(STEP_DEVICE, "");
                 let (device, queue) = {
                     profiling::scope!("request_device");
                     adapter
@@ -273,6 +385,8 @@ impl RenderState {
                 queue,
             }) => (instance, adapter, device, queue),
         };
+        // SolidCraft: a device the driver loses stops the painter, not the app (#4172).
+        let device_lost = DeviceLost::watch(&device);
 
         log_adapter_info(&adapter.get_info());
 
@@ -303,7 +417,26 @@ impl RenderState {
             msaa_samples,
             ..options
         };
+        startup_step(STEP_RENDERER, ""); // SolidCraft
+        // SolidCraft: capture errors on the real surface/device, including driver shader
+        // compilation failures, before wgpu's default uncaptured-error handler can panic.
+        // Await every scope (also on WebGPU); an invalid renderer is never handed to eframe.
+        let scopes = [
+            wgpu::ErrorFilter::OutOfMemory,
+            wgpu::ErrorFilter::Internal,
+            wgpu::ErrorFilter::Validation,
+        ]
+        .map(|filter| device.push_error_scope(filter));
         let renderer = Renderer::new(&device, target_format, options);
+        let mut failed = None;
+        for scope in scopes.into_iter().rev() {
+            if let Some(error) = scope.pop().await {
+                failed.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failed {
+            return Err(WgpuError::CreateRendererError(error));
+        }
 
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
         // It doesn't make sense to switch to Rc for that special usecase, so simply disable the lint.
@@ -320,6 +453,7 @@ impl RenderState {
             msaa_supported,
             renderer: Arc::new(RwLock::new(renderer)),
             surface_config: config.surface,
+            device_lost,
         })
     }
 }
@@ -668,5 +802,183 @@ mod msaa_tests {
         assert_eq!(super::msaa_counts(adapter, Some(F::MULTISAMPLE_X4)), [1, 4]);
         assert_eq!(super::msaa_counts(F::MULTISAMPLE_X4, None), [1]);
         assert_eq!(super::clamp_msaa_samples(&[], 8), 1);
+    }
+}
+
+/// SolidCraft: run `f` with `device`'s errors captured, and the first error it caused. Uncaptured,
+/// an error goes to the device's handler, which panics by default: a surface the driver can't
+/// reconfigure (D3D12 "Failed to wait for GPU to come idle", #1935) crashed the app. Native error
+/// scopes resolve at once; on the web the scope still keeps the error from the handler.
+pub fn capture_errors<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> (T, Option<wgpu::Error>) {
+    let scopes = [
+        wgpu::ErrorFilter::OutOfMemory,
+        wgpu::ErrorFilter::Internal,
+        wgpu::ErrorFilter::Validation,
+    ]
+    .map(|filter| device.push_error_scope(filter));
+    let value = f();
+    let mut failed = None;
+    for scope in scopes.into_iter().rev() {
+        let mut popped = std::pin::pin!(scope.pop());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(Some(error)) =
+            std::future::Future::poll(popped.as_mut(), &mut cx)
+        {
+            failed.get_or_insert(error);
+        }
+    }
+    (value, failed)
+}
+
+/// SolidCraft: refused configures in a row after which the surface is recreated (#1935).
+pub const SURFACE_RECREATE_AFTER: u32 = 3;
+
+/// SolidCraft: a surface's streak of refused configures (#1935) and when the next try is due.
+/// A refusal waits 16 ms, doubling with each refusal in a row up to 1 s, and every
+/// [`SURFACE_RECREATE_AFTER`] refusals the surface is recreated before the next try. Until the
+/// try is due, no configure or recreate happens however often the window repaints, so a device
+/// that keeps refusing costs a try a second instead of one a frame. A configure the device takes
+/// ends the streak, a recreate still pending included. The clock is passed in, for tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConfigureRetry {
+    failures: u32,
+    due: Option<web_time::Instant>,
+    /// The streak asked for a recreate that hasn't happened yet.
+    recreate: bool,
+}
+
+/// SolidCraft: what follows a refused configure ([`ConfigureRetry::refused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryPlan {
+    /// Refusals in a row, this one included.
+    pub failures: u32,
+    /// The first refusal of the streak: the one worth a warning.
+    pub first: bool,
+    /// How long until the next try.
+    pub delay: std::time::Duration,
+    /// This refusal asked for the surface to be recreated before the next try.
+    pub recreate: bool,
+}
+
+impl ConfigureRetry {
+    /// Refusals in a row so far.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// How long until the next try is due at `now`; `None` when a configure may go ahead (no
+    /// refusal pending, or its delay has passed).
+    pub fn wait(&self, now: web_time::Instant) -> Option<std::time::Duration> {
+        self.due
+            .and_then(|due| due.checked_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Whether a configure (or recreate) may go ahead at `now`.
+    pub fn is_due(&self, now: web_time::Instant) -> bool {
+        self.wait(now).is_none()
+    }
+
+    /// Whether the streak asked for a recreate that hasn't happened yet.
+    pub fn recreate_pending(&self) -> bool {
+        self.recreate
+    }
+
+    /// Whether the surface should be recreated at `now`: a recreate is pending and its try is due.
+    pub fn recreate_due(&self, now: web_time::Instant) -> bool {
+        self.recreate && self.is_due(now)
+    }
+
+    /// The surface was recreated: no recreate is pending. The streak and its deadline stay.
+    pub fn recreated(&mut self) {
+        self.recreate = false;
+    }
+
+    /// The device refused a configure at `now`: the streak grows and the next try waits.
+    pub fn refused(&mut self, now: web_time::Instant) -> RetryPlan {
+        self.failures = self.failures.saturating_add(1);
+        let doublings = self.failures.saturating_sub(1).min(6);
+        let delay = std::time::Duration::from_millis((16u64 << doublings).min(1000));
+        // A deadline past the clock's range can't happen in practice; it would make the try due.
+        self.due = now.checked_add(delay);
+        let recreate = self.failures % SURFACE_RECREATE_AFTER == 0;
+        self.recreate |= recreate;
+        RetryPlan {
+            failures: self.failures,
+            first: self.failures == 1,
+            delay,
+            recreate,
+        }
+    }
+
+    /// The device took a configure: the streak ends, and a pending recreate with it. Returns how
+    /// many refusals it had.
+    pub fn took(&mut self) -> u32 {
+        std::mem::take(self).failures
+    }
+
+    /// Runs `configure` at `now` unless a refused one's retry isn't due yet, and keeps the
+    /// streak. The surface's configures all go through here, so an early repaint (input, an
+    /// animation) can't bring a retry forward.
+    pub fn attempt<E>(
+        &mut self,
+        now: web_time::Instant,
+        configure: impl FnOnce() -> Result<(), E>,
+    ) -> Attempt<E> {
+        if let Some(left) = self.wait(now) {
+            return Attempt::Waiting(left);
+        }
+        match configure() {
+            Ok(()) => Attempt::Took(self.took()),
+            Err(error) => Attempt::Refused(self.refused(now), error),
+        }
+    }
+}
+
+/// SolidCraft: what came of [`ConfigureRetry::attempt`].
+#[derive(Debug)]
+pub enum Attempt<E> {
+    /// Not tried: the retry after a refusal is due in this long.
+    Waiting(std::time::Duration),
+    /// The configure was taken, after this many refusals in a row (0 when none).
+    Took(u32),
+    /// The configure was refused with this error; the plan says what follows.
+    Refused(RetryPlan, E),
+}
+
+/// SolidCraft: the surface size for a window of `width` x `height` pixels on a device whose
+/// textures are at most `max_side` on a side, and the scale it is drawn at. A window that fits is
+/// unchanged (scale 1); a larger one shrinks uniformly, keeping its aspect ratio, so the image
+/// the compositor stretches back over the window is not distorted. Never zero on a side.
+pub fn clamp_surface_extent(width: u32, height: u32, max_side: u32) -> (u32, u32, f32) {
+    let max_side = max_side.max(1);
+    let (width, height) = (width.max(1), height.max(1));
+    let longest = width.max(height);
+    if longest <= max_side {
+        return (width, height, 1.0);
+    }
+    let scale = f64::from(max_side) / f64::from(longest);
+    let fit = |side: u32| -> u32 {
+        let scaled = (f64::from(side) * scale).floor() as u32;
+        scaled.clamp(1, max_side)
+    };
+    let scale_f32 = scale as f32;
+    (fit(width), fit(height), scale_f32)
+}
+
+#[cfg(test)]
+mod device_lost_tests {
+    /// A loss is marked once, with the first reason, and every clone (and the shared flag) sees it.
+    #[test]
+    fn a_marked_loss_is_seen_by_every_clone() {
+        let lost = super::DeviceLost::default();
+        let painter = lost.clone();
+        let flag = lost.flag();
+        assert!(!painter.is_lost() && lost.reason().is_none());
+        lost.mark("Unknown: Device lost");
+        lost.mark("Destroyed: ");
+        assert!(painter.is_lost());
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(painter.reason().as_deref(), Some("Unknown: Device lost"));
     }
 }

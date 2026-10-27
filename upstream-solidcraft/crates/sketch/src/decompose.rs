@@ -75,31 +75,54 @@ pub(crate) const MAX_WORK: usize = 20_000_000;
 /// frame (see [`Budget::exhausted`]).
 pub(crate) const FRAME_WORK: usize = 1_000_000;
 
-/// Work the seed's cluster decomposition may do, shared by the solves it is passed to (the held
-/// solves of one drag frame): each decomposition is bounded by what is left, and charges what it
-/// did.
+/// Work shared by the held solves and feasible cursor correction of one drag frame. Cluster
+/// decomposition charges membership scans; cursor correction reserves estimates of dense
+/// arithmetic before starting it. These deterministic units approximate time, not a deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
     left: usize,
     spent: usize,
     cut: bool,
+    /// A live drag frame's allowance for the numerical solves (LM), which are counted but never
+    /// stopped by it: once it is spent, the drag takes no more steps this frame (`None`: not
+    /// counted).
+    numeric_left: Option<usize>,
 }
 
 impl Budget {
-    /// A budget of `work` units (a unit is one membership scan of the merge search).
+    /// A budget of `work` units: membership scans or estimated dense arithmetic operations.
     pub fn new(work: usize) -> Budget {
-        Budget { left: work, spent: 0, cut: false }
+        Budget { left: work, spent: 0, cut: false, numeric_left: None }
     }
     /// The budget of one solve: about 0.3 s, so a hostile sketch can't stall it.
     pub fn full() -> Budget {
         Budget::new(MAX_WORK)
     }
-    /// The budget of one live drag frame: about 16 ms.
+    /// The budget of one live drag frame: about 16 ms, and as much again for its numerical
+    /// solves ([`Budget::numeric_exhausted`]).
     pub fn frame() -> Budget {
-        Budget::new(FRAME_WORK)
+        Budget { numeric_left: Some(FRAME_WORK), ..Budget::new(FRAME_WORK) }
     }
-    /// Some decomposition stopped because the budget ran out: what it would have placed was
-    /// left to LM, from where it was.
+    /// The frame's numerical solves have done their share of work: a drag takes no more steps
+    /// this frame and goes on in the next.
+    pub fn numeric_exhausted(&self) -> bool {
+        self.numeric_left == Some(0)
+    }
+    /// This budget with `work` units for its numerical solves (a frame that runs out sooner).
+    pub fn with_numeric(self, work: usize) -> Budget {
+        Budget { numeric_left: Some(work), ..self }
+    }
+    /// Whether the numerical solves' work is counted ([`Budget::frame`]).
+    pub(crate) fn counts_numeric(&self) -> bool {
+        self.numeric_left.is_some()
+    }
+    /// Count a numerical solve's work against the frame's allowance.
+    pub(crate) fn charge_numeric(&mut self, work: usize) {
+        if let Some(left) = &mut self.numeric_left {
+            *left = left.saturating_sub(work);
+        }
+    }
+    /// Some decomposition or cursor work stopped because the budget ran out.
     pub fn exhausted(&self) -> bool {
         self.cut
     }
@@ -110,6 +133,17 @@ impl Budget {
     pub(crate) fn left(&self) -> usize {
         self.left
     }
+    /// Reserve estimated dense arithmetic before starting it. Unlike a decomposition scan,
+    /// a dense operation can be large, so it must not overshoot the remaining work.
+    pub(crate) fn try_charge(&mut self, work: usize) -> bool {
+        if work > self.left {
+            self.cut = true;
+            return false;
+        }
+        self.charge(work, false);
+        true
+    }
+
     /// Charge a decomposition's `work`; `cut` when it stopped at the budget.
     pub(crate) fn charge(&mut self, work: usize, cut: bool) {
         self.left = self.left.saturating_sub(work);

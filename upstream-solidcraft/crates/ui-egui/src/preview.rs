@@ -2,8 +2,13 @@
 //! scratch copy of the session ([`solidcraft_engine::Session::preview`]), off the UI thread
 //! where threads exist, and the result is drawn in place of the bodies it changes: new surface
 //! tinted, removed material as a translucent ghost. The last good preview stays up while the
-//! next one computes or when an input makes the feature fail (the error shows in the dialog).
+//! next one computes; once the current inputs make the feature fail, nothing is previewed and
+//! the error shows in the dialog (#3254).
 //! Nothing here touches the document or the undo history.
+//!
+//! A feature that adds or removes a tool body (join, cut, intersect) shows only its tool. That
+//! is all its preview builds: its boolean, which can take seconds (a text joined onto a part),
+//! runs once, on OK, and an error it finds shows then, the dialog staying open.
 
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -11,7 +16,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use serde_json::Value;
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::ModelState;
-use solidcraft_engine::geom::{Aabb3, Mesh, Vec3};
+use solidcraft_engine::geom::{Aabb3, Mesh, Ring, Vec3};
 
 use crate::SolveApp;
 use crate::gpu::{GpuScene, SceneSlot};
@@ -22,20 +27,42 @@ use crate::theme::Tokens;
 pub struct Colors {
     pub body: [u8; 4],
     pub added: [u8; 4],
+    /// A body the preview creates (New Body), so it doesn't look like a join.
+    pub new_body: [u8; 4],
     pub removed: [u8; 4],
     pub edge: [u8; 4],
+    /// Whether a moved component's old place is drawn as a ghost (Drive Joints' Show ghost).
+    pub ghost: bool,
 }
 
 impl Colors {
     pub fn from_tokens(t: &Tokens) -> Colors {
         let c = |c: egui::Color32| c.to_srgba_unmultiplied();
-        Colors { body: c(t.body), added: c(t.preview_add), removed: c(t.preview_cut), edge: c(t.body_edge) }
+        Colors { body: c(t.body), added: c(t.preview_add), new_body: c(t.preview_new), removed: c(t.preview_cut), edge: c(t.body_edge), ghost: true }
     }
+
+    fn for_tool(t: &Tokens, tab: &str, active: bool) -> Colors {
+        let mut colors = Self::from_tokens(t);
+        let accent = crate::theme::TabAccent::for_tab(t, tab);
+        if active && accent.color != t.accent {
+            colors.added = accent.color.to_srgba_unmultiplied();
+            colors.new_body = t.body.lerp_to_gamma(accent.color, 0.45).to_srgba_unmultiplied();
+        }
+        // Removed material retains its warning colour and opacity.
+        colors
+    }
+}
+
+pub struct SketchPreview {
+    pub sketch: std::sync::Arc<solidcraft_engine::doc::SolvedSketch>,
+    pub curves: Vec<usize>,
+    pub points: Vec<usize>,
 }
 
 /// A computed preview: the scene to draw and the bodies it stands in for.
 pub struct Built {
     pub scene: GpuScene,
+    pub sketches: Vec<SketchPreview>,
     pub replaced: Vec<String>,
     /// Why the feature failed, when the scene only shows its tool body.
     pub error: Option<String>,
@@ -44,6 +71,11 @@ pub struct Built {
     /// The smallest and largest radius a fillet used when it reduced one too large for its edges
     /// (`fit: reduce`).
     pub applied: Option<(f64, f64)>,
+    /// The radius spline of each edge a fillet tapered (`fit: taper`), with a point on the edge.
+    pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
+    /// The reply of a previewed drive that stopped short of the asked values (the dialog says
+    /// where and why, in the UI's language).
+    pub stopped: Option<serde_json::Value>,
 }
 
 type Job = Result<Built, String>;
@@ -53,6 +85,10 @@ pub struct PreviewState {
     /// Key of the commands whose result (or error) is shown.
     shown_key: Option<u64>,
     running: Option<(u64, Receiver<Job>)>,
+    /// The running job builds a tool alone (for a join, cut or intersect).
+    running_tool: bool,
+    /// Inputs of a joint or distance preview, excluding only its driven values.
+    running_stream_key: Option<u64>,
     /// Bodies the preview stands in for (hidden in the model scene).
     pub replaced: Vec<String>,
     /// The preview scene for the GPU and its key (changes whenever the scene does).
@@ -60,7 +96,8 @@ pub struct PreviewState {
     pub key: u64,
     /// Is a preview scene up?
     pub active: bool,
-    /// Why the current inputs don't make a feature (the last good preview stays up).
+    pub sketches: Vec<SketchPreview>,
+    /// Why the current inputs don't make a feature (nothing is previewed then).
     pub error: Option<String>,
     /// A preview is being computed.
     pub busy: bool,
@@ -71,21 +108,56 @@ pub struct PreviewState {
     started: f64,
     /// The smallest and largest radius the previewed fillet used when it reduced the one asked for.
     pub applied: Option<(f64, f64)>,
+    /// The reply of a previewed drive that stopped short (see [`Built::stopped`]).
+    pub stopped: Option<serde_json::Value>,
+    /// The radius splines the previewed fillet tapered its edges with.
+    pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
+    straight: crate::extrude_preview::StraightPreview,
+    moving: crate::move_preview::MovePreview,
+    /// PreviewReselect: Primary held - hide the preview and restore replaced bodies for picks.
+    pub rolled_back: bool,
 }
 
 impl PreviewState {
-    fn clear(&mut self) {
-        self.running = None;
-        self.shown_key = None;
-        self.error = None;
-        self.applied = None;
-        self.busy = false;
+    /// Bodies the model scene should hide for the preview (empty while rolled back).
+    pub fn effective_replaced(&self) -> &[String] {
+        if self.rolled_back { &[] } else { &self.replaced }
+    }
+
+    /// Stop drawing the preview scene and give the bodies it stood in for back to the model.
+    fn hide_scene(&mut self) {
         if self.active || !self.replaced.is_empty() {
             self.active = false;
             self.bounds = Aabb3::EMPTY;
             self.replaced.clear();
             self.set_scene(GpuScene::default());
         }
+    }
+
+    fn clear(&mut self) {
+        self.straight.clear();
+        self.moving.clear();
+        self.running = None;
+        self.running_tool = false;
+        self.running_stream_key = None;
+        self.shown_key = None;
+        self.error = None;
+        self.applied = None;
+        self.stopped = None;
+        self.tapered.clear();
+        self.sketches.clear();
+        self.busy = false;
+        self.rolled_back = false;
+        self.hide_scene();
+    }
+
+    /// Drop the preview of a design that leaves the window. Its scene goes too: the viewport
+    /// keeps drawing the last scene it took until the slot it reads hands it another, so a fresh
+    /// state (another slot, empty) would leave the old preview drawn over the next design.
+    pub fn reset(&mut self) {
+        let (slot, key) = (std::mem::take(&mut self.slot), self.key);
+        *self = PreviewState { slot, key, ..PreviewState::default() };
+        self.set_scene(GpuScene::default());
     }
 
     fn set_scene(&mut self, sc: GpuScene) {
@@ -100,24 +172,34 @@ impl PreviewState {
         self.ms = crate::now_ms() - self.started;
         match job {
             Ok(b) => {
+                self.sketches = b.sketches;
                 self.replaced = b.replaced;
                 self.bounds = b.bounds;
                 self.active = true;
                 self.error = b.error;
                 self.applied = b.applied;
+                self.stopped = b.stopped;
+                self.tapered = b.tapered;
                 self.set_scene(b.scene);
             }
+            // The current inputs make no feature: the last good geometry would contradict
+            // them (a 1 mm extrusion still drawn at 0 mm), so nothing is drawn.
             Err(e) => {
+                self.hide_scene();
+                self.sketches.clear();
                 self.error = Some(e);
                 self.applied = None;
+                self.stopped = None;
+                self.tapered.clear();
             }
         }
     }
 
     /// Errors validate only the current inputs. Keep the last good geometry while
     /// computing new inputs, but never let an obsolete result block their Apply.
-    fn poll(&mut self, key: u64) {
+    fn poll(&mut self, key: u64, stream_key: Option<u64>) {
         if self.shown_key != Some(key) {
+            self.sketches.clear();
             self.error = None;
         }
         if let Some((k, rx)) = &self.running {
@@ -129,7 +211,15 @@ impl PreviewState {
             };
             if let Some(job) = job {
                 self.running = None;
-                if k == key {
+                let good = matches!(&job, Ok(b) if b.error.is_none());
+                let intermediate = good && (self.running_tool || stream_key.is_some() && self.running_stream_key == stream_key);
+                self.running_stream_key = None;
+                self.running_tool = false;
+                // A held slider, a dragged arrow or an animation may advance faster than the
+                // worker. Show completed joint/distance results from the same setup, and tools built for
+                // inputs since changed, then compute the latest. Errors still require an exact
+                // key.
+                if k == key || intermediate {
                     self.apply(k, job);
                 }
             }
@@ -137,10 +227,89 @@ impl PreviewState {
     }
 }
 
+/// Joint motion can stream successful intermediate poses while values change. Include
+/// every other input, the document revision and colours so a different joint, changed
+/// limits, feature dialog or document cannot reuse an obsolete pose.
+fn motion_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
+    if !cmds.iter().any(|(c, p)| c == "joint.drive" || c == "joint.create" && p.get("values").is_some())
+        || !cmds.iter().all(|(c, _)| {
+            matches!(
+                c.as_str(),
+                "joint.drive"
+                    | "joint.create"
+                    | "joint.as_built"
+                    | "joint.edit"
+                    | "joint.limits"
+                    | "joint.gear"
+                    | "joint.rack_pinion"
+                    | "joint.screw"
+                    | "joint.cam"
+            )
+        })
+    {
+        return None;
+    }
+    let mut setup = cmds.to_vec();
+    for (command, params) in &mut setup {
+        if matches!(command.as_str(), "joint.drive" | "joint.create")
+            && let Some(p) = params.as_object_mut()
+        {
+            p.remove("values");
+            if command == "joint.drive" {
+                p.remove("value");
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(&setup).ok()?.hash(&mut h);
+    revision.hash(&mut h);
+    format!("{colors:?}").hash(&mut h);
+    Some(h.finish())
+}
+
+/// Tool previews already stream in `poll`. New-body extrusions, face offsets, fillets and
+/// chamfers instead build their full result; allow successful intermediate distances (a
+/// fillet's radii, a chamfer's distances and angle) only within the same setup. Preserve selections, feature identity, extent mode, revision and colours. The
+/// exact job key still ensures the latest distance is computed and errors never go stale.
+fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
+    if let Some(key) = motion_key(cmds, revision, colors) {
+        return Some(key);
+    }
+    if cmds.is_empty() || as_new_body(cmds).is_some() {
+        return None;
+    }
+    let mut setup = cmds.to_vec();
+    for (command, params) in &mut setup {
+        let (command, params) = if command == "timeline.redefine" {
+            let command = params.get("command")?.as_str()?.to_string();
+            (command, params.get_mut("params")?)
+        } else {
+            (command.clone(), params)
+        };
+        let fields: &[&str] = match command.as_str() {
+            "solid.extrude" => &["distance", "distance2", "to_offset"],
+            "solid.offset_face" => &["distance"],
+            // A radius dragged or typed: each result shows while the next computes, rather than
+            // the preview holding still until the input stops changing.
+            "solid.fillet" => &["radius", "radius2", "mid"],
+            "solid.chamfer" => &["distance", "distance2", "angle"],
+            _ => return None,
+        };
+        let params = params.as_object_mut()?;
+        for field in fields {
+            // Keep presence: changing extent mode must not reuse the old result.
+            if let Some(value) = params.get_mut(*field) {
+                *value = Value::Null;
+            }
+        }
+    }
+    Some(job_key(&setup, revision, colors))
+}
+
 /// Keep the preview in step with the open dialog: start a computation when its inputs changed,
 /// take finished results. Called once per frame.
 pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
-    let cmds = match app.dialog.as_ref().filter(|d| d.previews()).map(|d| crate::dialogs::preview_commands(app, d)) {
+    let cmds = match app.dialog.as_ref().filter(|d| d.previews() && d.preview_enabled).map(|d| crate::dialogs::preview_commands(app, d)) {
         Some(Ok(c)) if !c.is_empty() => c,
         _ if crate::sketch_attachment_ui::commands(app).is_some() => crate::sketch_attachment_ui::commands(app).unwrap_or_default(),
         // A parameter being edited in Change Parameters.
@@ -153,18 +322,33 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
             return;
         }
     };
-    let colors = Colors::from_tokens(&Tokens::get());
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(&cmds).unwrap_or_default().hash(&mut h);
-    app.session.revision.hash(&mut h);
-    format!("{colors:?}").hash(&mut h);
-    let key = h.finish();
+    let mut colors = Colors::for_tool(&Tokens::get(), &app.ui.tab, app.tool.is_some() || app.dialog.is_some());
+    if app.dialog.as_ref().is_some_and(|d| matches!(d.kind, crate::dialogs::Kind::Assembly(crate::dialogs_assembly::Asm::Drive { .. }))) {
+        colors.ghost = app.preferences.drive_joints_ghost;
+    }
+    let key = job_key(&cmds, app.session.revision, colors);
+    let stream_key = stream_key(&cmds, app.session.revision, colors);
+    let tool = as_new_body(&cmds).is_some();
     let pv = &mut app.preview;
-    pv.poll(key);
+    pv.poll(key, stream_key);
     if pv.running.is_none() && pv.shown_key != Some(key) {
         pv.started = crate::now_ms();
+        pv.running_stream_key = stream_key;
+        let mut straight = std::mem::take(&mut app.preview.straight);
+        let mut job = straight.compute(app, &cmds, colors);
+        app.preview.straight = straight;
+        if job.is_none() {
+            let mut moving = std::mem::take(&mut app.preview.moving);
+            job = moving.compute(app, &cmds, colors);
+            app.preview.moving = moving;
+        }
+        if let Some(job) = job {
+            app.preview.apply(key, job);
+            app.preview.busy = false;
+            return;
+        }
         let scratch = app.session.scratch();
-        spawn(&mut app.preview, key, scratch, cmds, colors);
+        spawn(&mut app.preview, key, scratch, cmds, colors, tool);
     }
     app.preview.busy = app.preview.running.is_some();
     if app.preview.busy {
@@ -172,22 +356,36 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     }
 }
 
+/// What tells one preview computation from another: its commands, the document revision they
+/// run on and the colours.
+fn job_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(cmds).unwrap_or_default().hash(&mut h);
+    revision.hash(&mut h);
+    format!("{colors:?}").hash(&mut h);
+    h.finish()
+}
+
+/// Start computing the preview of `cmds`: for a tool feature (`tool`), only its tool.
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors) {
+fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool) {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new().name("preview".into()).spawn(move || {
-        let _ = tx.send(compute(&scratch, &cmds, colors));
+        let _ = tx.send(if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) });
     });
     match spawned {
-        Ok(_) => pv.running = Some((key, rx)),
+        Ok(_) => {
+            pv.running = Some((key, rx));
+            pv.running_tool = tool;
+        }
         Err(e) => pv.apply(key, Err(e.to_string())),
     }
 }
 
 /// No threads on the web: compute right away.
 #[cfg(target_arch = "wasm32")]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors) {
-    pv.apply(key, compute(&scratch, &cmds, colors));
+fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool) {
+    pv.apply(key, if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) });
 }
 
 /// Evaluate the commands on the scratch session and build the preview scene.
@@ -197,8 +395,18 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 /// kernel can't do yet), the tool body is still shown, with the error.
 pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     if cmds.iter().any(|(command, params)| {
-        command == "sketch.redefine"
-            || command == "construct.plane.along_path"
+        matches!(
+            command.as_str(),
+            "sketch.redefine"
+                | "sketch.mirror"
+                | "sketch.pattern.rectangular"
+                | "sketch.pattern.circular"
+                | "sketch.offset"
+                | "sketch.fillet"
+                | "sketch.chamfer.equal_distance"
+                | "sketch.chamfer.two_distance"
+                | "sketch.chamfer.distance_angle"
+        ) || command == "construct.plane.along_path"
             || params.get("command").and_then(Value::as_str) == Some("construct.plane.along_path")
     }) {
         let preview = s.preview_visible_world(cmds).map_err(|error| error.to_string())?;
@@ -213,29 +421,93 @@ pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     if let Some(job) = crate::dialogs_assembly::world_preview(s, cmds, colors) {
         return job;
     }
-    let real = s.preview(cmds);
-    let guard = |f: &dyn Fn() -> Built| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| "the preview failed".to_string());
     match as_new_body(cmds) {
-        Some((alt, op)) => {
-            let tool = match s.preview(&alt) {
-                Ok(t) => t,
-                Err(e) => return Err(real.err().map_or_else(|| e.to_string(), |r| r.to_string())),
-            };
-            let mut b = guard(&|| build_tool(&tool.before, &tool.after, colors, &op))?;
-            b.error = real.err().map(|e| e.to_string());
-            b.bounds = state_bounds(&tool.after);
+        Some(_) => {
+            let mut b = compute_tool(s, cmds, colors)?;
+            b.error = s.preview(cmds).err().map(|e| e.to_string());
             Ok(b)
         }
         None => {
-            let p = real.map_err(|e| e.to_string())?;
+            let p = s.preview(cmds).map_err(|e| e.to_string())?;
+            let guard =
+                |f: &dyn Fn() -> Built| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| "the preview failed".to_string());
             let mut b = guard(&|| build(&p.before, &p.after, colors))?;
             b.bounds = state_bounds(&p.after);
             // The radius a previewed fillet used when it reduced the one asked for (a new
             // fillet or an edited one: the feature the replies name).
-            b.applied = p.replies.iter().filter_map(|r| r.get("feature").and_then(Value::as_u64)).find_map(|id| p.after.fitted_range(id));
+            let features = || p.replies.iter().filter_map(|r| r.get("feature").and_then(Value::as_u64));
+            b.applied = features().find_map(|id| p.after.fitted_range(id));
+            b.tapered = features().find_map(|id| p.after.tapered(id)).map(<[_]>::to_vec).unwrap_or_default();
             Ok(b)
         }
     }
+}
+
+/// The tool body of a feature that adds or removes one, built on its own (as a new body): what
+/// its live preview shows, without the boolean. When even the tool fails, the feature's own
+/// error. Other features: their whole preview ([`compute`]).
+fn compute_tool(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
+    let Some((alt, op)) = as_new_body(cmds) else { return compute(s, cmds, colors) };
+    // Where the view shows it: in a component placed away from its own frame (an imported
+    // part stood upright) the model's frame would draw the tool at right angles to the face.
+    let tool = match s.preview_world(&alt) {
+        Ok(t) => t,
+        Err(e) => return Err(s.preview(cmds).err().map_or_else(|| e.to_string(), |r| r.to_string())),
+    };
+    let mut b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tool(&tool.before, &tool.after, colors, &op)))
+        .map_err(|_| "the preview failed".to_string())?;
+    b.bounds = state_bounds(&tool.after);
+    Ok(b)
+}
+
+fn extrusion_params<'a>(id: &str, params: &'a Value) -> Option<&'a Value> {
+    match id {
+        "solid.extrude" => Some(params),
+        "timeline.redefine" if params.get("command").and_then(Value::as_str) == Some("solid.extrude") => params.get("params"),
+        _ => None,
+    }
+}
+
+/// Check references without intersecting the tool with the target's geometry.
+pub(crate) fn extrusion_target_error(s: &Session, cmds: &[(String, Value)], before: &ModelState) -> Option<String> {
+    for (id, params) in cmds {
+        let params = extrusion_params(id, params)?;
+        let op = params.get("operation").and_then(Value::as_str).unwrap_or("new");
+        if op == "new" {
+            continue;
+        }
+        let targets = params
+            .get("targets")
+            .and_then(Value::as_array)
+            .filter(|targets| !targets.is_empty())
+            .or_else(|| params.get("participants").and_then(Value::as_array));
+        let mut found = false;
+        if let Some(targets) = targets.filter(|targets| !targets.is_empty()) {
+            for target in targets.iter().filter_map(Value::as_str) {
+                if target == "*" {
+                    found |= !before.bodies.is_empty();
+                } else if before.body(target).is_some() {
+                    found = true;
+                } else {
+                    return Some(format!("unknown body `{target}`"));
+                }
+            }
+        } else {
+            // A cut or intersect from a component with no body of its own takes part in every
+            // body: the command decides that (#1234), and the preview asks it the same (#3085).
+            found = params.get("faces").and_then(|_| params.get("face_body")).and_then(Value::as_str).map_or_else(
+                || {
+                    before.bodies.iter().any(|body| s.doc.model_body_component(body) == s.active_component)
+                        || (matches!(op, "cut" | "intersect") && s.cut_takes_every_body(before))
+                },
+                |name| s.world_state().body(name).is_some(),
+            );
+        }
+        if !found && matches!(op, "cut" | "intersect") {
+            return Some("there is no body to cut or intersect".into());
+        }
+    }
+    None
 }
 
 fn state_bounds(st: &ModelState) -> Aabb3 {
@@ -269,7 +541,16 @@ fn build_tool(before: &ModelState, after: &ModelState, c: Colors, op: &str) -> B
             }
         }
     }
-    Built { scene: sc, replaced: Vec::new(), error: None, bounds: Aabb3::EMPTY, applied: None }
+    Built {
+        scene: sc,
+        sketches: Vec::new(),
+        replaced: Vec::new(),
+        error: None,
+        bounds: Aabb3::EMPTY,
+        applied: None,
+        tapered: Vec::new(),
+        stopped: None,
+    }
 }
 
 /// The same commands making a new body instead of joining, cutting or intersecting, and the
@@ -317,7 +598,7 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
                     sc.xray_tri(p.to_f32(), plane.normal().to_f32(), color);
                 }
             }
-            for (a, b) in quad.iter().zip(quad.iter().cycle().skip(1)).take(4) {
+            for (a, b) in Ring::from(quad).edges() {
                 sc.line(a.to_f32(), b.to_f32(), c.added, 1.3, true);
             }
         }
@@ -338,7 +619,11 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
         let cut = old.as_ref().is_some_and(|bm| am.measure().volume < bm.measure().volume - 1e-6);
         for (t, f) in am.triangles.iter().zip(&am.tri_face) {
             let new = added.get(*f as usize).copied().unwrap_or(true);
-            let col = if new { c.added } else { c.body };
+            let col = match (new, old.is_some()) {
+                (false, _) => c.body,
+                (true, true) => c.added,
+                (true, false) => c.new_body,
+            };
             for k in t {
                 let i = *k as usize;
                 if let (Some(p), Some(n)) = (am.positions.get(i), am.normals.get(i)) {
@@ -379,7 +664,39 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
             replaced.push(b.name.clone());
         }
     }
-    Built { scene: sc, replaced, error: None, bounds: Aabb3::EMPTY, applied: None }
+    let sketches = after
+        .sketches
+        .iter()
+        .filter_map(|sketch| {
+            let old = before.sketch(sketch.feature);
+            let old_curves =
+                old.into_iter().flat_map(|s| s.sketch.curves.iter().map(|c| (c.id.as_str(), c))).collect::<std::collections::HashMap<_, _>>();
+            let old_points =
+                old.into_iter().flat_map(|s| s.sketch.points.iter().map(|p| (p.id.as_str(), p.pos))).collect::<std::collections::HashMap<_, _>>();
+            let indices = sketch
+                .sketch
+                .curves
+                .iter()
+                .enumerate()
+                .filter_map(|(index, curve)| {
+                    let unchanged = old_curves.get(curve.id.as_str()).is_some_and(|previous| {
+                        previous.kind == curve.kind
+                            && curve.kind.point_ids().iter().all(|i| old.and_then(|s| s.sketch.point(*i)) == sketch.sketch.point(*i))
+                    });
+                    if unchanged { None } else { Some(index) }
+                })
+                .collect::<Vec<_>>();
+            let points = sketch
+                .sketch
+                .points
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| if old_points.get(p.id.as_str()) == Some(&p.pos) { None } else { Some(i) })
+                .collect::<Vec<_>>();
+            if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
+        })
+        .collect();
+    Built { scene: sc, sketches, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new(), stopped: None }
 }
 
 /// Which of the `nf` faces of `m` are new surface, i.e. not on the old mesh? Each is decided by
@@ -498,13 +815,65 @@ pub fn point_triangle_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
     if inside { h.abs() } else { [(a, b), (b, c), (c, a)].iter().map(|(u, v)| p.dist_to_segment(*u, *v)).fold(f64::INFINITY, f64::min) }
 }
 
+/// The same computed sketch preview is drawn over both native GPU and CPU viewports.
+pub fn paint_sketches(app: &SolveApp, painter: &egui::Painter, proj: &crate::viewport::Proj) {
+    if app.preview.rolled_back {
+        return;
+    }
+    if !app.dialog.as_ref().is_some_and(|d| matches!(d.kind, crate::dialogs::Kind::SketchModify(_)) && d.previews()) {
+        return;
+    }
+    let stroke = egui::Stroke::new(2.5, Tokens::get().preview_sketch);
+    let mut budget = solidcraft_engine::render::SamplingBudget::new(32_768, 65_536);
+    let mut curves = 0;
+    for preview in &app.preview.sketches {
+        let sketch = &preview.sketch;
+        for index in &preview.curves {
+            crate::tools::paint_curve(&sketch.sketch, *index, &sketch.plane, painter, proj, stroke, &mut budget);
+            curves += 1;
+        }
+        for index in &preview.points {
+            if let Some(point) = sketch.sketch.point(*index).and_then(|p| proj.to_screen(sketch.plane.to_world(p))) {
+                painter.circle_filled(point, 3.0, stroke.color);
+            }
+        }
+    }
+    crate::scenario::publish_count("sketch_preview_curves", curves as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn tool_preview_follows_tab_without_recolouring_removal_or_idle_previews() {
+        for dark in [false, true] {
+            for vision in crate::theme::ColorVision::ALL {
+                let t = Tokens::themed(dark, vision);
+                let base = Colors::from_tokens(&t);
+                for tab in ["MODEL", "SKETCH", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "VIEW", "SHEET METAL", "RENDER"] {
+                    for active in [false, true] {
+                        let colors = Colors::for_tool(&t, tab, active);
+                        assert_eq!(colors.removed, base.removed);
+                        assert_eq!(colors.body, base.body);
+                        assert_eq!(colors.edge, base.edge);
+                        if !active || crate::theme::TabAccent::for_tab(&t, tab).color == t.accent {
+                            assert_eq!(colors.added, base.added);
+                            assert_eq!(colors.new_body, base.new_body);
+                        } else {
+                            let accent = crate::theme::TabAccent::for_tab(&t, tab);
+                            assert_eq!(colors.added, accent.color.to_srgba_unmultiplied());
+                            assert_ne!(colors.new_body, colors.added);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn colors() -> Colors {
-        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255] }
+        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], new_body: [4, 4, 4, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255], ghost: true }
     }
 
     #[test]
@@ -519,14 +888,14 @@ mod tests {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         pv.running = Some((1, rx));
-        pv.poll(2);
+        pv.poll(2, None);
         assert!(pv.error.is_none(), "the corrected inputs can Apply while their preview computes");
         assert!(pv.running.is_some());
         assert!(pv.active);
         assert_eq!(pv.replaced, ["Turn"]);
         assert_eq!(pv.key, 9, "the last good geometry stays visible");
         tx.send(Err("unknown_angle".into())).unwrap();
-        pv.poll(2);
+        pv.poll(2, None);
         assert!(pv.error.is_none(), "a late obsolete result cannot disable Apply again");
         assert!(pv.running.is_none());
         assert_eq!(pv.shown_key, Some(1));
@@ -535,11 +904,188 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         pv.running = Some((2, rx));
         tx.send(Err("current invalid expression".into())).unwrap();
-        pv.poll(2);
+        pv.poll(2, None);
         assert_eq!(pv.error.as_deref(), Some("current invalid expression"));
         assert_eq!(pv.shown_key, Some(2));
-        pv.poll(2);
+        assert!(!pv.active && pv.replaced.is_empty(), "the current inputs failed: nothing is previewed (#3254)");
+        assert_ne!(pv.key, 9, "the viewport takes the empty scene");
+        pv.poll(2, None);
         assert_eq!(pv.error.as_deref(), Some("current invalid expression"), "current errors still prevent invalid Apply");
+    }
+
+    fn pose() -> Built {
+        Built {
+            scene: GpuScene::default(),
+            sketches: Vec::new(),
+            replaced: vec!["Lid".into()],
+            error: None,
+            bounds: Aabb3::EMPTY,
+            applied: None,
+            tapered: Vec::new(),
+            stopped: None,
+        }
+    }
+
+    /// The worker completes while the slider is still held or Play keeps advancing.
+    /// Intermediate successful poses must reach the viewport, and the final value
+    /// must still be computed rather than treating that intermediate pose as current.
+    #[test]
+    fn joint_motion_shows_completed_poses_while_inputs_keep_advancing() {
+        let mut pv = PreviewState::default();
+        for (running, wanted) in [(1, 2), (2, 3), (3, 4)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            pv.running = Some((running, rx));
+            pv.running_stream_key = Some(42);
+            pv.poll(wanted, Some(42));
+            assert!(pv.running.is_some());
+            tx.send(Ok(pose())).unwrap();
+            pv.poll(wanted, Some(42));
+            assert!(pv.active, "motion should be visible before input stops");
+            assert_eq!(pv.replaced, ["Lid"]);
+            assert_eq!(pv.key, running, "every completed pose reaches the scene");
+            assert_eq!(pv.shown_key, Some(running));
+            assert_ne!(pv.shown_key, Some(wanted), "the latest pose still needs a job");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        pv.running = Some((4, rx));
+        pv.running_stream_key = Some(42);
+        tx.send(Ok(pose())).unwrap();
+        pv.poll(4, Some(42));
+        assert_eq!(pv.shown_key, Some(4), "release catches up to the exact final pose");
+        assert!(pv.running.is_none());
+    }
+
+    #[test]
+    fn intermediate_motion_rejects_other_setups_and_obsolete_errors() {
+        for (context, job) in [
+            (None, Ok(pose())),
+            (Some(43), Ok(pose())),
+            (Some(42), Err("old invalid value".into())),
+            (Some(42), Ok(Built { error: Some("old tool preview error".into()), ..pose() })),
+        ] {
+            let mut pv = PreviewState { running_stream_key: Some(42), ..PreviewState::default() };
+            let (tx, rx) = std::sync::mpsc::channel();
+            pv.running = Some((1, rx));
+            tx.send(job).unwrap();
+            pv.poll(2, context);
+            assert!(!pv.active);
+            assert!(pv.error.is_none(), "obsolete errors must not block Apply");
+            assert!(pv.running.is_none());
+        }
+    }
+
+    #[test]
+    fn motion_context_changes_only_when_the_joint_setup_changes() {
+        let commands = |angle| {
+            vec![
+                ("joint.edit".into(), json!({"joint": 1, "flip": true})),
+                ("joint.limits".into(), json!({"joint": 1, "min": "-135 deg", "max": "0 deg"})),
+                ("joint.drive".into(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        let key = motion_key(&commands("-30 deg"), 7, colors());
+        assert!(key.is_some());
+        assert_eq!(key, motion_key(&commands("-60 deg"), 7, colors()));
+        assert_ne!(key, motion_key(&commands("-60 deg"), 8, colors()));
+        let mut different = commands("-60 deg");
+        different[2].1["joint"] = json!(2);
+        assert_ne!(key, motion_key(&different, 7, colors()));
+        different = commands("-60 deg");
+        different[1].1["min"] = json!("-90 deg");
+        assert_ne!(key, motion_key(&different, 7, colors()));
+        different = commands("-60 deg");
+        different[0].1["flip"] = json!(false);
+        assert_ne!(key, motion_key(&different, 7, colors()));
+        let mut other_colors = colors();
+        other_colors.body = [9, 9, 9, 255];
+        assert_ne!(key, motion_key(&commands("-60 deg"), 7, other_colors));
+        assert!(motion_key(&[("solid.extrude".into(), json!({"distance": 10}))], 7, colors()).is_none());
+        for command in ["joint.create", "joint.drive"] {
+            assert_eq!(
+                motion_key(&[(command.into(), json!({"joint": 1, "values": [0]}))], 7, colors()),
+                motion_key(&[(command.into(), json!({"joint": 1, "values": [90]}))], 7, colors()),
+            );
+        }
+        // A gear dialog playing its driving joint streams its poses too.
+        let gear = |angle: &str| {
+            vec![
+                ("joint.gear".to_string(), json!({"a": 1, "b": 2, "ra": 10, "rb": 20})),
+                ("joint.drive".to_string(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        assert!(motion_key(&gear("0 deg"), 7, colors()).is_some());
+        assert_eq!(motion_key(&gear("0 deg"), 7, colors()), motion_key(&gear("90 deg"), 7, colors()));
+        // So does a cam dialog turning its cam.
+        let cam = |angle: &str| {
+            vec![
+                ("joint.cam".to_string(), json!({"a": 1, "b": 2, "profile": {"sketch": 3}})),
+                ("joint.drive".to_string(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        assert!(motion_key(&cam("0 deg"), 7, colors()).is_some());
+        assert_eq!(motion_key(&cam("0 deg"), 7, colors()), motion_key(&cam("90 deg"), 7, colors()));
+    }
+
+    #[test]
+    fn edited_pattern_preview_includes_moved_instances_only() -> Result<(), Box<dyn std::error::Error>> {
+        for (command, initial, edits) in [
+            (
+                "sketch.pattern.rectangular",
+                json!({"entities":["seed"],"count":3,"spacing":10,"count2":2,"spacing2":15}),
+                vec![(json!({"spacing":14}), 4), (json!({"spacing2":19}), 3)],
+            ),
+            (
+                "sketch.pattern.circular",
+                json!({"entities":["seed"],"center":"origin","count":5}),
+                vec![(json!({"count":20}), 19), (json!({"count":2}), 1)],
+            ),
+        ] {
+            let mut s = Session::default();
+            s.execute("sketch.create", &json!({"plane":"XY"}))?;
+            s.execute("sketch.circle.center", &json!({"center":[-50,0],"radius":2,"id":"seed"}))?;
+            let pattern = s.execute(command, &initial)?;
+            // An identical result must not draw the seed or any existing copies.
+            let unchanged = compute(&s, &[(command.into(), json!({"pattern":pattern["pattern"]}))], colors())?;
+            assert!(unchanged.sketches.is_empty());
+            for (mut edit, expected) in edits {
+                edit["pattern"] = pattern["pattern"].clone();
+                let built = compute(&s, &[(command.into(), edit)], colors())?;
+                assert_eq!(built.sketches.len(), 1, "{command}");
+                for preview in &built.sketches {
+                    assert_eq!(preview.curves.len(), expected, "{command}");
+                    assert_eq!(preview.points.len(), expected, "{command}");
+                    assert!(preview.curves.iter().all(|i| preview.sketch.sketch.curves.get(*i).is_some_and(|c| c.id != "seed")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sketch_preview_includes_changed_curve_shapes() -> Result<(), Box<dyn std::error::Error>> {
+        let mut s = Session::default();
+        s.execute("sketch.create", &json!({"plane":"XY"}))?;
+        s.execute("sketch.circle.center", &json!({"center":[0,0],"radius":2,"id":"circle"}))?;
+        s.execute("sketch.line", &json!({"points":[[10,0],[20,0]],"ids":["line"]}))?;
+        let before = s.model.state();
+        let mut after = before.as_ref().clone();
+        for sketch in &mut after.sketches {
+            let sketch = &mut std::sync::Arc::make_mut(sketch).sketch;
+            for curve in &mut sketch.curves {
+                match &mut curve.kind {
+                    solidcraft_engine::sketch::CurveKind::Circle { r, .. } => *r = 3.0,
+                    solidcraft_engine::sketch::CurveKind::Line { a, b } => std::mem::swap(a, b),
+                    _ => {}
+                }
+            }
+        }
+        let built = build(&before, &after, colors());
+        assert_eq!(built.sketches.len(), 1);
+        for preview in &built.sketches {
+            assert_eq!(preview.curves, vec![0, 1]);
+            assert!(preview.points.is_empty());
+        }
+        Ok(())
     }
 
     /// Combine previews its result (cut, join or intersect between existing bodies) without an
@@ -556,6 +1102,23 @@ mod tests {
             let built = compute(&s, &[cmd], colors()).unwrap_or_else(|e| panic!("{op}: {e}"));
             assert!(built.error.is_none(), "{op}: {:?}", built.error);
         }
+    }
+
+    /// A plate in its own component, stood up by its placement (an imported part set upright)
+    /// and edited with that component active: the extrusion's tool is drawn where the plate is
+    /// shown, on its top face, not at right angles to it in the component's own frame.
+    #[test]
+    fn a_tool_on_a_turned_component_previews_where_it_is_shown() {
+        let mut s = Session::default();
+        let made = s.execute("component.create", &json!({"name": "Plate", "grounded": false})).unwrap();
+        s.execute("solid.box", &json!({"length": 20, "width": 8, "height": 30, "corner": [0, 0, -30], "body_name": "Plate"})).unwrap();
+        s.execute("occurrence.move", &json!({"occurrence": made["occurrence"], "axis": [1, 0, 0], "angle": "90 deg"})).unwrap();
+        s.execute("component.activate", &json!({"component": made["component"], "occurrence": made["occurrence"], "path": [made["occurrence"]]}))
+            .unwrap();
+        // Shown lying flat: 20 × 30, 8 high. Its top face pulled up 10.
+        let cmd = ("solid.extrude".to_string(), json!({"face": [10, 15, 8], "face_body": "Plate", "distance": "10 mm", "operation": "join"}));
+        let b = compute_tool(&s, &[cmd], colors()).unwrap().bounds;
+        assert!((b.max.z - 18.0).abs() < 1e-6 && (b.max.y - 30.0).abs() < 1e-6, "on top, not at right angles: {b:?}");
     }
 
     fn count(bytes: &[u8], stride: usize, col: [u8; 4]) -> usize {
@@ -628,17 +1191,75 @@ mod tests {
         assert!(SurfaceIndex::new(&Mesh::default()).is_none());
     }
 
-    /// Thousands of faces (a modeled thread's) are classified at once, not face by face against
-    /// every triangle: filleting beside a thread froze the app for minutes.
-    #[test]
-    fn many_faces_are_classified_quickly() {
-        let started = std::time::Instant::now();
-        let n = 120;
+    /// How long the faces of a sheet of `n × n` squares take to classify against an old sheet of
+    /// the same size. The meshes are built before the clock starts and the faces are collected
+    /// before it stops: only the classification, the work that used to freeze the app, is measured.
+    fn classify_sheet(n: usize) -> std::time::Duration {
         let (old, same, lifted) = (sheet(n, 0.0), sheet(n, 0.0), sheet(n, 5.0));
         let nf = n * n;
-        assert!(new_faces(&same, nf, &old).iter().all(|new| !new), "faces on the old surface are not new");
-        assert!(new_faces(&lifted, nf, &old).iter().all(|new| *new), "faces off the old surface are new");
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        let on = new_faces(&same, nf, &old);
+        let off = new_faces(&lifted, nf, &old);
+        let took = started.elapsed();
+        assert!(on.iter().all(|new| !new), "faces on the old surface are not new");
+        assert!(off.iter().all(|new| *new), "faces off the old surface are new");
+        took
+    }
+
+    /// Whether a job four times the size took at most about twice linear: `pair` times the small job,
+    /// then the big one. Linear is 4x, the quadratic that the bug cost 16x or more, so eight times the
+    /// small time is the limit. The load of the other test binaries can rise between the two runs, so a
+    /// pair that misses is measured again, up to three times. Load only ever slows a run, so each size
+    /// keeps its fastest time and the ratio is taken of those: a retry cannot pass a regression on a
+    /// small run that a spike happened to slow, once an earlier small run was fast.
+    ///
+    /// `slack` is the room the noise of a busy machine gets, on top of the ratio.
+    fn scales_linearly(mut pair: impl FnMut() -> (std::time::Duration, std::time::Duration), slack: std::time::Duration) -> Result<(), String> {
+        let limit = |small: f64| 8.0 * small + slack.as_secs_f64();
+        let (mut small, mut big) = (f64::INFINITY, f64::INFINITY);
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            let (s, b) = pair();
+            small = small.min(s.as_secs_f64());
+            big = big.min(b.as_secs_f64());
+            runs.push(format!("{s:?} then {b:?}"));
+            if big < limit(small) {
+                return Ok(());
+            }
+        }
+        Err(format!("{}; fastest {small:.3} s and {big:.3} s, limit {:.3} s", runs.join(", "), limit(small)))
+    }
+
+    #[test]
+    fn scales_linearly_keeps_each_sizes_fastest_run() {
+        let pairs = |p: Vec<(u64, u64)>| {
+            let mut p = p.into_iter().map(|(s, b)| (std::time::Duration::from_millis(s), std::time::Duration::from_millis(b)));
+            move || p.next().unwrap_or((std::time::Duration::from_secs(1), std::time::Duration::from_secs(1)))
+        };
+        let slack = std::time::Duration::from_millis(0);
+        // Linear: four times the work, four times the time.
+        assert!(scales_linearly(pairs(vec![(5, 20)]), slack).is_ok());
+        // A big run slowed by load, then a quiet pair.
+        assert!(scales_linearly(pairs(vec![(5, 80), (5, 20)]), slack).is_ok());
+        // A quadratic cost (16x) whose later small runs a spike slowed: the fast first one still counts.
+        let r = scales_linearly(pairs(vec![(5, 80), (15, 80), (15, 80)]), slack);
+        assert!(r.as_ref().is_err_and(|e| e.contains("fastest 0.005 s and 0.080 s, limit 0.040 s")), "{r:?}");
+    }
+
+    /// Thousands of faces (a modeled thread's) are classified at once, not face by face against
+    /// every triangle: filleting beside a thread froze the app for minutes.
+    ///
+    /// A ratio and not a limit: a test must not depend on wall-clock timing (CONTRIBUTING.md), the
+    /// machine is busy. 900 faces are classified, then 3 600, four times as many: linear is 4x, the
+    /// face-against-triangle cost 16x or more.
+    #[test]
+    fn many_faces_are_classified_quickly() {
+        /// The room the noise of a run on a busy machine gets, on top of the ratio: the 900 faces
+        /// take a fraction of a second, so this is the noise of one run and not a change of scale.
+        const SLACK: std::time::Duration = std::time::Duration::from_millis(20);
+        if let Err(missed) = scales_linearly(|| (classify_sheet(30), classify_sheet(60)), SLACK) {
+            panic!("the faces do not scale linearly: {missed}");
+        }
     }
 
     /// A fillet preview stands in for the body: the round face is new, the rest is kept, and the
@@ -680,8 +1301,119 @@ mod tests {
         let b = compute(&s, &[("solid.extrude".into(), json!({"distance": "15 mm"}))], colors()).unwrap();
         assert!(b.replaced.is_empty());
         assert_eq!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().body), 0);
+        // #1805: a new body has its own colour, not a join's.
+        assert!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().new_body) > 0);
+        assert_eq!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().added), 0);
         assert!(b.scene.ghost.is_empty());
         assert!(compute(&s, &[("solid.extrude".into(), json!({"distance": "1 +"}))], colors()).is_err());
         assert!(s.model.state().bodies.is_empty());
     }
+
+    fn session_of(cmds: &[(&str, Value)]) -> Session {
+        let mut s = Session::default();
+        for (id, p) in cmds {
+            s.execute(id, p).unwrap();
+        }
+        s
+    }
+
+    /// A block and a two-letter text to cut into it.
+    fn text_on_block() -> (Session, Vec<(String, Value)>) {
+        let s = session_of(&[
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 20]})),
+            ("sketch.finish", json!({})),
+            ("solid.extrude", json!({"distance": 10})),
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.text", json!({"text": "AB", "at": [5, 5], "height": 10})),
+            ("sketch.finish", json!({})),
+        ]);
+        (s, vec![("solid.extrude".to_string(), json!({"distance": 2, "operation": "cut"}))])
+    }
+
+    /// A tool feature's live preview builds its tool without the boolean: a cut into nothing
+    /// shows its tool with no error (OK will report it), while the whole preview has the error.
+    #[test]
+    fn a_tool_preview_builds_the_tool_without_the_boolean() {
+        let s = session_of(&[
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]})),
+            ("sketch.finish", json!({})),
+        ]);
+        let cmds = vec![("solid.extrude".to_string(), json!({"distance": 2, "operation": "cut"}))];
+        let tool = compute_tool(&s, &cmds, colors()).unwrap();
+        assert!(tool.error.is_none() && !tool.scene.xray.is_empty(), "{:?}", tool.error);
+        let whole = compute(&s, &cmds, colors()).unwrap();
+        assert!(whole.error.as_deref().is_some_and(|e| e.contains("no body to cut")), "{:?}", whole.error);
+        assert_eq!(whole.scene.xray.len(), tool.scene.xray.len());
+    }
+
+    /// #3085: a cut sketched in the root, where every body lives in a component, cuts every body
+    /// it meets (#1234). The preview said "there is no body to cut or intersect" all the same,
+    /// while the cut itself went through.
+    #[test]
+    fn a_cut_from_an_empty_root_is_not_refused_by_its_preview() {
+        let mut s = session_of(&[
+            ("component.create", json!({"name": "Part"})),
+            ("solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Block"})),
+            ("component.activate", json!({"component": "root"})),
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.rectangle.two_point", json!({"p0": [3, 3], "p1": [7, 7]})),
+            ("sketch.finish", json!({})),
+        ]);
+        let params = json!({"distance": 20, "operation": "cut"});
+        let cmds = vec![("solid.extrude".to_string(), params.clone())];
+        assert_eq!(extrusion_target_error(&s, &cmds, &s.model.state()), None);
+        s.execute("solid.extrude", &params).unwrap();
+        let volume = s.model.state().body("Block").map(|b| solidcraft_engine::kernel::measure(&b.body).unwrap().volume).unwrap_or(0.0);
+        assert!((volume - (1000.0 - 160.0)).abs() < 1e-6, "{volume}");
+    }
+
+    /// While an arrow is dragged the inputs change faster than a tool is built: a tool built
+    /// for inputs since changed is shown anyway (then the latest computed), an error only for
+    /// the inputs it belongs to.
+    #[test]
+    fn a_tool_for_inputs_since_changed_still_shows() {
+        let (s, cmds) = text_on_block();
+        let tool = compute_tool(&s, &cmds, colors()).unwrap();
+        let mut pv = PreviewState::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        pv.running = Some((1, rx));
+        pv.running_tool = true;
+        tx.send(Ok(tool)).unwrap();
+        pv.poll(2, None);
+        assert!(pv.running.is_none() && pv.active && pv.shown_key == Some(1), "shown, and key 2 still to compute");
+        let (tx, rx) = std::sync::mpsc::channel();
+        pv.running = Some((3, rx));
+        pv.running_tool = true;
+        tx.send(Err("too far".into())).unwrap();
+        pv.poll(4, None);
+        assert!(pv.error.is_none() && pv.shown_key == Some(1), "an old error is dropped");
+    }
+
+    /// A design leaving the window (another tab) takes its preview off the viewport: an empty
+    /// scene in the slot the viewport reads, under a new key. A fresh slot left the fillet
+    /// preview of the old design drawn over the new tab's empty design.
+    #[test]
+    fn reset_hands_the_viewport_an_empty_scene() {
+        let mut pv = PreviewState::default();
+        let mut sc = GpuScene::default();
+        sc.xray_tri([0.0; 3], [0.0, 0.0, 1.0], [255; 4]);
+        pv.set_scene(sc);
+        pv.active = true;
+        pv.replaced = vec!["Body1".into()];
+        let slot = pv.slot.clone();
+        let key = pv.key;
+        // The viewport took the scene.
+        assert!(slot.lock().unwrap().take().is_some_and(|s| !s.xray.is_empty()));
+        pv.reset();
+        assert!(std::sync::Arc::ptr_eq(&slot, &pv.slot), "the slot the viewport reads");
+        assert_ne!(pv.key, key, "a new key: the viewport takes the slot again");
+        assert!(slot.lock().unwrap().as_ref().is_some_and(|s| s.xray.is_empty() && s.blocks.is_empty()));
+        assert!(!pv.active && pv.replaced.is_empty());
+    }
 }
+
+#[cfg(test)]
+#[path = "preview_drag_tests.rs"]
+mod drag_tests;

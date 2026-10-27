@@ -1,14 +1,18 @@
 //! Resolving sketch links against the model: projecting edges, faces, body silhouettes, other
 //! sketches and the origin onto a sketch plane, and intersecting bodies with it.
 //!
-//! Model geometry is found again on every recompute from the reference point stored in the
-//! link (like fillet edges). Edge polylines from the tessellation lie exactly on their curves,
-//! so lines and circular arcs are recovered exactly by fitting; anything else (an ellipse from
-//! a tilted circle, a spline edge) becomes a chain of lines.
+//! Model geometry is found again on every recompute: a face or an edge by the persistent name
+//! its link keeps, anything else (and a link saved without a name) from the reference point
+//! stored in the link. An edge of a solid lying in a plane parallel to the sketch's comes in as
+//! its exact curve (a line, an arc, the Bézier pieces of a free-form curve such as a letter
+//! cut from a font), so a profile drawn round it meets the solid's faces exactly. Anything
+//! else is fitted to its polyline from the tessellation, which lies exactly on the curve:
+//! lines and circular arcs are recovered exactly, the rest (an ellipse from a tilted circle,
+//! a spline edge running out of the plane) becomes a chain of lines.
 
 use std::collections::BTreeMap;
 
-use solidcraft_geom::{Mesh, Plane, Vec2, Vec3};
+use solidcraft_geom::{Mesh, Plane, Seg2, Vec2, Vec3};
 use solidcraft_sketch::{CurveKind, LinkGeom, LinkKind, LinkSource, Sketch};
 
 use crate::eval::ModelState;
@@ -35,6 +39,9 @@ pub struct Resolved {
     /// Exact face selected during this resolution, before its closest point is
     /// projected onto an edge shared with another face. Computed metadata only.
     pub face_index: Option<usize>,
+    /// The edge an `Edge` reference resolved to (its index in the body's mesh), whose
+    /// persistent name the link keeps ([`resolved_edge_name`]). Computed metadata only.
+    pub edge_index: Option<usize>,
 }
 
 /// Resolutions of body-based references, keyed by the reference, the sketch plane and the
@@ -98,13 +105,9 @@ fn resolve_uncached(
     let lost = |what: &str| DocError::Invalid(format!("{what} no longer exists"));
     let mut moved = false;
     let mut face_index = None;
+    let mut edge_index = None;
     let mut source = src.clone();
     let mut wires: Vec<Vec<Vec3>> = Vec::new();
-    // Included curves that leave the sketch plane stay 3D.
-    let off_plane = |pts: &[Vec3]| {
-        let size = pts.iter().fold(1.0_f64, |m, p| m.max(p.len()));
-        pts.iter().any(|p| plane.height(*p).abs() > size * 1e-7)
-    };
     let geom = match src {
         LinkSource::Edge { body, at } => {
             let (bi, mesh) = body_mesh(st, body, *at)?;
@@ -116,15 +119,9 @@ fn resolve_uncached(
             moved = d > (size * 2e-3).max(1e-3);
             let name = st.bodies.get(bi).map(|b| b.name.clone()).unwrap_or_else(|| body.clone());
             source = LinkSource::Edge { body: name, at: q };
-            let pts = mesh.edges.get(e).cloned().unwrap_or_default();
-            match kind {
-                LinkKind::Intersect => section_of_polyline(plane, &pts),
-                LinkKind::Include if off_plane(&pts) => {
-                    wires.push(pts);
-                    Vec::new()
-                }
-                _ => fit_world(plane, &pts),
-            }
+            edge_index = Some(e);
+            let exact = st.bodies.get(bi).and_then(|b| exact_edges(b, plane, &[e]).pop().flatten());
+            edge_geom(plane, kind, exact, mesh.edges.get(e).cloned().unwrap_or_default(), &mut wires)
         }
         LinkSource::Face { body, at } => {
             let (bi, mesh) = body_mesh(st, body, *at)?;
@@ -140,13 +137,8 @@ fn resolve_uncached(
             match kind {
                 LinkKind::Intersect => section(plane, &mesh, Some(f)),
                 _ => {
-                    let mut g = Vec::new();
                     let target = st.bodies.get(bi).ok_or_else(|| lost("the projection body"))?;
-                    for e in projection_face_edges(target, &mesh, f, plane)? {
-                        if let Some(pts) = mesh.edges.get(e) {
-                            g.extend(fit_world(plane, pts));
-                        }
-                    }
+                    let g = projected_edges(target, &mesh, plane, &projection_face_edges(target, &mesh, f, plane)?);
                     if certified_planar_construction(target, f as usize) { merge_family_lines(g)? } else { g }
                 }
             }
@@ -188,7 +180,7 @@ fn resolve_uncached(
                 }
                 LinkKind::Include => {
                     let pts: Vec<Vec3> = ss.sketch.polyline(ci).iter().map(|p| ss.plane.to_world(*p)).collect();
-                    if off_plane(&pts) {
+                    if off_plane(plane, &pts) {
                         wires.push(pts);
                         Vec::new()
                     } else {
@@ -262,10 +254,17 @@ fn resolve_uncached(
         LinkSource::SketchAxis { name } => {
             vec![solidcraft_sketch::sketch_axis_geom(name).ok_or_else(|| DocError::Unknown(format!("sketch axis `{name}`")))?]
         }
-        LinkSource::Text { text, at, height, angle, font } => solidcraft_sketch::text_geometry_in(font.as_deref(), text, *at, *height, *angle)?,
+        LinkSource::Text { text, at, height, angle, font, style, .. } if style.path.is_none() => {
+            solidcraft_sketch::text_geometry_styled(font.as_deref(), text, *at, *height, *angle, style, None)?
+        }
+        // Its path is a curve of its own sketch: set with the sketch (`Sketch::text_source_geometry`).
+        LinkSource::Text { .. } => return Err(DocError::Invalid("a text on a path is set with its sketch".into())),
         LinkSource::Plane { name } => {
-            let pr =
-                if Plane::named(name).is_some() { PlaneRef::Origin { name: name.clone() } } else { PlaneRef::Construction { name: name.clone() } };
+            let pr = if Plane::named(name).is_some() {
+                PlaneRef::Origin { name: name.clone() }
+            } else {
+                PlaneRef::Construction { name: name.clone().into() }
+            };
             let other = doc.resolve_plane_in(vals, &pr, 0, Some(st)).map_err(|_| lost(&format!("plane {name}")))?;
             plane_trace(plane, &other).into_iter().collect()
         }
@@ -273,13 +272,114 @@ fn resolve_uncached(
     if geom.is_empty() && wires.is_empty() {
         return Err(DocError::Invalid(format!("the {} projects to nothing on this sketch plane", src.describe())));
     }
-    Ok(Resolved { geom: merge_split_circles(geom), wires, source, moved, face_index })
+    Ok(Resolved { geom: merge_split_circles(geom), wires, source, moved, face_index, edge_index })
+}
+
+/// Whether a curve (world points) leaves the sketch plane: included, it then stays 3D.
+fn off_plane(plane: &Plane, pts: &[Vec3]) -> bool {
+    let size = pts.iter().fold(1.0_f64, |m, p| m.max(p.len()));
+    pts.iter().any(|p| plane.height(*p).abs() > size * 1e-7)
+}
+
+/// What a body edge (its `exact` curve when read, and its polyline `pts`) gives a sketch: its
+/// section with the sketch plane, itself as a 3D curve (into `wires`) when it is included and
+/// leaves the plane, else its projection (the exact curve, or the polyline fitted).
+fn edge_geom(plane: &Plane, kind: LinkKind, exact: Option<Vec<LinkGeom>>, pts: Vec<Vec3>, wires: &mut Vec<Vec<Vec3>>) -> Vec<LinkGeom> {
+    match kind {
+        LinkKind::Intersect => section_of_polyline(plane, &pts),
+        LinkKind::Include if off_plane(plane, &pts) => {
+            wires.push(pts);
+            Vec::new()
+        }
+        _ => exact.unwrap_or_else(|| fit_world(plane, &pts)),
+    }
+}
+
+/// Edges `edges` of `body` (indices into its mesh's `edges`) on `plane` as their exact curves:
+/// lines, circles and arcs, and the Bézier pieces of a free-form curve. `None` for an edge that
+/// doesn't lie in a plane parallel to `plane` or isn't read exactly (a mesh body's): it is
+/// fitted to its polyline instead.
+fn exact_edges(body: &crate::ModelBody, plane: &Plane, edges: &[usize]) -> Vec<Option<Vec<LinkGeom>>> {
+    body.body.planar_edges(plane, edges).into_iter().map(|segs| segs?.iter().map(link_geom).collect()).collect()
+}
+
+/// `edges` of `body` projected on `plane`: each exactly ([`exact_edges`]) or fitted to its
+/// polyline in `mesh`.
+fn projected_edges(body: &crate::ModelBody, mesh: &Mesh, plane: &Plane, edges: &[usize]) -> Vec<LinkGeom> {
+    let mut out = Vec::new();
+    for (e, exact) in edges.iter().zip(exact_edges(body, plane, edges)) {
+        match exact {
+            Some(g) => out.extend(g),
+            None => {
+                if let Some(pts) = mesh.edges.get(*e) {
+                    out.extend(fit_world(plane, pts));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A boundary segment as the link geometry that is the same curve.
+fn link_geom(s: &Seg2) -> Option<LinkGeom> {
+    Some(match *s {
+        Seg2::Line { a, b } => LinkGeom::Line(a, b),
+        Seg2::Arc { center, radius, sweep, .. } if sweep.abs() >= std::f64::consts::TAU - 1e-9 => LinkGeom::Circle(center, radius),
+        Seg2::Arc { center, radius, start, sweep } => {
+            let at = |t: f64| center + Vec2::new(t.cos(), t.sin()) * radius;
+            // Counter-clockwise from `a` to `b`.
+            let (a, b) = if sweep > 0. { (at(start), at(start + sweep)) } else { (at(start + sweep), at(start)) };
+            LinkGeom::Arc { c: center, a, b }
+        }
+        Seg2::Conic { a, apex, b, w } => LinkGeom::Conic { a, apex, b, rho: w / (1. + w) },
+        Seg2::Cubic { p0, p1, p2, p3 } => LinkGeom::Spline { pts: vec![p0, p1, p2, p3], control: true, degree: 3, periodic: false },
+        Seg2::Bezier { n, p } => LinkGeom::Spline { pts: p.get(..=usize::from(n))?.to_vec(), control: true, degree: n, periodic: false },
+    })
+}
+
+/// The persistent name of the edge an `Edge` reference resolved to, for its link to keep and
+/// be found by from then on. None on a mesh body, whose edges have no names.
+pub fn resolved_edge_name(st: &ModelState, r: &Resolved) -> Option<String> {
+    let (LinkSource::Edge { body, .. }, Some(index)) = (&r.source, r.edge_index) else { return None };
+    let body = st.body(body).filter(|body| !body.body.is_mesh())?;
+    crate::naming::edge_names(body).get(index).filter(|name| !name.is_empty()).cloned()
 }
 
 /// Re-resolve every link of a sketch (in place). Returns warnings for lost, moved or rebuilt
 /// links; lost links keep their last geometry.
 fn lost(reference: &str) -> DocError {
     DocError::Unknown(format!("{reference} no longer exists"))
+}
+
+/// The edge a link's stored name finds, and the body it is on: the link's body, or, when no
+/// body has that name any more (it was joined into another), the body on which the name finds
+/// the edge nearest the link's point.
+fn locate_named_edge(st: &ModelState, body: &str, name: &str, at: Vec3) -> Option<(String, crate::naming::EdgeHit)> {
+    let hit = |b: &crate::ModelBody| crate::naming::locate_edge(b, name, at).ok().map(|hit| (b.name.clone(), hit));
+    match st.body(body) {
+        Some(b) => hit(b),
+        None => st.bodies.iter().filter(|b| !b.body.is_mesh()).filter_map(hit).min_by(|a, b| a.1.point.dist(at).total_cmp(&b.1.point.dist(at))),
+    }
+}
+
+/// An edge found by its persistent name: edge `index` of `body`, with the link's point `near`
+/// moved onto it.
+fn resolve_named_edge(st: &ModelState, plane: &Plane, kind: LinkKind, body: &str, index: usize, near: Vec3) -> Result<Resolved> {
+    let target = st.body(body).ok_or_else(|| lost("named projection body"))?;
+    let pts = target.mesh().edges.get(index).cloned().unwrap_or_default();
+    let at = pts
+        .windows(2)
+        .filter_map(|w| Some(closest_on_segment(near, *w.first()?, *w.get(1)?)))
+        .min_by(|a, b| a.dist(near).total_cmp(&b.dist(near)))
+        .ok_or_else(|| lost("named projection edge"))?;
+    let mut wires = Vec::new();
+    let exact = exact_edges(target, plane, &[index]).pop().flatten();
+    let geom = edge_geom(plane, kind, exact, pts, &mut wires);
+    if geom.is_empty() && wires.is_empty() {
+        return Err(DocError::Invalid("named edge projects to nothing on this sketch plane".into()));
+    }
+    let source = LinkSource::Edge { body: body.into(), at };
+    Ok(Resolved { geom: merge_split_circles(geom), wires, source, moved: false, face_index: None, edge_index: Some(index) })
 }
 
 fn resolve_named_face(st: &ModelState, plane: &Plane, kind: LinkKind, body: &str, index: usize, at: Vec3) -> Result<Resolved> {
@@ -293,19 +393,14 @@ fn resolve_named_face(st: &ModelState, plane: &Plane, kind: LinkKind, body: &str
     let geom = if kind == LinkKind::Intersect {
         section(plane, &mesh, Some(index))
     } else {
-        let mut geom = Vec::new();
-        for edge in projection_face_edges(target, &mesh, index, plane)? {
-            if let Some(points) = mesh.edges.get(edge) {
-                geom.extend(fit_world(plane, points));
-            }
-        }
+        let geom = projected_edges(target, &mesh, plane, &projection_face_edges(target, &mesh, index, plane)?);
         let geom = merge_split_circles(geom);
         if certified_planar_construction(target, index as usize) { merge_family_lines(geom)? } else { geom }
     };
     if geom.is_empty() {
         return Err(DocError::Invalid("named face projects to nothing on this sketch plane".into()));
     }
-    Ok(Resolved { geom, wires: Vec::new(), source: LinkSource::Face { body: body.into(), at }, moved: false, face_index })
+    Ok(Resolved { geom, wires: Vec::new(), source: LinkSource::Face { body: body.into(), at }, moved: false, face_index, edge_index: None })
 }
 
 fn projection_face_edges(body: &crate::ModelBody, mesh: &Mesh, index: u32, plane: &Plane) -> Result<Vec<usize>> {
@@ -334,7 +429,8 @@ fn certified_planar_construction(body: &crate::ModelBody, index: usize) -> bool 
 
 pub fn resolve_anchored_face(doc: &Document, st: &ModelState, plane: &Plane, kind: LinkKind, anchor: &crate::FaceAnchor) -> Result<Resolved> {
     let body = st.body(&anchor.target.body).ok_or_else(|| lost("anchored projection body"))?;
-    let indices = doc.configuration_face_indices(body, &anchor.target)?;
+    // The sketch's plane says when the face was found by fallback; its projection follows it.
+    let (indices, _) = doc.anchored_face_indices(st, body, &anchor.target)?;
     resolve_face_indices(st, plane, kind, &body.name, &indices)
 }
 
@@ -368,11 +464,7 @@ pub fn resolve_face_indices(st: &ModelState, plane: &Plane, kind: LinkKind, body
         } else {
             order::family_edges(&mesh, &selected, plane)?
         };
-        for edge in edges {
-            if let Some(points) = mesh.edges.get(edge) {
-                geometry.extend(fit_world(plane, points));
-            }
-        }
+        geometry.extend(projected_edges(body, &mesh, plane, &edges));
     }
     if kind != LinkKind::Intersect && (indices.len() > 1 || indices.first().is_some_and(|index| certified_planar_construction(body, *index))) {
         geometry = merge_family_lines(geometry)?;
@@ -392,6 +484,7 @@ pub fn resolve_face_indices(st: &ModelState, plane: &Plane, kind: LinkKind, body
         source: LinkSource::Face { body: body.name.clone(), at: point },
         moved: false,
         face_index: if indices.len() == 1 { indices.first().copied() } else { None },
+        edge_index: None,
     })
 }
 
@@ -479,6 +572,32 @@ pub fn refresh_links(doc: &Document, vals: &BTreeMap<String, Value>, st: &ModelS
     refresh_links_in(doc, vals, st, plane, sk, None)
 }
 
+/// Lay every text that runs along a curve of its sketch along that curve as the solve left it.
+/// The texts are laid out with the other links, before the solve, which can move their path (a
+/// path dimensioned from a parameter): without this a text followed its path one evaluation
+/// late. The warnings for texts that no longer lay out.
+pub(crate) fn relay_path_texts(sk: &mut Sketch) -> Vec<String> {
+    let texts: Vec<(String, LinkSource)> = sk
+        .links
+        .iter()
+        .filter(|l| !l.lost && matches!(&l.source, LinkSource::Text { style, .. } if style.path.is_some()))
+        .map(|l| (l.id.clone(), l.source.clone()))
+        .collect();
+    let mut warn = Vec::new();
+    for (id, source) in texts {
+        match sk.text_source_geometry(&source) {
+            Ok(geom) if geom.is_empty() => warn.push(format!("the {} makes no outline", source.describe())),
+            Ok(geom) => {
+                if let Err(e) = sk.update_link(&id, &geom) {
+                    warn.push(format!("{}: {e}", source.describe()));
+                }
+            }
+            Err(e) => warn.push(format!("{}: {e}", source.describe())),
+        }
+    }
+    warn
+}
+
 fn refresh_links_in(
     doc: &Document,
     vals: &BTreeMap<String, Value>,
@@ -519,7 +638,31 @@ fn refresh_links_in(
                 continue;
             }
         }
-        let resolved = if l.auto_face {
+        // An edge the link keeps by name is that edge of its body, wherever it went. When no
+        // edge has the name any more the link is lost: no other edge is taken for it.
+        let mut named_edge = None;
+        if let (Some(name), LinkSource::Edge { body, at }) = (&l.edge_name, &source) {
+            match locate_named_edge(st, body, name, *at) {
+                Some((body, hit)) => {
+                    warn.extend(hit.note(name).map(|note| format!("projected {note}")));
+                    named_edge = Some((body, hit.edge, *at));
+                }
+                None => {
+                    sk.set_link_lost(&l.id, true);
+                    warn.push(format!("projected reference lost: edge `{name}` no longer exists; last geometry retained"));
+                    continue;
+                }
+            }
+        }
+        let resolved = if matches!(source, LinkSource::Text { .. }) {
+            // A text needs nothing outside its sketch; one on a path follows a curve of it.
+            sk.text_source_geometry(&source).map_err(DocError::from).and_then(|geom| {
+                if geom.is_empty() {
+                    return Err(DocError::Invalid(format!("the {} makes no outline", source.describe())));
+                }
+                Ok(Resolved { geom, wires: Vec::new(), source: source.clone(), moved: false, face_index: None, edge_index: None })
+            })
+        } else if l.auto_face {
             anchor
                 .filter(|anchor| {
                     l.face_name.as_ref() == Some(&anchor.target.name) && matches!(&l.source,LinkSource::Face {body,..} if *body==anchor.target.body)
@@ -528,14 +671,28 @@ fn refresh_links_in(
                 .and_then(|anchor| resolve_anchored_face(doc, st, plane, l.kind, anchor))
         } else if let Some((body, index, at)) = named_face {
             resolve_named_face(st, plane, l.kind, &body, index, at)
+        } else if let Some((body, index, at)) = named_edge {
+            resolve_named_edge(st, plane, l.kind, &body, index, at)
         } else {
             resolve(doc, vals, st, plane, l.kind, &source)
         };
         match resolved {
             Ok(r) => {
+                // An edge link saved without a name takes the name of the edge it was found
+                // on. A sketch that is edited stores it; evaluation leaves the design as it is.
+                if l.edge_name.is_none()
+                    && let Some(name) = resolved_edge_name(st, &r)
+                    && let Some(link) = sk.links.iter_mut().find(|link| link.id == l.id)
+                {
+                    link.edge_name = Some(name);
+                }
                 sk.set_link_source(&l.id, r.source);
                 let _ = sk.set_link_wires(&l.id, &r.wires);
+                // Words built from text parameters change shape when the parameters do: that
+                // rebuild is the text following them, not a reference that changed under it.
+                let words_follow = matches!(&l.source, LinkSource::Text { exprs, .. } if exprs.text.is_some());
                 match sk.update_link(&l.id, &r.geom) {
+                    Ok(true) if words_follow => {}
                     Ok(true) => warn.push(format!("projected {} changed shape and was rebuilt", l.source.describe())),
                     Ok(false) if r.moved => warn.push(format!("projected {} was re-found on the nearest geometry", l.source.describe())),
                     Ok(false) => {}
@@ -640,14 +797,13 @@ fn merge_split_circles(geom: Vec<LinkGeom>) -> Vec<LinkGeom> {
     const TOL: f64 = 1e-6;
     let near = |p: Vec2, q: Vec2| p.dist(q) <= TOL * (1.0 + p.len().max(q.len()));
     let mut out = geom.clone();
-    for i in 0..geom.len() {
-        let Some(LinkGeom::Arc { c, a, b }) = geom.get(i).cloned() else { continue };
-        for j in i + 1..geom.len() {
-            if let Some(LinkGeom::Arc { c: c2, a: a2, b: b2 }) = geom.get(j).cloned()
+    for (i, first) in geom.iter().enumerate() {
+        let LinkGeom::Arc { c, a, b } = *first else { continue };
+        for (second, slot) in geom.iter().zip(out.iter_mut()).skip(i + 1) {
+            if let LinkGeom::Arc { c: c2, a: a2, b: b2 } = *second
                 && near(c, c2)
                 && near(a, a2)
                 && near(b, b2)
-                && let Some(slot) = out.get_mut(j)
             {
                 *slot = LinkGeom::Arc { c, a: b, b: a };
             }
@@ -891,22 +1047,51 @@ fn silhouette(plane: &Plane, m: &Mesh) -> Vec<LinkGeom> {
 /// Section of a mesh (or one of its faces) with the sketch plane.
 pub(crate) fn section(plane: &Plane, m: &Mesh, face: Option<u32>) -> Vec<LinkGeom> {
     let size = m.bounds().diagonal().max(1e-9);
+    let (segs, exact) = section_segments(plane, m, face);
+    let segs: Vec<(Vec2, Vec2)> = segs.into_iter().map(|(a, b, _)| (a, b)).collect();
+    let loose = size * 2e-3;
+    fit_segments(&segs, size).into_iter().map(|g| refine_round(g, &exact, loose)).collect()
+}
+
+/// The segments where the plane crosses the mesh's triangles (in plane coordinates, each with
+/// its B-rep face), and the crossings that lie exactly on the surface (on a ruling).
+fn section_segments(plane: &Plane, m: &Mesh, face: Option<u32>) -> (Vec<(Vec2, Vec2, u32)>, Vec<Vec2>) {
+    let size = m.bounds().diagonal().max(1e-9);
     let q = size * 1e-7;
     let key = |p: Vec3| ((p.x / q).round() as i64, (p.y / q).round() as i64, (p.z / q).round() as i64);
-    // Surface normal at each mesh vertex where the surface is smooth (None at creases).
-    let mut normals: BTreeMap<(i64, i64, i64), Option<Vec3>> = BTreeMap::new();
-    for (t, _) in m.triangles.iter().zip(&m.tri_face) {
+    // Surface normal at each mesh vertex where the surface is smooth (None at creases), over
+    // all faces and per face.
+    type Key = (i64, i64, i64);
+    // A vertex this close to the plane is on it, and lies on the same side for every edge it
+    // ends (so a plane through a vertex, or on a face, cuts every edge there alike): below when
+    // the mesh lies on or above the plane (the cut at its bottom face), else above (at its top
+    // face, through an apex). An edge with an end on the plane crosses it at that end.
+    let snap = size * 1e-9;
+    let zero_above = m.positions.iter().any(|p| plane.height(*p) < -snap);
+    let above = |h: f64| if h.abs() <= snap { zero_above } else { h > 0.0 };
+    let mut normals: BTreeMap<Key, Option<Vec3>> = BTreeMap::new();
+    let mut face_normals: BTreeMap<(u32, Key), Option<Vec3>> = BTreeMap::new();
+    // Faces on either side of each mesh edge.
+    let mut edge_faces: BTreeMap<(Key, Key), Vec<u32>> = BTreeMap::new();
+    let merge = |e: &mut Option<Vec3>, n: Vec3| {
+        if e.is_some_and(|o| o.dot(n) < 1.0 - 1e-6) {
+            *e = None;
+        }
+    };
+    for (t, f) in m.triangles.iter().zip(&m.tri_face) {
         for k in t {
             let (Some(p), Some(n)) = (m.positions.get(*k as usize), m.normals.get(*k as usize)) else { continue };
             let Some(n) = n.normalized() else { continue };
-            normals
-                .entry(key(*p))
-                .and_modify(|e| {
-                    if e.is_some_and(|o| o.dot(n) < 1.0 - 1e-6) {
-                        *e = None;
-                    }
-                })
-                .or_insert(Some(n));
+            normals.entry(key(*p)).and_modify(|e| merge(e, n)).or_insert(Some(n));
+            face_normals.entry((*f, key(*p))).and_modify(|e| merge(e, n)).or_insert(Some(n));
+        }
+        for (i, j) in [(0usize, 1usize), (1, 2), (2, 0)] {
+            let (Some(a), Some(b)) = (t.get(i).and_then(|k| m.positions.get(*k as usize)), t.get(j).and_then(|k| m.positions.get(*k as usize)))
+            else {
+                continue;
+            };
+            let (ka, kb) = (key(*a), key(*b));
+            edge_faces.entry(if ka <= kb { (ka, kb) } else { (kb, ka) }).or_default().push(*f);
         }
     }
     // Where the plane crosses a mesh edge: on a cubic through the end points whose end
@@ -916,12 +1101,31 @@ pub(crate) fn section(plane: &Plane, m: &Mesh, face: Option<u32>) -> Vec<LinkGeo
     let crossing = |a: Vec3, b: Vec3| -> Option<Vec3> {
         let (a, b) = if key(a) <= key(b) { (a, b) } else { (b, a) };
         let (ha, hb) = (plane.height(a), plane.height(b));
-        if (ha > 0.0) == (hb > 0.0) {
+        if above(ha) == above(hb) {
             return None;
         }
+        if let Some(p) = [(a, ha), (b, hb)].into_iter().find(|(_, h)| h.abs() <= snap).map(|(p, _)| p) {
+            exact.borrow_mut().push(plane.to_local(p));
+            return Some(p);
+        }
         let d = b - a;
+        // An edge inside one face takes that face's normals (its ends may lie on the face's
+        // boundary, a crease for the whole mesh); an edge between faces, the merged ones, so
+        // both faces agree on the crossing.
+        let faces = edge_faces.get(&(key(a), key(b)));
+        let inside = faces.and_then(|fs| fs.first().filter(|f| fs.len() == 2 && fs.iter().all(|x| x == *f)).copied());
+        // An edge where a curved face meets another (a cylinder's rim on its cap) lies on the
+        // curved face: its normals there put the crossing on the curve, not on the chord.
+        let face_normal = |f: u32, p: Vec3| face_normals.get(&(f, key(p))).copied().flatten();
+        let curved =
+            || faces?.iter().copied().find(|f| matches!((face_normal(*f, a), face_normal(*f, b)), (Some(x), Some(y)) if x.dot(y) < 1.0 - 1e-12));
+        let inside = inside.or_else(curved);
+        let normal = |p: Vec3| match inside {
+            Some(f) => face_normals.get(&(f, key(p))).copied().flatten(),
+            None => normals.get(&key(p)).copied().flatten(),
+        };
         // Tangent length: the arc length of a circle through both ends with these normals.
-        let (na, nb) = (normals.get(&key(a)).copied().flatten(), normals.get(&key(b)).copied().flatten());
+        let (na, nb) = (normal(a), normal(b));
         let l = match (na, nb) {
             (Some(x), Some(y)) => {
                 let half = 0.5 * x.dot(y).clamp(-1.0, 1.0).acos();
@@ -960,7 +1164,7 @@ pub(crate) fn section(plane: &Plane, m: &Mesh, face: Option<u32>) -> Vec<LinkGeo
         }
         Some(h(0.5 * (lo + hi)))
     };
-    let mut segs: Vec<(Vec2, Vec2)> = Vec::new();
+    let mut segs: Vec<(Vec2, Vec2, u32)> = Vec::new();
     for (t, f) in m.triangles.iter().zip(&m.tri_face) {
         if face.is_some_and(|x| x != *f) {
             continue;
@@ -976,13 +1180,11 @@ pub(crate) fn section(plane: &Plane, m: &Mesh, face: Option<u32>) -> Vec<LinkGeo
         if let [a, b] = pts[..] {
             let (a, b) = (plane.to_local(a), plane.to_local(b));
             if a.dist(b) > size * 1e-9 {
-                segs.push((a, b));
+                segs.push((a, b, *f));
             }
         }
     }
-    let exact = exact.into_inner();
-    let loose = size * 2e-3;
-    fit_segments(&segs, size).into_iter().map(|g| refine_round(g, &exact, loose)).collect()
+    (segs, exact.into_inner())
 }
 
 /// Re-fit a circle or arc through the exact section points near it, when there are enough.

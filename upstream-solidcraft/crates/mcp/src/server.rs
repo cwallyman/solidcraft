@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 /// Longest accepted request line, shared with the control server.
 use solidcraft_engine::MAX_LINE;
 
+use solidcraft_engine::io::vfs::{self, PathScope};
+
 use crate::backend::Backend;
 use crate::tools::{call_tool, check_arguments, tool_definitions};
 
@@ -23,18 +25,22 @@ const RESOURCE_NOT_FOUND: i64 = -32002;
 /// Most messages in one JSON-RPC batch.
 const MAX_BATCH: usize = 1000;
 
-const INSTRUCTIONS: &str = "SolidCraft is a parametric 3D CAD app in the style of Autodesk Fusion. Units are millimetres \
-and degrees in expressions (internally radians), Z is up. Model like in Fusion: `sketch.create {plane: XY}`, draw \
+const INSTRUCTIONS: &str = "SolidCraft is an independent parametric 3D CAD app, and these tools drive it: when its window is \
+open the user watches the model appear, otherwise a headless session builds it. When asked to design or build a part \
+(a bracket, an enclosure, a gear) do it with these tools straight away; nothing needs explaining first. Units are millimetres \
+and degrees in expressions (internally radians), Z is up. Model like this: `sketch.create {plane: XY}`, draw \
 (`sketch.rectangle.two_point {p0, p1}`, `sketch.circle.center {center, radius}`, `sketch.line {points, closed}`), constrain \
 and dimension (`sketch.dimension {entities, value}`; values may name parameters), `sketch.finish`, then features \
 (`solid.extrude {distance, operation?: new|join|cut|intersect}`, `solid.revolve`, `solid.fillet {edges: [[x,y,z] point on \
 edge], radius}`, `solid.chamfer`, patterns, mirror, primitives). Use `batch` for several steps at once, \
-`list_commands` for ids and parameter docs, `inspect_design` / `measure` to verify, `list_edges` to find edge points, \
-`set_parameter` to drive the design and `screenshot` to look at it.";
+`list_commands` for ids and parameter docs, `describe_command` for a command's schemas, `inspect_design` / `measure` to verify, \
+`body_topology` to find edge points, `set_parameter` to drive the design and `screenshot` to look at it. A call whose error \
+starts `still running:` was not cancelled: don't send it again; `pending` waits for its result.";
 
 pub struct Server {
     backend: Box<dyn Backend>,
     initialized: bool,
+    scope: Option<PathScope>,
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -46,7 +52,13 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self { backend, initialized: false }
+        Self { backend, initialized: false, scope: None }
+    }
+    /// Confine the files tool calls may reach to `scope` (`None`: anywhere). `solidcraft-cli mcp`
+    /// always sets one unless started with `--allow-any-path` (docs/mcp.md).
+    pub fn with_path_scope(mut self, scope: Option<PathScope>) -> Self {
+        self.scope = scope;
+        self
     }
     pub fn backend(&mut self) -> &mut dyn Backend {
         self.backend.as_mut()
@@ -56,22 +68,48 @@ impl Server {
     }
 
     /// Serve newline-delimited JSON-RPC until `input` closes. Only protocol messages go to
-    /// `output`; diagnostics belong on stderr.
-    pub fn serve(&mut self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = match line {
-                Ok(l) => l,
-                // Not UTF-8: answer with a parse error and keep serving.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                    let reply = error(Value::Null, PARSE_ERROR, "parse error: input is not UTF-8").to_string();
-                    output.write_all(reply.as_bytes())?;
-                    output.write_all(b"\n")?;
-                    output.flush()?;
-                    continue;
+    /// `output`; diagnostics belong on stderr. Consume oversized lines in bounded space so an
+    /// agent cannot exhaust memory by sending an arbitrarily long request without a newline.
+    pub fn serve(&mut self, mut input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+        loop {
+            let mut line = Vec::new();
+            let mut oversized = false;
+            let mut received = false;
+            loop {
+                let chunk = input.fill_buf()?;
+                if chunk.is_empty() {
+                    break;
                 }
-                Err(e) => return Err(e),
+                let count = chunk.iter().position(|&byte| byte == b'\n').map_or(chunk.len(), |i| i + 1);
+                let newline = chunk[count - 1] == b'\n';
+                let content_len = count - usize::from(newline);
+                if !oversized {
+                    if line.len().saturating_add(content_len) > MAX_LINE {
+                        oversized = true;
+                        line.clear();
+                    } else {
+                        line.extend_from_slice(&chunk[..content_len]);
+                    }
+                }
+                input.consume(count);
+                received = true;
+                if newline {
+                    break;
+                }
+            }
+            if !received {
+                break;
+            }
+            let reply = if oversized {
+                Some(error(Value::Null, INVALID_REQUEST, "request too large").to_string())
+            } else {
+                match String::from_utf8(line) {
+                    Ok(line) => self.handle_line(&line),
+                    // Not UTF-8: answer with a parse error and keep serving.
+                    Err(_) => Some(error(Value::Null, PARSE_ERROR, "parse error: input is not UTF-8").to_string()),
+                }
             };
-            if let Some(reply) = self.handle_line(&line) {
+            if let Some(reply) = reply {
                 output.write_all(reply.as_bytes())?;
                 output.write_all(b"\n")?;
                 output.flush()?;
@@ -82,12 +120,13 @@ impl Server {
 
     /// One line in, at most one line out (notifications get no reply).
     pub fn handle_line(&mut self, line: &str) -> Option<String> {
+        // Check the raw input before trimming: a huge whitespace prefix is still a huge line.
+        if line.len() > MAX_LINE {
+            return Some(error(Value::Null, INVALID_REQUEST, "request too large").to_string());
+        }
         let line = line.trim();
         if line.is_empty() {
             return None;
-        }
-        if line.len() > MAX_LINE {
-            return Some(error(Value::Null, INVALID_REQUEST, "request too large").to_string());
         }
         let reply = match serde_json::from_str::<Value>(line) {
             Ok(Value::Array(batch)) if batch.is_empty() => Some(error(Value::Null, INVALID_REQUEST, "empty batch")),
@@ -146,7 +185,16 @@ impl Server {
                     Some(a) => a.clone(),
                 };
                 check_arguments(name, &args).map_err(|e| (INVALID_PARAMS, e))?;
-                Ok(call_tool(self.backend.as_mut(), name, &args))
+                // The open design's folder counts as it is now (a save-as or open moves it).
+                let scope = self.scope.clone().map(|s| s.with_design(self.backend.design_path().as_deref()));
+                let backend = self.backend.as_mut();
+                let mut result = vfs::scoped(scope, || call_tool(backend, name, &args));
+                if let Some(note) = backend.notice()
+                    && let Some(content) = result.get_mut("content").and_then(Value::as_array_mut)
+                {
+                    content.push(json!({"type": "text", "text": note}));
+                }
+                Ok(result)
             }
             "resources/list" => Ok(json!({"resources": [
                 {"uri": "solidcraft://design", "name": "Active design", "description": "document.inspect with measurements", "mimeType": "application/json"},

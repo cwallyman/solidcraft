@@ -35,16 +35,15 @@ fn rect_json(rect: Rect) -> Value {
 
 pub fn update(app: &SolveApp, ctx: &Context) {
     let view = if app.home.open { None } else { app.viewport.rect };
-    let controls: Vec<_> = ["nav:outer", "axis_view:outer", "browser:divider"].into_iter().filter_map(scenario::rect_of).collect();
+    let controls: Vec<_> = ["nav:outer", "axis_view:outer"].into_iter().filter_map(scenario::rect_of).collect();
     HIT.with(|h| {
         *h.borrow_mut() = Some(HitState { ctx: ctx.clone(), viewport: view, controls, projection: view.map(|r| viewport::projection(app, r)) })
     });
     let handles: serde_json::Map<String, Value> = [
-        "panel:SOLID:INSERT",
+        "ribbon:section:INSERT:2D",
         "dropdown:sketch.insert_dxf",
-        "browser:panel",
-        "browser:divider",
-        "browser:toggle",
+        "browser:card",
+        "browser:header",
         "nav:outer",
         "nav:fit",
         "nav:lookat",
@@ -65,7 +64,7 @@ pub fn update(app: &SolveApp, ctx: &Context) {
             "mesh_body_name": mesh_bodies.first().map(|b| b.name.clone()),
             "cad_shell_count": state.bodies.iter().filter(|b| !b.body.is_mesh()).map(|b| b.body.shell_count()).sum::<usize>(),
             "viewport": view.map(rect_json), "zoom": ctx.zoom_factor(), "rects": handles,
-            "browser_collapsed": app.ui.browser_docked, "browser_width": app.ui.browser_width,
+            "browser_collapsed": app.tree.panel_collapsed, "browser_width": app.preferences.browser_width,
             "imported_sketch_count": app.session.doc.features.iter().filter(|f| f.name.starts_with("DXF ")).count(),
             "imported_curve_count": app.session.doc.features.iter().filter(|f| f.name.starts_with("DXF ")).map(|f| match &f.kind {solidcraft_engine::doc::FeatureKind::Sketch{sketch,..} => sketch.curves.len(), _ => 0}).sum::<usize>(),
             "active_sketch": app.session.active_sketch,
@@ -200,39 +199,5 @@ mod tests {
         assert!(h.app.cam.back().dot(Vec3::Z) > 0.9999);
         assert_eq!(h.app.cam.fov, 0.0);
         assert_eq!(h.app.session.selection, selection);
-    }
-
-    #[test]
-    fn apple_touch_browser_resizes_and_collapses_with_real_input() {
-        let mut h = sample();
-        let panel = scenario::rect_of("browser:panel").unwrap();
-        h.call("ui.drag", json!({"x0":panel.right()-1.0,"y0":panel.center().y,"x1":350,"y1":panel.center().y,"steps":8}));
-        h.settle();
-        h.frames(3);
-        assert!(scenario::rect_of("browser:panel").unwrap().width() > 320.0);
-        let button = scenario::rect_of("browser:toggle").unwrap().center();
-        h.call("ui.click", json!({"x":button.x,"y":button.y}));
-        h.settle();
-        h.frames(3);
-        assert!(h.app.ui.browser_docked);
-        assert!(scenario::rect_of("browser:panel").unwrap().width() < 60.0);
-        let button = scenario::rect_of("browser:toggle").unwrap().center();
-        h.call("ui.click", json!({"x":button.x,"y":button.y}));
-        h.settle();
-        h.frames(3);
-        assert!(!h.app.ui.browser_docked);
-        assert!(scenario::rect_of("browser:panel").unwrap().width() > 320.0);
-    }
-
-    #[test]
-    fn apple_touch_browser_preferences_survive_reopen() {
-        let mut h = sample();
-        h.app.ui.browser_width = 345.0;
-        h.app.ui.browser_docked = true;
-        let prefs = h.app.prefs();
-        let mut restored = SolveApp::new(Default::default(), Default::default());
-        restored.load_prefs(&prefs);
-        assert_eq!(restored.ui.browser_width, 345.0);
-        assert!(restored.ui.browser_docked);
     }
 }

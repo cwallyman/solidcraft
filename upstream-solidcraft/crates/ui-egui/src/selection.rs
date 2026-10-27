@@ -17,6 +17,28 @@ pub(crate) fn same_item(a: &Sel, b: &Sel) -> bool {
     }
 }
 
+/// Two distinct point intents for the alignment command, without creating sketch points.
+pub(crate) fn alignment_points(selection: &[Sel]) -> Option<[serde_json::Value; 2]> {
+    let [a, b] = selection else { return None };
+    let point = |s: &Sel| match s {
+        Sel::SketchPoint { id } => Some(serde_json::json!(id)),
+        Sel::SketchMidpoint { id } => Some(serde_json::json!({"midpoint": id})),
+        _ => None,
+    };
+    let (a, b) = (point(a)?, point(b)?);
+    (a != b).then_some([a, b])
+}
+
+/// The current middle of a finite straight sketch edge.
+pub(crate) fn line_midpoint(sk: &solidcraft_engine::sketch::Sketch, line: usize) -> Option<solidcraft_engine::geom::Vec2> {
+    let curve = sk.curves.get(line)?;
+    if curve.infinite {
+        return None;
+    }
+    let solidcraft_engine::sketch::CurveKind::Line { a, b } = &curve.kind else { return None };
+    Some((sk.point(*a)? + sk.point(*b)?) * 0.5)
+}
+
 /// What a selection input accepts (bit set).
 pub type Accept = u16;
 pub const PROFILES: Accept = 1;
@@ -36,6 +58,22 @@ pub const CURVES: Accept = 256;
 pub const POINTS: Accept = 512;
 /// Timeline features (pattern objects), picked in the timeline.
 pub const FEATURES: Accept = 1024;
+/// Points of the sketch being modified; unlike POINTS these never enable cross-sketch picking.
+pub const SKETCH_POINTS: Accept = 2048;
+/// The origin point, picked as a vertex of no body (in the viewport or the browser's Origin).
+pub const ORIGIN: Accept = 4096;
+/// Curves of any sketch, picked with their sketch (`ExternalSketchCurve`): curve ids are a
+/// sketch's own, so two sketches can both have a `w2` (frame member lines).
+pub const SKETCH_LINES: Accept = 8192;
+/// Sketch points with an explicit source sketch; only for commands that consume external references.
+pub const EXTERNAL_POINTS: Accept = 16384;
+/// Named construction points.
+pub const CONSTRUCTION_POINTS: Accept = 32768;
+/// What a 3D axis input takes (Revolve, Circular Pattern, Plane at Angle, Move's Rotate): an
+/// origin or construction axis, a straight sketch line, and an edge or face of the model that
+/// has an axis (a straight or circular edge, a cylinder, cone or torus face; the dialog takes
+/// only those, `Dialog::candidate_on`).
+pub const AXIS_PICKS: Accept = AXES | EDGES | FACES;
 
 /// One selection input of a command dialog ("Profiles", "Edges", "Plane", ...).
 #[derive(Clone, Debug, PartialEq)]
@@ -44,16 +82,26 @@ pub struct SelInput {
     pub accept: Accept,
     /// Many items (clicks toggle them), or one (a click replaces it).
     pub multi: bool,
+    /// Face picks are places on the face, not the face: several on one face add up (a click on
+    /// the very spot of one takes it out). For points that pick pieces a face is cut into.
+    pub places: bool,
     pub items: Vec<Sel>,
 }
 
 impl SelInput {
     pub fn new(label: &'static str, accept: Accept, multi: bool) -> SelInput {
-        SelInput { label, accept, multi, items: Vec::new() }
+        SelInput { label, accept, multi, places: false, items: Vec::new() }
     }
 
-    /// The selection a hit stands for, if this input accepts it.
-    pub fn accepts(&self, h: &Hit, planar: impl Fn(&str, usize) -> bool) -> Option<Sel> {
+    /// This input with face picks as places (see [`SelInput::places`]).
+    pub fn places(mut self) -> SelInput {
+        self.places = true;
+        self
+    }
+
+    /// The selection a hit stands for, if this input accepts it. A curve of another sketch than
+    /// the `active` one names its sketch: curve ids repeat from one sketch to the next (#3726).
+    pub fn accepts(&self, h: &Hit, active: Option<u64>, planar: impl Fn(&str, usize) -> bool) -> Option<Sel> {
         let a = self.accept;
         match h {
             Hit::Profile { sketch, index } if a & PROFILES != 0 => Some(Sel::Profile { sketch: *sketch, index: *index }),
@@ -64,10 +112,15 @@ impl SelInput {
             Hit::Face { body, .. } if a & BODIES != 0 => Some(Sel::Body { name: body.clone() }),
             Hit::Plane { name, .. } if a & PLANES != 0 => Some(Sel::Plane { name: name.clone() }),
             Hit::Axis { name } if a & AXES != 0 => Some(Sel::Axis { name: name.clone() }),
-            Hit::SketchCurve { id, straight: true, .. } if a & AXES != 0 => Some(Sel::SketchCurve { id: id.clone() }),
-            Hit::SketchCurve { id, .. } if a & CURVES != 0 => Some(Sel::SketchCurve { id: id.clone() }),
+            Hit::ConstructionPoint { name } if a & CONSTRUCTION_POINTS != 0 => Some(Sel::ConstructionPoint { name: name.clone() }),
+            Hit::SketchCurve { sketch, id, straight: true, .. } if a & AXES != 0 => Some(curve_pick(id, *sketch, active)),
+            Hit::SketchCurve { sketch, id, .. } if a & SKETCH_LINES != 0 => Some(Sel::ExternalSketchCurve { sketch: *sketch, id: id.clone() }),
+            Hit::SketchCurve { sketch, id, .. } if a & CURVES != 0 => Some(curve_pick(id, *sketch, active)),
+            Hit::SketchPoint { sketch, id, .. } if a & EXTERNAL_POINTS != 0 => Some(Sel::ExternalSketchPoint { sketch: *sketch, id: id.clone() }),
+            Hit::SketchPoint { id, .. } if a & SKETCH_POINTS != 0 => Some(Sel::SketchPoint { id: id.clone() }),
             Hit::SketchPoint { sketch, id, .. } if a & POINTS != 0 => Some(Sel::SketchPoint { id: format!("{sketch}:{id}") }),
-            Hit::Vertex { body, point } if a & VERTICES != 0 => Some(Sel::Vertex { body: body.clone(), point: *point }),
+            Hit::Vertex { body, point } if body.is_empty() && a & ORIGIN != 0 => Some(Sel::Vertex { body: String::new(), point: *point }),
+            Hit::Vertex { body, point } if !body.is_empty() && a & VERTICES != 0 => Some(Sel::Vertex { body: body.clone(), point: *point }),
             _ => None,
         }
     }
@@ -82,16 +135,83 @@ impl SelInput {
             return;
         }
         // A pick of something already in (or a chain fully in) takes it out.
-        if picked.iter().all(|p| self.items.iter().any(|x| same_item(x, p))) {
-            self.items.retain(|x| !picked.iter().any(|p| same_item(x, p)));
+        let places = self.places;
+        // Whether two picks are the same item of this input.
+        let same = |a: &Sel, b: &Sel| match (a, b) {
+            (Sel::Face { point: p, .. }, Sel::Face { point: q, .. }) if places => same_item(a, b) && p.dist(*q) <= 1e-9,
+            _ => same_item(a, b),
+        };
+        if picked.iter().all(|p| self.items.iter().any(|x| same(x, p))) {
+            self.items.retain(|x| !picked.iter().any(|p| same(x, p)));
         } else {
             for p in picked {
-                if !self.items.iter().any(|x| same_item(x, &p)) {
+                if !self.items.iter().any(|x| same(x, &p)) {
                     self.items.push(p);
                 }
             }
         }
     }
+}
+
+/// A sketch curve as a dialog's pick. A curve of another sketch than the `active` one names its
+/// sketch: curve ids repeat from one sketch to the next (#3726).
+pub(crate) fn curve_pick(id: &str, sketch: u64, active: Option<u64>) -> Sel {
+    Sel::SketchCurve { id: id.to_string(), sketch: (active != Some(sketch)).then_some(sketch) }
+}
+
+/// Projections preserve pick order and repetitions; callers own any deduplication or frames.
+pub(crate) trait SelectionExt {
+    fn body_names(&self) -> Vec<String>;
+    fn curve_ids(&self) -> Vec<String>;
+    /// The sketch every curve pick names, when they all name the same one (#3726).
+    fn named_sketch(&self) -> Option<u64>;
+    fn profiles(&self) -> Vec<(u64, usize)>;
+    fn edge_points(&self) -> Vec<Vec3>;
+    fn face_points(&self) -> Vec<Vec3>;
+}
+
+impl SelectionExt for [Sel] {
+    fn body_names(&self) -> Vec<String> {
+        self.iter().filter_map(|x| if let Sel::Body { name } = x { Some(name.clone()) } else { None }).collect()
+    }
+    fn curve_ids(&self) -> Vec<String> {
+        self.iter().filter_map(|x| if let Sel::SketchCurve { id, .. } = x { Some(id.clone()) } else { None }).collect()
+    }
+    fn named_sketch(&self) -> Option<u64> {
+        let mut named = self.iter().filter_map(|x| if let Sel::SketchCurve { sketch, .. } = x { Some(*sketch) } else { None });
+        let first = named.next()??;
+        named.all(|k| k == Some(first)).then_some(first)
+    }
+    fn profiles(&self) -> Vec<(u64, usize)> {
+        self.iter().filter_map(|x| if let Sel::Profile { sketch, index } = x { Some((*sketch, *index)) } else { None }).collect()
+    }
+    fn edge_points(&self) -> Vec<Vec3> {
+        self.iter().filter_map(|x| if let Sel::Edge { point, .. } = x { Some(*point) } else { None }).collect()
+    }
+    fn face_points(&self) -> Vec<Vec3> {
+        self.iter().filter_map(|x| if let Sel::Face { point, .. } = x { Some(*point) } else { None }).collect()
+    }
+}
+
+pub(crate) fn items(inputs: &[SelInput], i: usize) -> &[Sel] {
+    inputs.get(i).map(|x| x.items.as_slice()).unwrap_or(&[])
+}
+
+pub(crate) fn point_value(v: Vec3) -> serde_json::Value {
+    serde_json::json!([v.x, v.y, v.z])
+}
+
+pub(crate) fn polyline_mid(pts: &[Vec3]) -> Vec3 {
+    let len: f64 = pts.windows(2).map(|w| w[0].dist(w[1])).sum();
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let l = w[0].dist(w[1]);
+        if acc + l >= len * 0.5 && l > 0.0 {
+            return w[0].lerp(w[1], (len * 0.5 - acc) / l);
+        }
+        acc += l;
+    }
+    pts.first().copied().unwrap_or_default()
 }
 
 /// World size of the origin widget: a fixed fraction of the viewport height, whatever the zoom
@@ -239,13 +359,29 @@ mod tests {
         inp.toggle(vec![e(2), e(3)]);
         assert_eq!(inp.items, vec![e(1)]);
         let face = Hit::Face { body: "B".into(), index: 0, point: Vec3::ZERO };
-        assert!(inp.accepts(&face, |_, _| true).is_none());
+        assert!(inp.accepts(&face, None, |_, _| true).is_none());
         let planes = SelInput::new("Plane", PLANES | PLANAR_FACES, false);
-        assert!(planes.accepts(&face, |_, _| true).is_some());
-        assert!(planes.accepts(&face, |_, _| false).is_none());
+        assert!(planes.accepts(&face, None, |_, _| true).is_some());
+        assert!(planes.accepts(&face, None, |_, _| false).is_none());
         let mut one = SelInput::new("Plane", PLANES, false);
         one.toggle(vec![Sel::Plane { name: "XY".into() }]);
         one.toggle(vec![Sel::Plane { name: "YZ".into() }]);
         assert_eq!(one.items, vec![Sel::Plane { name: "YZ".into() }]);
+    }
+}
+
+#[cfg(test)]
+mod shared_geometry_baseline_tests {
+    use super::*;
+
+    #[test]
+    fn polyline_mid_preserves_degenerate_and_unequal_segments() {
+        let p = Vec3::new(10.0, -3.0, 7.0);
+        assert_eq!(polyline_mid(&[]), Vec3::ZERO);
+        assert_eq!(polyline_mid(&[p]), p);
+        assert_eq!(polyline_mid(&[p, p, p]), p);
+        assert_eq!(polyline_mid(&[p, p + Vec3::X, p + Vec3::X * 10.0]), p + Vec3::X * 5.0);
+        assert_eq!(polyline_mid(&[p, p, p + Vec3::X * 2.0, p + Vec3::X * 2.0 + Vec3::Y * 6.0]), p + Vec3::X * 2.0 + Vec3::Y * 2.0);
+        assert_eq!(polyline_mid(&[p, Vec3::new(f64::NAN, 0.0, 0.0)]), p);
     }
 }

@@ -9,20 +9,20 @@
   <meta property="og:site_name" content="SolidCraft">
   <meta property="og:title" content="SolidCraft: try it in your browser">
   <meta property="og:description" content="Open-source parametric CAD built in Rust. Desktop, browser, and MCP for AI agents.">
-  <meta property="og:url" content="https://bherbruck.github.io/solidcraft/app/">
-  <meta property="og:image" content="https://bherbruck.github.io/solidcraft/og.png">
+  <meta property="og:url" content="https://solidcraft.ai/">
+  <meta property="og:image" content="https://docs.solidcraft.io/og.png">
   <meta property="og:image:width" content="1280">
   <meta property="og:image:height" content="640">
   <meta property="og:image:alt" content="SolidCraft: open-source parametric CAD built in Rust">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="SolidCraft: try it in your browser">
   <meta name="twitter:description" content="Open-source parametric CAD built in Rust. Desktop, browser, and MCP for AI agents.">
-  <meta name="twitter:image" content="https://bherbruck.github.io/solidcraft/og.png">
+  <meta name="twitter:image" content="https://docs.solidcraft.io/og.png">
   <meta name="twitter:image:alt" content="SolidCraft: open-source parametric CAD built in Rust">
   
 <script type="module">
-import init, * as bindings from './solidcraft-web-3967bd64c0cae432.js';
-const wasm = await init({ module_or_path: './solidcraft-web-3967bd64c0cae432_bg.wasm' });
+import init, * as bindings from './solidcraft-web-7dc756c37282812f.js';
+const wasm = await init({ module_or_path: './solidcraft-web-7dc756c37282812f_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -33,15 +33,30 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 </script>
   
   
-  <style>
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #e8ebf0; }
-    #solidcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-    #solidcraft_loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
-      color: #4a5060; font: 14px system-ui, sans-serif; pointer-events: none; }
-  </style>
-<link rel="modulepreload" href="./solidcraft-web-3967bd64c0cae432.js" crossorigin="anonymous"><link rel="preload" href="./solidcraft-web-3967bd64c0cae432_bg.wasm" crossorigin="anonymous" as="fetch" type="application/wasm"></head>
+  <link rel="stylesheet" href="./loading-fa23566dd89fa92b.css"/>
+  
+  <!-- Installable as an app (manifest.webmanifest); the icons are the Linux exports of the app mark. -->
+  <meta name="theme-color" content="#343840">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/32x32/ai.storyteller.solidcraft.png">
+  <link rel="apple-touch-icon" href="icons/256x256/ai.storyteller.solidcraft.png">
+  
+  
+  
+  
+<link rel="modulepreload" href="./solidcraft-web-7dc756c37282812f.js" crossorigin="anonymous"><link rel="preload" href="./solidcraft-web-7dc756c37282812f_bg.wasm" crossorigin="anonymous" as="fetch" type="application/wasm"></head>
 <body>
   <canvas id="solidcraft_canvas"></canvas>
-  <div id="solidcraft_loading">Loading SolidCraft&hellip;</div>
+  <div id="solidcraft_loading" role="status"><img src="loading-logo.svg" alt=""><span class="sr-only">Loading SolidCraft&hellip;</span></div>
+  <script>
+    // Offline use and updates (sw.js; written into release builds by `cargo xtask web-offline`).
+    if ("serviceWorker" in navigator) {
+      addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+    }
+    // Install as an app: the browser's offer can come before the app runs, so it is kept here for
+    // the app's File ▸ Install app… item (src/install.rs). Installed, the browser makes no more offers.
+    addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); window.solidcraftInstall = e; });
+    addEventListener("appinstalled", () => { window.solidcraftInstall = null; });
+  </script>
 </body>
 </html>

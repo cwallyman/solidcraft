@@ -1,141 +1,48 @@
-# SolidCraft — instructions for agents
+# SolidCraft: instructions for agents
 
-SolidCraft is a clean-room, open-source, pure-Rust parametric 3D CAD application:
-sketches with a constraint solver, a parametric timeline of features, a B-rep
-kernel, and a desktop UI that agents can drive. Projects published by
-[storytold](https://github.com/storytold) can serve as references for implementation conventions.
-Any code adapted from other projects (MIT OR Apache-2.0) is noted in ATTRIBUTION.md.
+SolidCraft is a clean-room, pure-Rust parametric 3D CAD app (sketch solver, feature timeline, B-rep kernel, an egui UI that agents drive). This file is a router: the hard rules, then the skill to read for your task. Humans: CONTRIBUTING.md.
 
-## Product name
-SolidCraft everywhere: crates `solidcraft-*`, binaries `solidcraft` and `solidcraft-cli`,
-`.solidcraft` designs, the `solidcraft/N` format tag, `SOLIDCRAFT_*` environment variables,
-settings and recovery folders, the MCP server name, docs, CI and packaging. The old name
-survives only in the explicit compatibility shims listed in `docs/compatibility.md`; don't add
-new uses of it anywhere else. Public docs/web/Flatpak deployments use project Pages
-`/solidcraft/`; do not add permanent old-name Pages aliases.
+## Start here
+Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelled `help wanted`, `good first issue`, `needs-triage`; architecture in `docs/architecture.md`. Act when the code, docs and rules settle a question; ask only when it changes what users see. Local `plan/` notes are optional.
 
-## Start every session here
-1. Read `plan/STATUS.md` (current milestone, next task), then the task in `plan/execution-plan.md`
-   and the relevant `plan/architecture.md` section.
-2. Kernel and library decisions: `plan/adr/0001-geometry-kernel.md` (what we may depend on, what
-   is rejected for licence reasons).
-3. Follow the autonomous operation protocol (`plan/execution-plan.md` §6). Don't stop to ask
-   unless it lists the decision as the owner's.
+## Hard rules (what enforces each)
+- Independent: never copy another product's code, icons, text or templates; never drive or take data from commercial CAD. `skills/solidcraft-ground-rules/SKILL.md`.
+- No GPL/LGPL/AGPL code, not even reading it (OpenCASCADE, FreeCAD, SolveSpace, CadQuery, LibreCAD, QCAD): `cargo xtask licences --check`.
+- Every asset is original or openly licensed with a row in ATTRIBUTION.md; read `assets/AGENTS.md` before icon work: `cargo xtask assets`, `cargo xtask icons`.
+- Never crash: no unwrap/expect/panic/unsafe in non-test code (unsafe allowlist in crash-safety), errors are `Result`, input is hostile: clippy `-D warnings`, `hostile_params_never_panic`.
+- Everything is a command and programmatic calls never open dialogs: `skills/solidcraft-commands/SKILL.md`.
+- Layering (geom, sketch/kernel/render, doc, io, engine, ui-egui, apps); only `crates/kernel` uses truck: `cargo xtask layers`.
+- One outer UI container, one camera path (`navigation::handle`), colours from theme tokens: `cargo xtask ui-containers`.
+- Application code is Rust only and builds for wasm: `cargo xtask wasm`, `cargo xtask web-offline-test`.
+- The product name is SolidCraft; the old name lives only in `docs/compatibility.md`.
+- Sorted lists (message catalogs, `mod` lines, languages) stay sorted: `cargo xtask lists`. Never edit generated files (`docs/features.md`, `THIRD-PARTY-LICENSES.txt`) in a PR.
+- A design-format change is ONE new file in `crates/doc/src/format/pending/`: `scripts/test-format-pending.sh`.
+- A command has input and output schemas (will become required; `schema/unconverted.txt` only shrinks): `skills/solidcraft-commands/SKILL.md`.
+- New UI strings go in `assets/locales/pending/<slug>.json`, ATTRIBUTION rows in `attribution/pending/<slug>.md`: `cargo xtask lists`.
+- A changed default keeps the old behaviour behind a preference and fills the PR's `Changes a default:` line, and no second PR for an issue a lower-numbered one closes: `pr-checks.yml`.
+- A regression test goes in the area's existing test file, never a per-bug file (#3226).
+- Look at open PRs first, claim with a draft PR (lowest number wins), one topic per PR, never force-push `main`, no pushes just to catch up with `main`: `skills/solidcraft-contributing/SKILL.md`.
+- Show observable changes with real screenshots or a recording, captured yourself.
+- Run `cargo xtask ci` before every commit, without switching branches while it runs. `cargo xtask skills` keeps this file and `skills/` honest.
 
-`plan/` is gitignored (local only).
-
-## Never crash
-People trust SolidCraft with their designs; a crash loses their work. **This outranks feature work.**
-- **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
-  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
-- **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
-  returns an error ("not supported yet: …"); it never panics.
-- **Input-derived numbers are hostile** (command parameters, design files, control-channel
-  input): `get()` not `[i]`, finite checks, caps on sizes and loop counts.
-- **Third-party kernel calls are guarded:** everything that calls `truck` goes through
-  `solidcraft_kernel::guard`, which turns a panic into `KernelError::Internal`.
-- **Last-resort guard:** `Session::execute` runs every command under `catch_unwind`; an escaped
-  panic restores the design and reports `EngineError::Internal`.
-- **Crash reports:** the desktop app writes every panic and every unclean exit to a local crash folder,
-  with the design and the commands that reproduce it (`solidcraft_engine::crash`, docs/crash-reports.md).
-  When someone says the app crashed, look there first: `solidcraft-cli crashes`, `crashes show <id>`,
-  `crashes replay <id>` (or the `diagnostics.crash_reports` command / MCP `crash_reports` tool).
-- **Prove it:** every crash fix lands with a regression test (see `hostile_params_never_panic`); a
-  crash report's `design.solidcraft` + `replay.json` is the test's starting point.
-- Every production crate root carries
-  `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]`.
-
-## Non-negotiables
-- **Independent.** SolidCraft is independent. Behaviour is designed from public documentation,
-  general CAD conventions and user feedback. Reference tests use analytic values and open-source
-  tools. Never copy another product's code, icons, artwork, help text, tooltips, templates or
-  materials. File formats come from public specifications.
-- **No commercial CAD products.** Agents must not drive, script, automate or extract data from
-  commercial CAD products (Fusion, SolidWorks, Onshape, …) for this project: no test data,
-  measurements, command lists, ids or files produced with them.
-- **Never read, copy or link GPL/LGPL/AGPL code**: OpenCASCADE, FreeCAD (incl. planegcs),
-  SolveSpace, CadQuery/OCP, LibreCAD, QCAD — don't even read their sources. (`tools/freecad-oracle/`
-  runs FreeCAD as a separate program through its public scripting API to compute reference values;
-  nothing from FreeCAD is linked, vendored or shipped.) The sketch solver and the blend
-  operations are our own.
-- **Assets — absolutely essential.** SolidCraft contains **no iconography, images, fonts or
-  artwork from commercial CAD products — ever.** Every icon is drawn in code
-  (`crates/ui-egui/src/icons.rs`). Any file asset must be original or openly licensed and **must have a row in ATTRIBUTION.md**
-  (`cargo xtask assets` enforces it). Screenshots of commercial CAD software are never committed.
-  Breaking this rule is the most serious mistake you can make in this repo.
-- **Everything is a command.** User-visible behaviour = a command in `crates/engine/src/cmd/*`
-  (`CommandSpec`: id = our own dotted, lower-case id `<area>.<thing>[.<variant>]` such as
-  `solid.extrude` or `sketch.rectangle.two_point`, never another product's command id; label;
-  toolbar tab and panel; icon; shortcut; params doc; `enabled`; JSON `run`) + tests. The toolbar,
-  dialogs, sketch tools, palette, scripts, CLI and control channel all reach the same commands.
-- **Programmatic calls never open dialogs.** `engine.execute` runs the JSON form; only toolbar
-  clicks (`ui.start`) start interactive tools and dialogs, which then run commands.
-- **Layering** is enforced by `cargo xtask layers`: L0 `geom` → L1 `sketch`, `kernel`, `render`
-  → L2 `doc` → L3 `io` → L4 `engine` → L5 `ui-egui` → apps. Nothing below L5 depends on
-  egui/eframe/winit/wgpu/rfd. **The UI crate is swappable.** Only `crates/kernel` may use `truck`.
-- **The UI is thin**: panels read engine state and act through `app.run(id, params)` /
-  `app.start(id)`. Colours come from `theme::Tokens`.
-- **Rust only.** Units are millimetres and radians internally; Z is up.
-- **Quality gates** before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests,
-  assets, layers). Commit after every feature arc that builds.
-- **Publishing**: `origin` is github.com/bherbruck/solidcraft. Changes land through **pull requests**:
-  push a branch, open a PR, and let GitHub CI run. Maintainers (and agents working for them) may
-  merge their own PR as soon as CI is green (`gh pr merge --squash`); a trivial fix (docs, typos)
-  may be merged right away. Keep each PR to one topic, rebase or merge `main` into it when it
-  conflicts, and never force-push `main`. Never commit `plan/`, build dirs (`target*/`) or
-  generated reference data; check `git ls-files` before pushing.
-- **Never break wasm**: everything below the apps must build for `wasm32-unknown-unknown`
-  (`cargo xtask wasm`, part of `cargo xtask ci`).
-
-## Showing and following through on changes
-
-- Help reviewers see what is broken or changed. For observable CAD, UI or model behavior,
-  issues and PRs must include actual descriptive screenshots or a short recording from a
-  small reproduction. This includes kernel, geometry, assembly and backend changes whose
-  effects can be shown in the app. Coding agents should run the app and capture this evidence
-  themselves; do not ask a human for evidence the agent can produce. Show the actual failure
-  or result, preferably before and after, with brief reproduction steps, expected/actual
-  behavior and annotations that point out the relevant detail.
-- Flowcharts and Mermaid diagrams cannot substitute for screenshots or recordings of visible
-  behavior. Use diagrams for architectural reasoning when actual screenshots cannot illustrate
-  the point. Changes with no useful observable behavior do not need screenshot or video evidence.
-- Use a small public-safe example and check for private designs, paths, account details or
-  other sensitive content before sharing. Attach media to the issue/PR or link to an accessible
-  recording; do not commit generated screenshots or videos just to provide review evidence.
-- Throughout the work and before handoff, check current upstream commits and the relevant
-  PR's merge status. Keep your branch current with upstream merges, resolve conflicts without
-  discarding others' work, and re-run validation when integration changes the result. Use
-  `git pull --rebase origin main` before pushing as above; never force-push. Report the checked
-  upstream/PR state, any conflicts resolved and the validation performed. If a PR remains open,
-  keep monitoring it while the task is active and make its pending status clear at handoff;
-  do not claim it merged without checking.
-
-## Application releases
-Development pushes are not application releases. Follow `docs/releasing.md` when asked to
-prepare or ship a release: choose the version from the actual changes, update Cargo.toml and
-Cargo.lock, pass the quality gates, advance `release` without force-pushing, and verify the
-resulting draft and its artifacts. When shipping is authorized, publish that verified draft
-and confirm its tag and downstream deployment. Do not auto-release every push to `main`, infer
-version bumps solely from commit prefixes, overwrite published versions, or push release tags
-before the draft is verified.
-
-## Running and looking at the app
-- `cargo run --release -p solidcraft -- --sample --control PORT` (sample design + control channel).
-  Pick a free port. Without a display, run it under `Xvfb :99` with `DISPLAY=:99`.
-- Drive it with JSON lines on `127.0.0.1:PORT` (see `docs/control-protocol.md`):
-  - `{"id":1,"method":"engine.execute","params":{"command":"solid.extrude","params":{"distance":20}}}`
-  - `{"id":2,"method":"ui.start","params":{"command":"sketch.create"}}` then `ui.click {x, y}`
-  - `{"id":3,"method":"ui.screenshot","params":{"path":"/tmp/shot.png"}}` then read the PNG.
-- **For UI work, look at the result** (screenshot, read the PNG). Without a window use
-  `ui.render` or `solidcraft-cli snapshot`.
-- Headless: `solidcraft-cli run script.json --out part.step`, `solidcraft-cli eval design.solidcraft`,
-  `solidcraft-cli snapshot script.json --out shot.png`, `solidcraft-cli commands`.
-- Reference tests: `cargo xtask oracle` replays `tests/oracle/*/recipe.json` and compares with
-  each case's `expected.json` (analytic or FreeCAD values; writes `docs/oracle.md`). Expected
-  values never come from a commercial CAD product.
-- Build with `CARGO_TARGET_DIR=<repo>/target`. Windows: `cargo xwin build --release --target x86_64-pc-windows-msvc -p solidcraft`.
-
-## Roadmap
-`ROADMAP.md` (committed) tracks status, milestones and estimates. Update it whenever a
-milestone task lands. `cargo xtask features` regenerates `docs/features.md` (SolidCraft's
-commands by area, from the registry) when commands are added or renamed.
+## Working on X: read the skill first
+| Working on | Read |
+|---|---|
+| A PR, a claim, review, CI or evidence | `skills/solidcraft-contributing/SKILL.md` |
+| Licences, assets, clean-room, the name | `skills/solidcraft-ground-rules/SKILL.md` |
+| Non-test Rust, hostile input, a crash report | `skills/solidcraft-crash-safety/SKILL.md` |
+| A command, a crate boundary | `skills/solidcraft-commands/SKILL.md` |
+| A dialog, panel, camera, icon, colour | `skills/solidcraft-ui/SKILL.md` |
+| Labels, messages, translations | `skills/solidcraft-ui-text/SKILL.md` |
+| Saving something new in a design, import, export | `skills/solidcraft-file-formats/SKILL.md` |
+| Preferences, a changed default | `skills/solidcraft-preferences/SKILL.md` |
+| Writing or running tests | `skills/solidcraft-tests/SKILL.md` |
+| Slow work, the window thread, wasm | `skills/solidcraft-performance/SKILL.md` |
+| Releases, installers, packages | `skills/solidcraft-packaging/SKILL.md` |
+| Running the app, control channel, MCP tools | `skills/solidcraft-agent-tools/SKILL.md` |
+| Building a part over MCP | `skills/solidcraft-modeling/SKILL.md` |
+| Changing an existing design | `skills/solidcraft-editing/SKILL.md` |
+| A bug report, a crash, a wrong result | `skills/solidcraft-reporting/SKILL.md` |
+| Checking, porting, designs in git | `skills/solidcraft-checking/SKILL.md` |
+| Assemblies, joints, motion | `skills/solidcraft-mechanisms/SKILL.md` |
+>>>>>>> 4a3e0772a (Agents: AGENTS.md becomes a router to focused skills, with a staleness check (Refs #6439))

@@ -1,5 +1,7 @@
 //! Original, code-drawn navigation cube. Flat faces share invisible picking regions.
 use super::*;
+use crate::icons::navigation::{Facet, arrow, curved_arrow, paint_cube};
+use solidcraft_engine::geom::Ring;
 
 pub(super) const SIZE: f32 = 112.0;
 // Paint and picking use the same original coordinate space, scaled as a group.
@@ -8,16 +10,6 @@ const HALF: f64 = 40.0;
 // Corner squares lie on the six flat faces, preserving a sharp cube silhouette.
 // The remaining regions belong to the face, including the middle of each edge.
 const INSET: f64 = 0.68;
-
-struct Facet {
-    direction: Vec3,
-    points: Vec<Pos2>,
-    outer_edges: Vec<bool>,
-    centre: Pos2,
-    label: String,
-    text_axes: Option<(egui::Vec2, egui::Vec2)>,
-    depth: f64,
-}
 
 fn project(cam: &Camera, v: Vec3, scale: f64) -> egui::Vec2 {
     let (r, u, _) = cam.basis();
@@ -58,10 +50,9 @@ fn facets(cam: &Camera, c: Pos2, half: f64) -> Vec<Facet> {
             let b = project(cam, *b - centre, half);
             a.y.atan2(a.x).total_cmp(&b.y.atan2(b.x))
         });
+        let vertices = Ring::new(vertices);
         let outer_edges = vertices
-            .iter()
-            .zip(vertices.iter().cycle().skip(1))
-            .take(vertices.len())
+            .edges()
             .map(|(a, b)| [(a.x, b.x), (a.y, b.y), (a.z, b.z)].into_iter().filter(|(a, b)| a.abs() == 1.0 && a == b).count() >= 2)
             .collect();
         let points = vertices.into_iter().map(|v| c + project(cam, v, half)).collect();
@@ -101,12 +92,12 @@ fn facets(cam: &Camera, c: Pos2, half: f64) -> Vec<Facet> {
     out
 }
 
-fn contains(points: &[Pos2], p: Pos2) -> bool {
+fn contains(points: &Ring<Pos2>, p: Pos2) -> bool {
     if !p.is_finite() || points.len() < 3 {
         return false;
     }
     let mut sign = 0.0_f32;
-    for (a, b) in points.iter().zip(points.iter().cycle().skip(1)).take(points.len()) {
+    for (a, b) in points.edges() {
         let edge = *b - *a;
         let offset = p - *a;
         let cross = edge.x * offset.y - edge.y * offset.x;
@@ -126,120 +117,6 @@ fn hit(faces: &[Facet], p: Pos2) -> Option<usize> {
 
 pub(super) fn drag_origin(cam: &Camera, centre: Pos2, pointer: Pos2, scale: f32) -> bool {
     hit(&facets(cam, centre, HALF * f64::from(scale)), pointer).is_some()
-}
-
-// Private marker for label meshes with atlas-pixel UVs. The output hook replaces
-// it with the font texture before any renderer sees the frame.
-const LABEL_PIXELS: egui::TextureId = egui::TextureId::User(u64::from_le_bytes(*b"cubetext"));
-
-struct LabelAtlas;
-
-impl egui::plugin::Plugin for LabelAtlas {
-    fn debug_name(&self) -> &'static str {
-        "navigation cube label atlas"
-    }
-
-    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
-        let size = ctx.fonts(|f| f.font_image_size());
-        let normalize = vec2(1.0 / size[0].max(1) as f32, 1.0 / size[1].max(1) as f32);
-        for shape in &mut output.shapes {
-            if let Shape::Mesh(mesh) = &mut shape.shape
-                && mesh.texture_id == LABEL_PIXELS
-            {
-                let mesh = std::sync::Arc::make_mut(mesh);
-                mesh.texture_id = egui::TextureId::default();
-                for v in &mut mesh.vertices {
-                    v.uv = (v.uv.to_vec2() * normalize).to_pos2();
-                }
-            }
-        }
-    }
-}
-
-/// Warp the font mesh into the projected face, so labels turn with the model.
-fn face_text(painter: &egui::Painter, face: &Facet, ink: Color32, font_size: f32) {
-    let Some((r, down)) = face.text_axes else { return };
-    let opacity = ((face.depth - 0.18) / 0.17).clamp(0.0, 1.0) as f32;
-    if opacity <= 0.0 {
-        return;
-    }
-    let ink = ink.gamma_multiply(opacity);
-    let galley = painter.layout_no_wrap(face.label.clone(), FontId::proportional(font_size), ink);
-    let centre = galley.rect.center();
-    // Keep atlas-pixel UVs until the frame is complete: another label or widget
-    // can grow the atlas after this mesh is created, invalidating early UVs.
-    painter.ctx().add_plugin(LabelAtlas);
-    let text = Shape::Text(egui::epaint::TextShape::new(Pos2::ZERO, galley, ink));
-    let atlas = painter.ctx().fonts(|f| f.font_image_size());
-    let primitives =
-        painter.ctx().tessellate(vec![egui::epaint::ClippedShape { clip_rect: Rect::EVERYTHING, shape: text }], painter.ctx().pixels_per_point());
-    for primitive in primitives {
-        if let egui::epaint::Primitive::Mesh(mut mesh) = primitive.primitive {
-            mesh.texture_id = LABEL_PIXELS;
-            for v in &mut mesh.vertices {
-                v.uv = pos2(v.uv.x * atlas[0] as f32, v.uv.y * atlas[1] as f32);
-                let local = v.pos - centre;
-                v.pos = face.centre + r * local.x + down * (local.y * 1.35);
-            }
-            painter.add(Shape::mesh(mesh));
-        }
-    }
-}
-
-fn paint_cube(painter: &egui::Painter, faces: &[Facet], hovered: Option<usize>, t: Tokens, labels: bool, scale: f32) {
-    // A shared, opaque triangle mesh has no antialiasing fringes between facets.
-    // Per-polygon fringes and miter joins overlap as a face becomes edge-on.
-    let mut fill_mesh = egui::epaint::Mesh::default();
-    let mut edges: Vec<(Pos2, Pos2, usize, bool)> = Vec::new();
-    let hovered_direction = hovered.and_then(|i| faces.get(i)).map(|f| f.direction);
-    for face in faces {
-        let base = t.cube_face;
-        let shade = (0.72 + 0.28 * face.depth.min(1.0)) as f32;
-        let highlighted = hovered_direction == Some(face.direction);
-        let fill = if highlighted {
-            t.cube_hover
-        } else {
-            Color32::from_rgb((f32::from(base.r()) * shade) as u8, (f32::from(base.g()) * shade) as u8, (f32::from(base.b()) * shade) as u8)
-        };
-        let centre = fill_mesh.vertices.len() as u32;
-        fill_mesh.colored_vertex(face.centre, fill);
-        for &p in &face.points {
-            fill_mesh.colored_vertex(p, fill);
-        }
-        for (j, (&a, &b)) in face.points.iter().zip(face.points.iter().cycle().skip(1)).take(face.points.len()).enumerate() {
-            fill_mesh.add_triangle(centre, centre + 1 + j as u32, centre + 1 + ((j + 1) % face.points.len()) as u32);
-            // Coplanar picking regions have no visible seams. Only actual cube
-            // edges and the hovered target's boundary receive an outline.
-            let outer = face.outer_edges.get(j).copied().unwrap_or(false);
-            if !highlighted && !outer {
-                continue;
-            }
-            if let Some(edge) = edges
-                .iter_mut()
-                .find(|(p, q, _, _)| (p.distance_sq(a) < 1e-6 && q.distance_sq(b) < 1e-6) || (p.distance_sq(b) < 1e-6 && q.distance_sq(a) < 1e-6))
-            {
-                edge.2 += usize::from(highlighted);
-                edge.3 |= outer;
-            } else {
-                edges.push((a, b, usize::from(highlighted), outer));
-            }
-        }
-    }
-    painter.add(Shape::mesh(fill_mesh));
-    for (a, b, highlights, outer) in edges {
-        // Two highlighted coplanar patches share an internal subdivision, not
-        // a target boundary. Actual cube edges remain visible across faces.
-        if !outer && highlights != 1 {
-            continue;
-        }
-        let highlighted = highlights > 0;
-        painter.line_segment([a, b], Stroke::new(1.0, if highlighted { t.accent } else { t.cube_border }));
-    }
-    if labels {
-        for face in faces {
-            face_text(painter, face, t.cube_text, 14.0 * scale);
-        }
-    }
 }
 
 fn navigate(app: &mut SolveApp, action: Option<&str>, dir: Option<Vec3>) {
@@ -263,32 +140,6 @@ fn control(app: &mut SolveApp, ui: &mut egui::Ui, bounds: Rect, action: &str, to
     hover
 }
 
-fn arrow(painter: &egui::Painter, at: Pos2, direction: egui::Vec2, hover: bool, t: Tokens) {
-    let side = vec2(-direction.y, direction.x);
-    painter.add(Shape::convex_polygon(
-        vec![at + direction * 7.0, at - direction * 5.0 + side * 7.0, at - direction * 5.0 - side * 7.0],
-        if hover { t.accent_soft } else { t.cube_face },
-        Stroke::new(1.0, if hover { t.accent } else { t.cube_border }),
-    ));
-}
-
-fn curved_arrow(painter: &egui::Painter, at: Pos2, clockwise: bool, hover: bool, t: Tokens, scale: f32) {
-    let (start, end) =
-        if clockwise { (-std::f32::consts::FRAC_PI_4 + 0.12, 0.0) } else { (-std::f32::consts::FRAC_PI_4 - 0.12, -std::f32::consts::FRAC_PI_2) };
-    let points: Vec<_> = (0..=16)
-        .map(|i| {
-            let angle = egui::lerp(start..=end, f32::from(i as u8) / 16.0);
-            at + vec2(angle.cos(), angle.sin()) * (32.0 * scale)
-        })
-        .collect();
-    painter.add(Shape::line(points.clone(), Stroke::new(5.0 * scale, if hover { t.accent } else { t.cube_border })));
-    painter.add(Shape::line(points.clone(), Stroke::new(3.0 * scale, if hover { t.accent_soft } else { t.cube_face })));
-    if let Some(tip) = points.last() {
-        let sign = if clockwise { 1.0 } else { -1.0 };
-        arrow(painter, *tip, vec2(-end.sin(), end.cos()) * (sign * scale), hover, t);
-    }
-}
-
 pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     let outer = axis_rect(app, rect);
     if !outer.is_positive() {
@@ -304,7 +155,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     let t = Tokens::get().navigation_cube(active);
     crate::scenario::publish_count("navigation_cube:active", f64::from(u8::from(active)));
     let faces = facets(&app.cam, c, HALF * f64::from(scale));
-    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| ui.rect_contains_pointer(rect));
+    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| ui.is_enabled() && ui.rect_contains_pointer(rect) && !crate::shell::covered(app, *p));
     let hovered = if orbiting { None } else { hover.and_then(|p| hit(&faces, p)) };
     let painter = ui.painter_at(outer);
     paint_cube(&painter, &faces, hovered, t, true, scale);
@@ -334,7 +185,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     if let Some(face) = hovered.and_then(|i| faces.get(i)) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.interact(Rect::from_center_size(hover.unwrap_or(face.centre), vec2(2.0, 2.0)), ui.id().with("navigation_cube_tip"), Sense::hover())
-            .on_hover_text(format!("{} view. Drag to orbit; hold Shift to snap.", face.label));
+            .on_hover_text(format!("{} view. Drag to orbit{}.", face.label, if app.preferences.free_orbit { "" } else { "; hold Shift to snap" }));
         if ui.input(|i| i.pointer.primary_clicked()) {
             navigate(app, None, Some(face.direction));
         }
@@ -363,11 +214,10 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
     let home = Rect::from_center_size(c + vec2(-65.0, -65.0) * scale, vec2(26.0, 26.0) * scale);
-    crate::scenario::publish_rect("axis_view:home", home);
-    crate::scenario::publish_handle("axis_view:home", home.center());
+    crate::scenario::publish_target("axis_view:home", home);
     let home_hover = control(app, ui, home, "home", "Home: isometric view and fit model");
     if active {
-        icons::paint(&painter, home.shrink(4.0 * scale), "home", if home_hover { t.accent } else { t.cube_face }, t.cube_face, t.accent);
+        icons::paint_icon(&painter, home.shrink(4.0 * scale), "home", f32::from((if home_hover { t.accent } else { t.cube_face }).a()) / 255.0);
     }
     let fit = Rect::from_center_size(c + vec2(67.0, 67.0) * scale, vec2(22.0, 22.0) * scale);
     let fit_hover = control(app, ui, fit, "fit", "Fit model in view");
@@ -380,13 +230,15 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
         let (r, u, _) = app.cam.basis();
         let tip = origin + vec2((d.dot(r) * 17.0) as f32, -(d.dot(u) * 17.0) as f32) * scale;
         painter.line_segment([origin, tip], Stroke::new(1.5, color));
-        painter.text(tip, Align2::CENTER_CENTER, label, FontId::proportional(8.0), color);
+        painter.text(tip, Align2::CENTER_CENTER, label, FontId::proportional(crate::theme::Tokens::get().font_triad), color);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(test)]
+    use crate::icons::navigation::{LABEL_PIXELS, face_text};
     use solidcraft_engine::render::{StandardView, UpAxis};
 
     fn paint_frame(ctx: &egui::Context, paint: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
@@ -419,7 +271,7 @@ mod tests {
     fn former_edge_strips_click_the_face_and_hover_without_internal_seams() {
         let mut h = crate::scenario::Harness::new();
         h.call("ui.prefs", json!({"navigator_style":"cube"}));
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         h.app.preferences.look_at_anim = false;
         for up in ["z", "y"] {
             h.call("ui.prefs", json!({"up_axis":up}));
@@ -484,7 +336,7 @@ mod tests {
 
     #[test]
     fn hovered_face_and_corner_have_a_pale_blue_opaque_fill_in_both_themes() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         let faces = facets(&Camera::default(), pos2(100.0, 100.0), HALF);
         for t in [Tokens::light(), Tokens::dark()] {
             assert_ne!(t.navigation_cube(false).cube_face, t.cube_face);
@@ -510,7 +362,7 @@ mod tests {
 
     #[test]
     fn idle_principal_views_have_square_faces_without_visible_picking_seams() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         for up in [UpAxis::Z, UpAxis::Y] {
             for view in [StandardView::Front, StandardView::Back, StandardView::Top, StandardView::Bottom, StandardView::Left, StandardView::Right] {
                 let mut cam = Camera { up, ..Default::default() };
@@ -574,11 +426,11 @@ mod tests {
 
     #[test]
     fn face_labels_use_normalized_font_atlas_coordinates() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         let output = paint_frame(&ctx, |ui| {
             let faces = facets(&Camera::default(), pos2(100.0, 100.0), HALF);
             for face in &faces {
-                face_text(ui.painter(), face, Tokens::light().cube_text, 14.0);
+                face_text(ui.painter(), face, Tokens::light().cube_text, Tokens::get().font_heading);
             }
         });
         let meshes: Vec<_> = output.shapes.iter().filter_map(|shape| if let Shape::Mesh(mesh) = &shape.shape { Some(mesh) } else { None }).collect();
@@ -591,7 +443,7 @@ mod tests {
 
     #[test]
     fn label_uvs_follow_font_atlas_growth_later_in_the_same_frame() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         let mut pixel_uv = Pos2::ZERO;
         let mut glyph_vertex = 0;
         let mut early_size = [0; 2];
@@ -604,7 +456,7 @@ mod tests {
             let (index, vertex) = galley.rows.first().unwrap().visuals.mesh.vertices.iter().enumerate().find(|(_, v)| v.uv.y > 1.0).unwrap();
             glyph_vertex = index;
             pixel_uv = vertex.uv;
-            face_text(ui.painter(), face, Tokens::light().cube_text, 14.0);
+            face_text(ui.painter(), face, Tokens::light().cube_text, Tokens::get().font_heading);
             early_size = ctx.fonts(|f| f.font_image_size());
             // Other widgets can allocate new glyphs after the cube has been drawn.
             let text: String = (32_u8..127).map(char::from).collect();
@@ -620,7 +472,7 @@ mod tests {
 
     #[test]
     fn rotating_cube_facets_stay_opaque_and_inside_the_projected_geometry() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         for up in [UpAxis::Z, UpAxis::Y] {
             for view in [StandardView::Top, StandardView::Bottom, StandardView::Front, StandardView::Back, StandardView::Left, StandardView::Right] {
                 let from = Camera { up, ..Default::default() };
@@ -687,6 +539,30 @@ mod tests {
             h.app.cam = anim.to;
             h.app.cancel_view_animation();
         }
+    }
+
+    /// A view-cube click glides, but a mouse orbit started at once cancels the glide: the camera
+    /// then follows the pointer one to one, and nothing keeps easing after the pointer stops.
+    #[test]
+    fn a_mouse_orbit_right_after_a_cube_click_follows_the_pointer_one_to_one() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.prefs", json!({"navigator_style":"cube"}));
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+        h.frames(4);
+        let p = crate::scenario::handle_at("navigation_cube:top").unwrap();
+        let button = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        h.app.synthetic.extend([egui::Event::PointerMoved(p), button(true), button(false)]);
+        h.frames(3);
+        assert!(h.app.cam_anim.is_some(), "the click glides");
+        let mut expected = h.app.cam;
+        h.call("ui.drag", json!({"x0":800,"y0":500,"x1":850,"y1":520,"button":"middle","shift":true,"steps":20}));
+        assert!(h.app.cam_anim.is_none(), "the orbit cancels the glide");
+        expected.orbit(50.0, 20.0);
+        // The glide may step once, in the frame the orbit starts and cancels it.
+        assert!((h.app.cam.yaw - expected.yaw).abs() < 0.03 && (h.app.cam.pitch - expected.pitch).abs() < 0.03, "{:?} vs {:?}", h.app.cam, expected);
+        let done = h.app.cam;
+        h.frames(30);
+        assert_eq!(h.app.cam, done, "nothing keeps easing after the pointer stops");
     }
 
     #[test]

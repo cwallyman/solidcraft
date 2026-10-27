@@ -4,7 +4,7 @@ use solidcraft_engine::doc::{FaceAttachmentStatus, FeatureKind, PlaneRef};
 
 fn picked_sketch() -> (Harness, u64) {
     let mut h = Harness::new();
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.app.session.auto_project = false;
     h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"body_name":"BaseBox","name":"Original"})).unwrap();
     h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"corner":[0,0,20],"body_name":"ControlBox","name":"Control"})).unwrap();
@@ -63,8 +63,6 @@ fn lost_attachment_ghost_rebind_preview_cancel_apply_and_undo_preserve_sketch() 
     assert!(h.app.session.world_state().sketch(sketch).is_none(), "saved repair guides are not solved sketch geometry");
     let raw = raw_sketch(&h, sketch);
     let before = h.app.session.doc.to_json();
-    let undo = h.app.session.undo.len();
-    let redo = h.app.session.redo.len();
     h.app.edit_sketch(sketch);
     h.frames(4);
     assert_eq!(h.app.tree.redefine, Some(sketch));
@@ -82,6 +80,9 @@ fn lost_attachment_ghost_rebind_preview_cancel_apply_and_undo_preserve_sketch() 
     assert!(h.app.session.selection.is_empty(), "saved lost-plane guides must not be selectable geometry");
     assert!(h.app.session.active_sketch.is_none());
     h.app.run("browser.visibility", json!({"items":["ControlBox"],"visible":true})).unwrap();
+    // After the setup's two hide/show commands: each is an undo step of its own now (#2219).
+    let undo = h.app.session.undo.len();
+    let redo = h.app.session.redo.len();
     h.frames(4);
     h.step(&json!({"click":{"world":[3,4,30]}})).unwrap();
     assert!(matches!(h.app.session.selection.first(), Some(solidcraft_engine::Sel::Face { body, .. }) if body=="ControlBox"));
@@ -105,7 +106,7 @@ fn lost_attachment_ghost_rebind_preview_cancel_apply_and_undo_preserve_sketch() 
     h.frames(4);
     h.step(&json!({"widget":"Reattach selected face"})).unwrap();
     h.frames(8);
-    h.step(&json!({"widget":"Apply"})).unwrap();
+    h.step(&json!({"widget":"OK"})).unwrap();
     assert!(h.app.tree.redefine.is_none(), "{:?}", h.app.tree.redefine_draft);
     assert_eq!(raw_sketch(&h, sketch), raw, "curves, dimensions and expressions remain exact");
     assert_eq!(h.app.session.undo.len(), undo + 1);
@@ -146,7 +147,7 @@ fn attachment_drafts_leave_on_document_replacement_but_survive_failed_open() {
 #[test]
 fn unsupported_modified_face_offers_explicit_fixed_plane_without_live_links() {
     let mut h = Harness::new();
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"body_name":"Modified"})).unwrap();
     // An intentional split gives the +z source two distinct planar pieces. A
     // strict attachment cannot claim the original whole-face certificate.
@@ -181,7 +182,7 @@ fn occurrence_click(h: &mut Harness, path: &[u64], control: &str) {
 #[test]
 fn actual_nested_second_placement_face_pick_keeps_target_and_author_paths() {
     let mut h = Harness::new();
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.app.session.auto_project = false;
     let parent = h.app.run("component.create", json!({"name":"Parent"})).unwrap();
     let parent_component = parent["component"].as_u64().unwrap();
@@ -290,6 +291,7 @@ fn nested_anchor_saved_fixed_conversion_preserves_rotated_second_author_plane() 
         axis_origin: Vec3::ZERO,
         axis_dir: Vec3::X,
         angle: "15 deg".into(),
+        line: None,
     };
     h.app.session = solidcraft_engine::Session::new(document);
     let raw = h.app.session.doc.sketch(id).unwrap().clone();
@@ -320,7 +322,7 @@ fn nested_anchor_saved_fixed_conversion_preserves_rotated_second_author_plane() 
     assert!(shown.x.dist(expected.x) < 1e-7 && shown.y.dist(expected.y) < 1e-7);
     assert_eq!(h.app.session.doc.to_json(), before);
     h.frames(6);
-    h.step(&json!({"widget":"Apply"})).unwrap();
+    h.step(&json!({"widget":"OK"})).unwrap();
     assert!(h.app.tree.redefine.is_none());
     assert_eq!(h.app.session.doc.sketch(id).unwrap(), &raw);
     assert_eq!(h.app.session.undo.len(), undo + 1);
@@ -336,7 +338,7 @@ fn nested_anchor_saved_fixed_conversion_preserves_rotated_second_author_plane() 
 #[test]
 fn picked_top_face_of_a_stacked_join_extrude_takes_a_sketch() {
     let mut h = Harness::new();
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.app.run("sketch.create", json!({"plane":"XY","name":"Base"})).unwrap();
     h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,40]})).unwrap();
     h.app.run("sketch.finish", json!({})).unwrap();
@@ -369,4 +371,52 @@ fn picked_top_face_of_a_stacked_join_extrude_takes_a_sketch() {
         panic!("attachment must be healthy");
     };
     assert!((plane.origin.z - 20.).abs() < 1e-9);
+}
+
+#[test]
+fn plane_redefinition_uses_dense_card_and_keeps_command_preview_cancel_and_ok() {
+    use crate::scenario;
+    let mut h = Harness::new();
+    let sketch = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0":[10,10],"p1":[30,20]})).unwrap();
+    h.app.finish_sketch();
+    let before = h.app.session.doc.to_json();
+    for apply in [false, true] {
+        crate::browser::redefine_sketch(&mut h.app, sketch);
+        h.frames(5);
+        for rect in ["dialog:header", "dialog:hint:tool", "dialog:field:Plane", "dialog:footer"] {
+            assert!(scenario::rect_of(rect).is_some(), "{rect}");
+        }
+        assert_eq!(scenario::count_of("dialog:ok:enabled"), Some(0.0));
+        h.step(&json!({"widget":"Use XZ plane"})).unwrap();
+        h.frames(3);
+        assert_eq!(crate::sketch_attachment_ui::commands(&h.app).unwrap(), vec![("sketch.redefine".into(), json!({"sketch":sketch,"plane":"XZ"}))]);
+        assert_eq!(h.app.session.doc.to_json(), before, "candidate is scratch preview only");
+        h.step(&json!({"click":{"handle":if apply { "dialog:ok" } else { "dialog:cancel" }}})).unwrap();
+        assert!(h.app.tree.redefine.is_none());
+        if apply {
+            assert_ne!(h.app.session.doc.to_json(), before);
+            h.app.run("edit.undo", json!({})).unwrap();
+        }
+        assert_eq!(h.app.session.doc.to_json(), before);
+    }
+}
+
+/// #5103: Redefine Sketch Plane names the plane a sketch is on now, not only "no body-face
+/// attachment": an origin plane, a construction plane, and planes built from them.
+#[test]
+fn redefine_panel_names_the_plane_a_sketch_is_on() {
+    use crate::sketch_attachment_ui::plane_description;
+    let mut h = Harness::new();
+    h.app.run("construct.plane.offset", json!({"base": "XY", "offset": 10, "name": "Shelf"})).unwrap();
+    for (plane, expected) in [("XZ", "The XZ plane"), ("Shelf", "Shelf")] {
+        let id = h.app.run("sketch.create", json!({"plane": plane})).unwrap()["sketch"].as_u64().unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        let FeatureKind::Sketch { plane: on, .. } = &h.app.session.doc.feature(id).unwrap().kind else { panic!("a sketch") };
+        assert_eq!(plane_description(on), expected, "{plane}");
+    }
+    let xy = Box::new(PlaneRef::Origin { name: "XY".into() });
+    let offset = PlaneRef::Offset { base: xy.clone(), distance: "12 mm".into() };
+    assert_eq!(plane_description(&offset), "The XY plane, offset by 12 mm");
+    assert_eq!(plane_description(&PlaneRef::Flipped { base: xy, about_y: false }), "The XY plane, from its other side");
 }

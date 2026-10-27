@@ -9,6 +9,7 @@
 use serde_json::Value;
 use solidcraft_doc::construct::{AxisDef, GeoRef, PointDef};
 use solidcraft_doc::{FeatureKind, PlaneRef};
+use solidcraft_geom::Vec3;
 
 use super::CommandSpec;
 use super::features::{add_feature, check_expr, plane_param, sketch_id};
@@ -21,75 +22,87 @@ const REF: &str =
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("construct.axis.through_cylinder", "Axis Through Cylinder/Cone/Torus", axis_face)
         .at("SOLID", "CONSTRUCT")
-        .icon("axis")
+        .icon("axis_through_cylinder")
         .params("face: ref (a cylinder, cone or torus face, or a circular edge); name?"),
     CommandSpec::new("construct.axis.normal_to_face", "Axis Perpendicular To Face", axis_normal)
         .at("SOLID", "CONSTRUCT")
-        .icon("axis")
+        .icon("axis_normal_to_face")
         .params("face: ref; point: ref (the axis goes through it, square to the face); name?"),
     CommandSpec::new("construct.axis.two_planes", "Axis Through Two Planes", axis_planes)
         .at("SOLID", "CONSTRUCT")
-        .icon("axis")
+        .icon("axis_two_planes")
         .params("a, b: plane or planar face refs; name?"),
     CommandSpec::new("construct.axis.two_points", "Axis Through Two Points", axis_points)
         .at("SOLID", "CONSTRUCT")
-        .icon("axis")
+        .icon("axis_two_points")
         .params("a, b: point refs (vertices, sketch points, points); name?"),
     CommandSpec::new("construct.axis.edge", "Axis Through Edge", axis_edge)
         .at("SOLID", "CONSTRUCT")
-        .icon("axis")
+        .icon("axis_edge")
         .params("edge: ref (a straight edge or sketch line); name?"),
     CommandSpec::new("construct.point.vertex", "Point At Vertex", point_at)
         .at("SOLID", "CONSTRUCT")
-        .icon("point")
+        .icon("point_vertex")
         .params("point: ref (vertex, sketch point, point); name?"),
     CommandSpec::new("construct.point.two_edges", "Point Through Two Edges", point_edges)
         .at("SOLID", "CONSTRUCT")
-        .icon("point")
+        .icon("point_two_edges")
         .params("a, b: edge or line refs (where they meet, or come closest); name?"),
     CommandSpec::new("construct.point.three_planes", "Point Through Three Planes", point_planes)
         .at("SOLID", "CONSTRUCT")
-        .icon("point")
+        .icon("point_three_planes")
         .params("a, b, c: plane or planar face refs; name?"),
     CommandSpec::new("construct.point.center", "Point At Center Of Circle/Sphere/Torus", point_center)
         .at("SOLID", "CONSTRUCT")
-        .icon("point")
+        .icon("point_center")
         .params("of: ref (circular edge, sketch circle or arc, sphere or torus face); name?"),
     CommandSpec::new("construct.point.edge_plane", "Point At Edge And Plane", point_edge_plane)
         .at("SOLID", "CONSTRUCT")
-        .icon("point")
+        .icon("point_edge_plane")
         .params("edge: edge or line ref; plane: plane or planar face ref; name?"),
     CommandSpec::new("construct.point.along_path", "Point Along Path", point_along)
         .at("SOLID", "CONSTRUCT")
-        .icon("point")
+        .icon("point_along_path")
         .params("path: edge or sketch curve ref; t: expr, 0…1 along it (default 0.5); name?"),
     CommandSpec::new("construct.plane.midplane", "Midplane", plane_mid)
         .at("SOLID", "CONSTRUCT")
-        .icon("plane")
+        .icon("plane_midplane")
         .params("a, b: plane or planar face refs (halfway between; bisecting when they meet at an angle); name?"),
     CommandSpec::new("construct.plane.two_edges", "Plane Through Two Edges", plane_edges)
         .at("SOLID", "CONSTRUCT")
-        .icon("plane")
+        .icon("plane_two_edges")
         .params("a, b: straight edge or line refs in one plane; name?"),
     CommandSpec::new("construct.plane.three_points", "Plane Through Three Points", plane_points)
         .at("SOLID", "CONSTRUCT")
-        .icon("plane")
+        .icon("plane_three_points")
         .params("a, b, c: point refs; name?"),
     CommandSpec::new("construct.plane.tangent", "Tangent Plane", plane_tangent)
         .at("SOLID", "CONSTRUCT")
-        .icon("plane")
+        .icon("plane_tangent")
         .params("face: ref (cylinder, cone, sphere or torus); at?: [x,y,z] where it touches (default: the face pick); name?"),
     CommandSpec::new("construct.plane.along_path", "Plane Along Path", plane_along)
         .at("SOLID", "CONSTRUCT")
-        .icon("plane")
+        .icon("plane_along_path")
         .params("path: edge or sketch curve ref; t: expr, 0…1 along it (default 0.5); name? The plane is square to the path there"),
-    CommandSpec::new("construct.plane.perpendicular", "Perpendicular Plane", plane_perpendicular).at("SOLID", "CONSTRUCT").icon("plane").params(
+    CommandSpec::new("construct.plane.perpendicular", "Perpendicular Plane", plane_perpendicular).at("SOLID", "CONSTRUCT").icon("plane_perpendicular").params(
         "plane: plane or planar face ref; line: straight edge, sketch line or axis ref; name? The plane holds the line and is square to the plane",
     ),
 ];
 
+/// An axis on an edge or round face of the model (`{edge: [x,y,z]}` or `{face: [x,y,z]}`, the
+/// point on it), with the line it gives now (`solidcraft_doc::construct::model_axis`); `None`
+/// for any other form of `axis`.
+pub(super) fn model_axis_param(s: &Session, v: Option<&Value>, cmd: &str) -> Result<Option<(GeoRef, Vec3, Vec3)>> {
+    // Also as saved (`{type: edge|face, at, name?}`), as an edit dialog gives back one it kept.
+    let saved = |v: &Value| matches!(v.get("type").and_then(Value::as_str), Some("edge" | "face"));
+    let Some(v) = v.filter(|v| v.get("edge").is_some() || v.get("face").is_some() || saved(v)) else { return Ok(None) };
+    let g = geo(s, Some(v), cmd, "axis")?;
+    let (o, d) = solidcraft_doc::construct::model_axis(&s.world_state(), &g).map_err(|e| bad(cmd, format!("`axis`: {e}")))?;
+    Ok(Some((g, o, d)))
+}
+
 /// A reference from its JSON form.
-fn geo(s: &Session, v: Option<&Value>, cmd: &str, what: &str) -> Result<GeoRef> {
+pub(super) fn geo(s: &Session, v: Option<&Value>, cmd: &str, what: &str) -> Result<GeoRef> {
     let v = v.ok_or_else(|| bad(cmd, format!("`{what}` is required: {REF}")))?;
     let p3 = |k: &str| v.get(k).and_then(vec3);
     let mut g = if v.get("type").is_some() {
@@ -99,7 +112,7 @@ fn geo(s: &Session, v: Option<&Value>, cmd: &str, what: &str) -> Result<GeoRef> 
     } else if let Some(at) = p3("edge") {
         GeoRef::Edge { at, name: None }
     } else if let Some(at) = p3("vertex") {
-        GeoRef::Vertex { at }
+        GeoRef::Vertex { at, edges: None }
     } else if let Some(sk) = v.get("sketch") {
         let sketch = sketch_id(s, Some(sk), cmd, what)?;
         match (str_(v, "point"), str_(v, "curve")) {
@@ -116,13 +129,13 @@ fn geo(s: &Session, v: Option<&Value>, cmd: &str, what: &str) -> Result<GeoRef> 
             GeoRef::World { axis: a.to_ascii_uppercase() }
         } else {
             match s.doc.find_feature(a).map(|f| &f.kind) {
-                Some(FeatureKind::ConstructionAxis { .. }) => GeoRef::Axis { name: a.to_string() },
+                Some(FeatureKind::ConstructionAxis { .. }) => GeoRef::Axis { name: a.into() },
                 _ => return Err(bad(cmd, format!("no axis `{a}`"))),
             }
         }
     } else if let Some(n) = str_(v, "construct_point") {
         match s.doc.find_feature(n).map(|f| &f.kind) {
-            Some(FeatureKind::ConstructionPoint { .. }) => GeoRef::ConstructPoint { name: n.to_string() },
+            Some(FeatureKind::ConstructionPoint { .. }) => GeoRef::ConstructPoint { name: n.into() },
             _ => return Err(bad(cmd, format!("no construction point `{n}`"))),
         }
     } else if v.as_str().is_some() {
@@ -135,8 +148,8 @@ fn geo(s: &Session, v: Option<&Value>, cmd: &str, what: &str) -> Result<GeoRef> 
     Ok(g)
 }
 
-fn t_param(s: &Session, p: &Value, cmd: &str) -> Result<String> {
-    let t = if p.get("t").is_some() { req_expr(cmd, p, "t")? } else { "0.5".to_string() };
+fn t_param(s: &Session, p: &Value, cmd: &str) -> Result<solidcraft_doc::Expr> {
+    let t = if p.get("t").is_some() { req_expr(cmd, p, "t")? } else { "0.5".into() };
     check_expr(s, &t, solidcraft_doc::expr::Kind::Unitless, cmd, "t")?;
     Ok(t)
 }

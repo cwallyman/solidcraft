@@ -35,7 +35,7 @@ fn generated_face_profiles_keep_exact_links_live_after_edit_and_reopen() {
         let result = run(&mut s, "solid.extrude", json!({"face":[5,5,20],"distance":10,"operation":"new","name":"Pad"}));
         let pad = s.doc.feature(result["feature"].as_u64().unwrap()).unwrap();
         let FeatureKind::Extrude { sketch, .. } = pad.kind else { panic!("extrude") };
-        let generated = s.doc.feature(sketch).unwrap();
+        let generated = s.doc.feature(sketch.0).unwrap();
         let FeatureKind::Sketch { plane, sketch: profile } = &generated.kind else { panic!("sketch") };
         let PlaneRef::Face { anchor: Some(anchor), .. } = plane else { panic!("the original Box cap remains exact after a hole cut") };
         assert_eq!(anchor.target.origin_feature, base);
@@ -50,8 +50,8 @@ fn generated_face_profiles_keep_exact_links_live_after_edit_and_reopen() {
         let edited = s.model.state();
         assert!(edited.bodies.iter().any(|body| body.body.contains(Vec3::new(49.0, 5.0, 34.0))));
         assert!(!edited.bodies.iter().any(|body| body.body.contains(Vec3::new(51.0, 5.0, 34.0))));
-        assert!(edited.sketch(sketch).unwrap().sketch.links.iter().all(|link| link.auto_face && !link.lost));
-        let solved = edited.sketch(sketch).unwrap().plane;
+        assert!(edited.sketch(sketch.0).unwrap().sketch.links.iter().all(|link| link.auto_face && !link.lost));
+        let solved = edited.sketch(sketch.0).unwrap().plane;
         assert!((solved.origin.z - 25.0).abs() < 1e-6);
         let before = s.model.state();
         let before_volume: f64 = before.bodies.iter().map(|body| solidcraft_kernel::measure(&body.body).unwrap().volume).sum();
@@ -84,7 +84,7 @@ fn internal_capture_does_not_bypass_missing_ambiguous_or_invalid_path_picks() {
 fn generated_profiles_and_press_pull_convert_rotated_occurrence_picks_once() {
     for hole in [false, true] {
         let mut s = Session::default();
-        let component = run(&mut s, "component.create", json!({"name":"Arm"}));
+        let component = run(&mut s, "component.create", json!({"name":"Arm","grounded":false}));
         let cid = component["component"].as_u64().unwrap();
         let occ = component["occurrence"].as_u64().unwrap();
         run(&mut s, "solid.box", json!({"length":40,"width":30,"height":20,"name":"Base","body_name":"Stock"}));
@@ -147,7 +147,7 @@ fn raised_half(s: &mut Session, body: &str) {
 #[test]
 fn legacy_internal_capture_refuses_an_uncaptured_source_in_another_component() {
     let mut s = Session::default();
-    let component = run(&mut s, "component.create", json!({"name":"Source"}));
+    let component = run(&mut s, "component.create", json!({"name":"Source","grounded":false}));
     let occurrence = component["occurrence"].as_u64().unwrap();
     // A face Offset Face raised has no construction certificate or exact history name yet:
     // the legacy path.
@@ -260,7 +260,7 @@ fn join_keeps_exact_face_attachments_from_both_operands() {
     run(&mut s, "sketch.create", json!({"plane":"YZ"}));
     run(&mut s, "sketch.circle.center", json!({"center":[0,20],"radius":5}));
     run(&mut s, "sketch.finish", json!({}));
-    run(&mut s, "solid.extrude", json!({"distance":20,"symmetric":true,"operation":"join"}));
+    run(&mut s, "solid.extrude", json!({"distance":20,"operation":"join"}));
     run(&mut s, "sketch.create", json!({"plane":{"face":[0,0,40]}}));
     run(&mut s, "sketch.circle.center", json!({"center":[0,0],"radius":4}));
     run(&mut s, "sketch.finish", json!({}));

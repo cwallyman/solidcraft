@@ -2,27 +2,29 @@
 //! their rows and inputs, the triad on the canvas and the solid.move they make. Nothing
 //! moves until a value is typed or the triad is dragged.
 
+use crate::selection::SelectionExt as _;
+use crate::ui_kit::{choice_row, expr_row};
 use serde_json::{Value, json};
 use solidcraft_engine::Sel;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
 use solidcraft_engine::geom::Vec3;
 
 use crate::SolveApp;
-use crate::dialogs::{Dialog, Kind, combo, field, row_label};
+use crate::dialogs::{Dialog, Kind};
 use crate::gizmo::{self, Change, Drag};
-use crate::selection::{AXES, BODIES, EDGES, FACES, SelInput, VERTICES};
+use crate::selection::{AXIS_PICKS, BODIES, EDGES, FACES, ORIGIN, SelInput, VERTICES};
 
 pub const TYPES: [&str; 5] = ["Free Move", "Translate", "Rotate", "Point to Point", "Point to Position"];
-const FREE: usize = 0;
-const TRANSLATE: usize = 1;
-const ROTATE: usize = 2;
-const POINT_TO_POINT: usize = 3;
-const POINT_TO_POSITION: usize = 4;
-const POINTS: u16 = VERTICES | FACES | EDGES;
+pub const FREE: usize = 0;
+pub const TRANSLATE: usize = 1;
+pub const ROTATE: usize = 2;
+pub const POINT_TO_POINT: usize = 3;
+pub const POINT_TO_POSITION: usize = 4;
+const POINTS: u16 = VERTICES | FACES | EDGES | ORIGIN;
 
 /// A fresh Move dialog of a type (all values zero).
-pub fn kind(mode: usize) -> Kind {
-    let z = || "0 mm".to_string();
+pub fn kind(mode: usize, doc: &solidcraft_engine::doc::Document) -> Kind {
+    let z = || crate::length_input::default(doc, "0");
     let a = || "0 deg".to_string();
     Kind::Move { mode, x: z(), y: z(), z: z(), rx: a(), ry: a(), rz: a(), angle: a() }
 }
@@ -32,7 +34,7 @@ pub fn inputs(mode: usize) -> Vec<SelInput> {
     let mut v = vec![SelInput::new("Bodies", BODIES, true)];
     match mode {
         FREE => v.push(SelInput::new("Pivot", POINTS, false)),
-        ROTATE => v.push(SelInput::new("Axis", AXES | EDGES, false)),
+        ROTATE => v.push(SelInput::new("Axis", AXIS_PICKS, false)),
         POINT_TO_POINT => {
             v.push(SelInput::new("From", POINTS, false));
             v.push(SelInput::new("To", POINTS, false));
@@ -44,15 +46,13 @@ pub fn inputs(mode: usize) -> Vec<SelInput> {
 }
 
 /// The Move Type row (above the inputs); switching keeps the bodies and resets the values.
-pub fn type_row(d: &mut Dialog, ui: &mut egui::Ui) {
+pub fn type_row(d: &mut Dialog, ui: &mut egui::Ui, doc: &solidcraft_engine::doc::Document) {
     let Kind::Move { mode, .. } = d.kind else { return };
-    row_label(ui, "Move Type");
     let mut m = mode;
-    combo(ui, "move_type", &TYPES, &mut m);
-    ui.end_row();
+    choice_row(ui, "Move Type", "move_type", &mut m, &TYPES);
     if m != mode {
         let bodies = d.inputs.first().map(|i| i.items.clone()).unwrap_or_default();
-        d.kind = kind(m);
+        d.kind = kind(m, doc);
         d.inputs = inputs(m);
         if let Some(i) = d.inputs.first_mut() {
             i.items = bodies;
@@ -70,46 +70,47 @@ fn bodies_empty(d: &Dialog) -> bool {
 pub fn rows(ui: &mut egui::Ui, k: &mut Kind) -> bool {
     let Kind::Move { mode, x, y, z, rx, ry, rz, angle } = k else { return false };
     let mut enter = false;
-    let mut row = |ui: &mut egui::Ui, l: &str, v: &mut String| {
-        row_label(ui, l);
-        enter |= field(ui, v);
-        ui.end_row();
-    };
     match *mode {
         FREE | TRANSLATE => {
-            row(ui, "X Distance", x);
-            row(ui, "Y Distance", y);
-            row(ui, "Z Distance", z);
+            enter |= expr_row(ui, "X Distance", x);
+            enter |= expr_row(ui, "Y Distance", y);
+            enter |= expr_row(ui, "Z Distance", z);
             if *mode == FREE {
-                row(ui, "X Angle", rx);
-                row(ui, "Y Angle", ry);
-                row(ui, "Z Angle", rz);
+                enter |= expr_row(ui, "X Angle", rx);
+                enter |= expr_row(ui, "Y Angle", ry);
+                enter |= expr_row(ui, "Z Angle", rz);
             }
         }
-        ROTATE => row(ui, "Angle", angle),
+        ROTATE => enter |= expr_row(ui, "Angle", angle),
         POINT_TO_POSITION => {
-            row(ui, "X", x);
-            row(ui, "Y", y);
-            row(ui, "Z", z);
+            enter |= expr_row(ui, "X", x);
+            enter |= expr_row(ui, "Y", y);
+            enter |= expr_row(ui, "Z", z);
         }
         _ => {}
     }
     enter
 }
 
-fn sel_point(s: Option<&Sel>) -> Option<Vec3> {
+/// Where a point pick is: a round edge stands for its centre, where the model is before this
+/// move, in the world (a body of a placed component where its occurrence puts it, as it was
+/// picked); any other pick is where it was picked.
+fn sel_point(app: &SolveApp, d: &Dialog, s: Option<&Sel>) -> Option<Vec3> {
     match s? {
-        Sel::Vertex { point, .. } | Sel::Face { point, .. } | Sel::Edge { point, .. } => Some(*point),
+        Sel::Edge { body, index, point } => {
+            let st = match d.editing {
+                Some((id, _)) => std::sync::Arc::new(solidcraft_engine::doc::world_state(&app.session.doc, &app.session.model.state_before(id))),
+                None => app.session.world_state(),
+            };
+            Some(crate::dialogs::edge_circle_in(&st, body, *index).map_or(*point, |(c, ..)| c))
+        }
+        Sel::Vertex { point, .. } | Sel::Face { point, .. } => Some(*point),
         _ => None,
     }
 }
 
 fn items(d: &Dialog, i: usize) -> &[Sel] {
-    d.inputs.get(i).map(|x| x.items.as_slice()).unwrap_or(&[])
-}
-
-fn body_names(d: &Dialog) -> Vec<String> {
-    items(d, 0).iter().filter_map(|x| if let Sel::Body { name } = x { Some(name.clone()) } else { None }).collect()
+    crate::selection::items(&d.inputs, i)
 }
 
 /// The centre of the picked bodies where they are before this move.
@@ -119,7 +120,7 @@ fn bodies_center(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
         None => app.session.model.state(),
     };
     let mut bb: Option<(Vec3, Vec3)> = None;
-    for n in body_names(d) {
+    for n in items(d, 0).body_names() {
         let Some(b) = st.body(&n) else { continue };
         let x = b.mesh().bounds();
         bb = Some(match bb {
@@ -136,7 +137,7 @@ fn bodies_center(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
 /// What a Free Move turns about: the picked pivot, else the kept one (editing), else the
 /// bodies' centre.
 fn pivot(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
-    if let Some(p) = sel_point(items(d, 1).first()) {
+    if let Some(p) = sel_point(app, d, items(d, 1).first()) {
         return Some(p);
     }
     if let Some(a) = d.extra.get("pivot").and_then(|v| serde_json::from_value::<[f64; 3]>(v.clone()).ok()) {
@@ -146,11 +147,15 @@ fn pivot(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
 }
 
 fn len(app: &SolveApp, s: &str) -> Result<f64, String> {
-    app.session.doc.eval(s, ValueKind::Length).map_err(|e| e.to_string()).and_then(|v| if v.is_finite() { Ok(v) } else { Err("not a number".into()) })
+    crate::length_input::eval(&app.session.doc, s, ValueKind::Length)
+        .map_err(|e| e.to_string())
+        .and_then(|v| if v.is_finite() { Ok(v) } else { Err("not a number".into()) })
 }
 
 fn ang(app: &SolveApp, s: &str) -> Result<f64, String> {
-    app.session.doc.eval(s, ValueKind::Angle).map_err(|e| e.to_string()).and_then(|v| if v.is_finite() { Ok(v) } else { Err("not a number".into()) })
+    crate::length_input::eval(&app.session.doc, s, ValueKind::Angle)
+        .map_err(|e| e.to_string())
+        .and_then(|v| if v.is_finite() { Ok(v) } else { Err("not a number".into()) })
 }
 
 fn mm(v: f64) -> String {
@@ -168,11 +173,11 @@ fn deg(v: f64) -> String {
 /// The solid.move parameters (bodies, translate, axis, angle).
 pub fn params(app: &SolveApp, d: &Dialog) -> Result<Value, String> {
     let Kind::Move { mode, x, y, z, rx, ry, rz, angle } = &d.kind else { return Err("not a move".into()) };
-    let bodies = body_names(d);
+    let bodies = items(d, 0).body_names();
     if bodies.is_empty() {
         return Err("select bodies first".into());
     }
-    let need_point = |i: usize, what: &str| sel_point(items(d, i).first()).ok_or(format!("select {what} first"));
+    let need_point = |i: usize, what: &str| sel_point(app, d, items(d, i).first()).ok_or(format!("select {what} first"));
     let num = |t: Vec3| json!([mm(t.x), mm(t.y), mm(t.z)]);
     let mut p = json!({ "bodies": bodies });
     match *mode {
@@ -209,7 +214,10 @@ pub fn params(app: &SolveApp, d: &Dialog) -> Result<Value, String> {
             }
         }
         ROTATE => {
-            let (o, a) = items(d, 1).first().and_then(|s| axis_line(app, s)).ok_or("select an axis or a straight edge first")?;
+            let (o, a) = items(d, 1)
+                .first()
+                .and_then(|s| axis_line(app, s))
+                .ok_or("select an axis, a straight or circular edge, or a cylinder, cone or torus face first")?;
             let th = ang(app, angle)?;
             let r = gizmo::rotation(a, th);
             p["translate"] = num(o - gizmo::apply(&r, o));
@@ -232,7 +240,8 @@ pub fn params(app: &SolveApp, d: &Dialog) -> Result<Value, String> {
     Ok(p)
 }
 
-/// An axis line: origin axes and sketch lines, or a straight body edge.
+/// An axis line: origin axes and sketch lines, a straight or circular body edge, or a cylinder,
+/// cone or torus face (`dialogs::axis_of`), or a straight edge of a body where it was modelled.
 fn axis_line(app: &SolveApp, s: &Sel) -> Option<(Vec3, Vec3)> {
     if let Some(a) = crate::dialogs::axis_of(app, s) {
         return Some(a);
@@ -257,8 +266,58 @@ pub fn triad(app: &SolveApp, d: &Dialog) -> Option<gizmo::Triad> {
     Some(gizmo::Triad { center: pivot(app, d)? + t, translate: true, rotate: *mode == FREE })
 }
 
+/// Rotate's ring lies on the selected axis, level with the picked bodies' centre.
+pub(crate) fn rotation_axis(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Vec3)> {
+    if !matches!(d.kind, Kind::Move { mode: ROTATE, .. }) {
+        return None;
+    }
+    let centre = bodies_center(app, d)?;
+    let (origin, axis) = axis_line(app, items(d, 1).first()?)?;
+    let axis = axis.normalized()?;
+    Some((origin + axis * (centre - origin).dot(axis), axis))
+}
+
 /// Apply a triad drag to the dialog's values (added to the values when the drag began).
+/// Which value the canvas box shows and types into, for the types that translate: X, Y or Z
+/// (0 to 2), or, in Free Move, the angle about X, Y or Z (3 to 5). Kept in `extra` as
+/// `value_field`; X at first.
+pub fn value_field(d: &Dialog) -> usize {
+    let Kind::Move { mode, .. } = &d.kind else { return 0 };
+    let n = fields(*mode);
+    d.extra.get("value_field").and_then(Value::as_u64).map_or(0, |f| f as usize).min(n.saturating_sub(1))
+}
+
+/// How many values the box can show for a move type (see [`value_field`]).
+fn fields(mode: usize) -> usize {
+    match mode {
+        FREE => 6,
+        TRANSLATE | POINT_TO_POSITION => 3,
+        _ => 1,
+    }
+}
+
+/// Show the next (`step` 1) or previous (`step` -1) value in the box, round the type's values.
+pub fn step_value_field(d: &mut Dialog, step: i64) {
+    let Kind::Move { mode, .. } = &d.kind else { return };
+    let n = fields(*mode) as i64;
+    let next = (value_field(d) as i64 + step).rem_euclid(n.max(1));
+    d.extra.insert("value_field".into(), json!(next));
+}
+
 pub fn drag(app: &SolveApp, d: &mut Dialog, g: Drag) {
+    // The box shows the value the handle drives: the distance along a dragged arrow, the angle
+    // of a dragged ring (#4776). A plane square or the ball moves along two or three axes and
+    // leaves it as it is.
+    let field = match g.handle {
+        crate::gizmo::Handle::Axis(i) => Some(i.min(2)),
+        crate::gizmo::Handle::Ring(i) => Some(3 + i.min(2)),
+        _ => None,
+    };
+    if let (Some(f), Kind::Move { mode, .. }) = (field, &d.kind)
+        && f < fields(*mode)
+    {
+        d.extra.insert("value_field".into(), json!(f));
+    }
     let Kind::Move { x, y, z, rx, ry, rz, .. } = &d.kind else { return };
     if g.started || !d.extra.contains_key("drag0") {
         let v = [len(app, x), len(app, y), len(app, z), ang(app, rx), ang(app, ry), ang(app, rz)].map(|r| r.unwrap_or(0.0));
@@ -268,9 +327,9 @@ pub fn drag(app: &SolveApp, d: &mut Dialog, g: Drag) {
     let Kind::Move { x, y, z, rx, ry, rz, .. } = &mut d.kind else { return };
     match g.change {
         Change::Translate(t) => {
-            *x = mm(v0[0] + t.x);
-            *y = mm(v0[1] + t.y);
-            *z = mm(v0[2] + t.z);
+            *x = crate::length_input::model(&app.session.doc, v0[0] + t.x);
+            *y = crate::length_input::model(&app.session.doc, v0[1] + t.y);
+            *z = crate::length_input::model(&app.session.doc, v0[2] + t.z);
         }
         Change::Rotate { axis, angle } => {
             let slot = match axis {
@@ -288,18 +347,26 @@ pub fn drag(app: &SolveApp, d: &mut Dialog, g: Drag) {
 
 /// The dialog for editing a move: Free Move with its translation and, about a world axis
 /// through the origin, its angle (another axis is kept as it is).
-pub fn for_feature(d: &mut Dialog, bodies: &[String], translate: &[String; 3], axis: Option<Vec3>, angle: Option<&String>, copy: bool) {
-    let [x, y, z] = translate.clone();
-    let mut k = kind(FREE);
+pub fn for_feature(
+    doc: &solidcraft_engine::doc::Document,
+    d: &mut Dialog,
+    bodies: &[String],
+    translate: &[solidcraft_engine::doc::Expr; 3],
+    axis: Option<Vec3>,
+    angle: Option<&solidcraft_engine::doc::Expr>,
+    copy: bool,
+) {
+    let [x, y, z] = translate.clone().map(String::from);
+    let mut k = kind(FREE, doc);
     if let Kind::Move { x: kx, y: ky, z: kz, rx, ry, rz, .. } = &mut k {
         (*kx, *ky, *kz) = (x, y, z);
         if let Some(a) = angle {
             let dir = axis.unwrap_or(Vec3::Z);
             let world = [Vec3::X, Vec3::Y, Vec3::Z].iter().position(|w| dir.cross(*w).len() < 1e-9 && dir.dot(*w) > 0.0);
             match world {
-                Some(0) => *rx = a.clone(),
-                Some(1) => *ry = a.clone(),
-                Some(_) => *rz = a.clone(),
+                Some(0) => *rx = a.to_string(),
+                Some(1) => *ry = a.to_string(),
+                Some(_) => *rz = a.to_string(),
                 None => {
                     d.extra.insert("axis".into(), json!([dir.x, dir.y, dir.z]));
                     d.extra.insert("angle".into(), json!(a));
@@ -318,3 +385,7 @@ pub fn for_feature(d: &mut Dialog, bodies: &[String], translate: &[String; 3], a
         d.extra.insert("copy".into(), json!(true));
     }
 }
+
+#[cfg(test)]
+#[path = "dialogs_move_tests.rs"]
+mod tests;

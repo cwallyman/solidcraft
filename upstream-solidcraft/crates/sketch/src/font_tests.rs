@@ -1,5 +1,5 @@
 //! Font choice for sketch text. A small TrueType font is built here, so the outlines it must give are
-//! known by hand; the repository's second font (BIZ UDPGothic, `apps/solidcraft-web/fonts`) stands for
+//! known by hand; the repository's second font (BIZ UDPGothic, `assets/fonts/biz-udp-gothic`) stands for
 //! a real one.
 
 use std::path::PathBuf;
@@ -164,7 +164,7 @@ impl Drop for Folder {
 }
 
 fn web_fonts() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("apps").join("solidcraft-web").join("fonts")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts/biz-udp-gothic")
 }
 
 /// The corner points of the lines of `geometry`, as (min, max) over x and y.
@@ -223,7 +223,8 @@ fn text_in_a_font_closes_into_profiles_with_counters() {
     let folder = Folder::new("profiles");
     let (at, height) = (v(10.0, 20.0), 7.0);
     let font = folder.font();
-    let source = LinkSource::Text { text: "O".into(), at, height, angle: 0.0, font: Some(font.clone()) };
+    let source =
+        LinkSource::Text { text: "O".into(), at, height, angle: 0.0, font: Some(font.clone()), style: Default::default(), exprs: Default::default() };
     let mut sk = Sketch::new();
     sk.add_link(LinkKind::Text, source, &text_geometry_in(Some(&font), "O", at, height, 0.0).unwrap()).unwrap();
     // The block with the counter in it is 8 x 7 mm minus 4 x 3 mm; the counter is a region of its own.
@@ -292,11 +293,46 @@ fn a_text_that_the_font_makes_too_large_is_refused() {
     std::fs::write(&path, font).unwrap();
     assert_eq!(text_geometry_in(Some(&path), &"H".repeat(66), Vec2::ZERO, 5.0, 0.0).unwrap().len(), 66 * 300);
     assert!(matches!(text_geometry_in(Some(&path), &"H".repeat(67), Vec2::ZERO, 5.0, 0.0), Err(SketchError::TooLarge)));
+    // Too large to draw, not to measure: 67 times one H.
+    let font = font_data(Some(&path)).unwrap();
+    let m = TextMetrics::new(&font, &TextStyle::default()).unwrap();
+    let (one, all) = (m.line_width("H", 5.0).unwrap(), m.line_width(&"H".repeat(67), 5.0).unwrap());
+    assert!(one > 0.0 && (all - 67.0 * one).abs() < 1e-12 * all, "{one} {all}");
+}
+
+#[test]
+fn a_font_file_is_measured_by_its_own_tables() {
+    let folder = Folder::new("metrics");
+    let font = font_data(Some(&folder.font())).unwrap();
+    let m = TextMetrics::new(&font, &TextStyle::default()).unwrap();
+    // Its H is 700 units tall, so at 7 mm a unit is 0.01 mm; ascender 800, descender -200 and no line gap put lines
+    // 10 mm apart; H, I and O advance 700, 200 and 900 units.
+    assert!((m.scale(7.0).unwrap() - 0.01).abs() < 1e-15);
+    assert!((m.line_pitch(7.0).unwrap() - 10.0).abs() < 1e-12);
+    assert!((m.line_width("HIO", 7.0).unwrap() - 18.0).abs() < 1e-12);
+    // It has neither an x nor a `?`: an x is left out, taking no room and drawing nothing, but it is named.
+    assert_eq!(m.line_width("HxI", 7.0).unwrap(), m.line_width("HI", 7.0).unwrap());
+    assert_eq!(m.missing("xHx"), ['x', 'x']);
+    let draw = |text: &str| text_geometry_in(Some(&folder.font()), text, Vec2::ZERO, 7.0, 0.0).unwrap();
+    assert_eq!(draw("HxI"), draw("HI"));
+    assert!(draw("xx").is_empty() && m.line_width("xx", 7.0).unwrap() == 0.0);
+    // A face the file does not have (it is no collection) is an error.
+    let mut elsewhere = font.clone();
+    elsewhere.index = 1;
+    assert!(TextMetrics::new(&elsewhere, &TextStyle::default()).is_err());
 }
 
 #[test]
 fn a_font_is_kept_in_the_design_and_old_designs_read_without_one() {
-    let source = |font: Option<&str>| LinkSource::Text { text: "I".into(), at: Vec2::ZERO, height: 5.0, angle: 0.0, font: font.map(str::to_string) };
+    let source = |font: Option<&str>| LinkSource::Text {
+        text: "I".into(),
+        at: Vec2::ZERO,
+        height: 5.0,
+        angle: 0.0,
+        font: font.map(str::to_string),
+        style: Default::default(),
+        exprs: Default::default(),
+    };
     // No font: nothing is written, so the text of a design reads and writes as it did before fonts, and a design saved
     // before them reads as text in the built-in font.
     let plain = serde_json::to_string(&source(None)).unwrap();
@@ -306,4 +342,25 @@ fn a_font_is_kept_in_the_design_and_old_designs_read_without_one() {
     let json = serde_json::to_string(&source(Some("C:/fonts/Some Font.ttf"))).unwrap();
     assert!(json.contains(r#""font":"C:/fonts/Some Font.ttf""#), "{json}");
     assert_eq!(serde_json::from_str::<LinkSource>(&json).unwrap(), source(Some("C:/fonts/Some Font.ttf")));
+}
+
+#[test]
+fn installed_families_are_listed_by_name_once_without_the_built_in_one() {
+    let folder = Folder::new("families");
+    // A second copy of the tiny font, the built-in font and the repository's second font: each family once,
+    // sorted; the built-in family is not among the installed ones, broken files and other files are skipped.
+    std::fs::write(folder.0.join("copy.ttf"), tiny_font()).unwrap();
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts/liberation-sans/LiberationSans-Regular.ttf"),
+        folder.0.join("lib.ttf"),
+    )
+    .unwrap();
+    std::fs::copy(web_fonts().join("BIZUDPGothic-Regular.ttf"), folder.0.join("biz.ttf")).unwrap();
+    let families = crate::families_in(std::slice::from_ref(&folder.0));
+    assert_eq!(families, ["BIZ UDPGothic", "Tiny Block"]);
+    // Each name finds its font again.
+    for family in &families {
+        assert!(find_family_in(std::slice::from_ref(&folder.0), family).unwrap().is_some(), "{family}");
+    }
+    assert!(crate::families_in(&[folder.0.join("missing")]).is_empty());
 }

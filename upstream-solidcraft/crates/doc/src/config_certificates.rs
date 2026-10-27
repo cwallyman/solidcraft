@@ -148,6 +148,35 @@ pub(crate) fn extrude_cap_bindings(sketch: &SolvedSketch, bodies: &[solidcraft_k
     Some(bindings)
 }
 
+/// Cap signatures for a thin extrude (#1519). A thin wall's caps are bounded by offset curves
+/// the sketch doesn't have, so [`extrude_cap_bindings`] can never certify them. A wall built
+/// from one region is signed by the curves it follows instead: the cap of this extrude whose
+/// wall runs along them. That is the signature its solid caps had when the wall follows the
+/// whole profile (a rectangle's four lines), so a sketch attached to a solid cap keeps its face
+/// when the extrude is made thin, and the other way round. Several regions (walls apart, or one
+/// meeting itself) are left uncertified: they keep their history names.
+pub(crate) fn thin_extrude_cap_bindings(curves: &[String], regions: usize, bodies: &[solidcraft_kernel::Body]) -> CapBindings {
+    use solidcraft_kernel::FaceSource;
+    let mut outer = curves.to_vec();
+    outer.sort();
+    outer.dedup();
+    let signed = regions == 1 && bodies.len() == 1 && valid_signature(&outer, &[]);
+    bodies
+        .iter()
+        .map(|body| {
+            let sources: Vec<_> = body.face_sources().into_iter().flatten().collect();
+            let ends =
+                |high: bool| sources.iter().filter(|source| matches!(source, Some(FaceSource::ExtrudeCap { high: h, .. }) if *h == high)).count();
+            // One cap at each end, or none of them is certified.
+            let unique = ends(true) <= 1 && ends(false) <= 1;
+            sources
+                .iter()
+                .map(|source| (signed && unique && matches!(source, Some(FaceSource::ExtrudeCap { .. }))).then(|| (outer.clone(), Vec::new())))
+                .collect()
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FaceCertificate {
@@ -457,6 +486,129 @@ impl<'a> ExactSketchCurves<'a> {
     }
 }
 
+impl ExactSketchCurves<'_> {
+    /// The sketch curves a generated segment is drawn on: [`find_along`](Self::find_along)'s one
+    /// curve, else every drawn curve that contains it or runs along and overlaps it (projections
+    /// only where no drawn curve does), in the sketch's order. A segment two coincident curves
+    /// were drawn over (four squares drawn edge to edge), or one a profile merged from collinear
+    /// curves (the outline of several adjacent profiles extruded together), is drawn on all of
+    /// them: the set is exact and fixed by the sketch, so its face is named by it (the first its
+    /// name, the others aliases) rather than not at all. Empty when it lies on none.
+    pub(crate) fn find_all_along(&self, generated: &Seg2) -> Vec<String> {
+        if let Some(id) = self.find_along(generated) {
+            return vec![id];
+        }
+        let runs_along = |original: &Seg2| {
+            if exact_segment_contains(original, generated) {
+                return true;
+            }
+            let (Seg2::Line { a, b }, Seg2::Line { a: c, b: d }) = (*original, *generated) else { return false };
+            let direction = b - a;
+            let scale = direction.len().max((d - c).len()).max(1.);
+            if direction.len() <= 1e-12
+                || direction.cross(c - a).abs() > 1e-10 * scale * scale
+                || direction.cross(d - a).abs() > 1e-10 * scale * scale
+            {
+                return false;
+            }
+            let (tc, td) = ((c - a).dot(direction) / direction.len2(), (d - a).dot(direction) / direction.len2());
+            tc.min(td).max(0.) < tc.max(td).min(1.) - 1e-9
+        };
+        let pick = |linked: bool| -> Vec<String> {
+            self.segments
+                .iter()
+                .filter(|(_, l, originals)| *l == linked && originals.iter().any(runs_along))
+                .map(|(id, _, _)| (*id).to_owned())
+                .collect()
+        };
+        let drawn = pick(false);
+        if drawn.is_empty() { pick(true) } else { drawn }
+    }
+}
+
+impl ExactSketchCurves<'_> {
+    /// The roles of a thin wall's side that runs parallel to some of the wall's `curves`, off
+    /// them by one of the wall's `distances`: `wall:<curve>:left` (or `:right`) for the side of
+    /// that curve, left or right of the direction it is drawn in. A thin wall's sides lie off the
+    /// sketch (by half its thickness, say), so [`find_all_along`](Self::find_all_along) finds no
+    /// curve under them. Every curve the side runs along and overlaps names it (the first its
+    /// name, the others aliases), in the sketch's order; empty when it is parallel to none, or
+    /// its distance is not one of the wall's.
+    pub(crate) fn find_offset(&self, generated: &Seg2, curves: &[String], distances: [f64; 2]) -> Vec<String> {
+        let wanted = |offset: f64, scale: f64| {
+            let tolerance = 1e-7 * scale.max(1.);
+            offset.abs() > tolerance && distances.iter().any(|d| (d - offset.abs()).abs() <= tolerance)
+        };
+        let side = |offset: f64| if offset > 0. { "left" } else { "right" };
+        let tau = std::f64::consts::TAU;
+        let mut roles = Vec::new();
+        for (id, _, originals) in &self.segments {
+            if !curves.iter().any(|c| c == id) {
+                continue;
+            }
+            let found = originals.iter().find_map(|original| match (*original, *generated) {
+                (Seg2::Line { a, b }, Seg2::Line { a: c, b: d }) => {
+                    let direction = b - a;
+                    let length = direction.len();
+                    let scale = length.max((d - c).len());
+                    if length <= 1e-12 {
+                        return None;
+                    }
+                    let (left_c, left_d) = (direction.cross(c - a) / length, direction.cross(d - a) / length);
+                    if (left_c - left_d).abs() > 1e-9 * scale.max(1.) || !wanted(left_c, scale) {
+                        return None;
+                    }
+                    let (tc, td) = ((c - a).dot(direction) / direction.len2(), (d - a).dot(direction) / direction.len2());
+                    (tc.min(td).max(0.) < tc.max(td).min(1.) - 1e-9).then(|| side(left_c))
+                }
+                (Seg2::Arc { center: oc, radius: or, start: os, sweep: ow }, Seg2::Arc { center: gc, radius: gr, start: gs, sweep: gw }) => {
+                    let scale = or.max(gr);
+                    if oc.dist(gc) > 1e-9 * scale.max(1.) || !wanted(gr - or, scale) || ow == 0. || gw == 0. {
+                        return None;
+                    }
+                    // Drawn counter-clockwise, the curve's left is towards its centre.
+                    let left = if ow > 0. { gr < or } else { gr > or };
+                    let inside = |start: f64, sweep: f64, angle: f64| {
+                        let low = if sweep >= 0. { start } else { start + sweep };
+                        (angle - low).rem_euclid(tau) <= sweep.abs() + 1e-9
+                    };
+                    let overlaps = inside(os, ow, gs)
+                        || inside(os, ow, gs + gw)
+                        || inside(os, ow, gs + gw / 2.)
+                        || inside(gs, gw, os)
+                        || inside(gs, gw, os + ow / 2.)
+                        || ow.abs() >= tau - 1e-9
+                        || gw.abs() >= tau - 1e-9;
+                    overlaps.then_some(if left { "left" } else { "right" })
+                }
+                _ => None,
+            });
+            // The end of an open chain: a straight cut across the curve, through its end point.
+            let cap = || {
+                let Seg2::Line { a: c, b: d } = *generated else { return None };
+                let width = (d - c).len();
+                if width <= 1e-12 || (width - (distances[0] + distances[1])).abs() > 1e-7 * width.max(1.) {
+                    return None;
+                }
+                originals.iter().find_map(|original| {
+                    [("start", original.start(), original.start_tangent()), ("end", original.end(), original.end_tangent())].into_iter().find_map(
+                        |(end, point, tangent)| {
+                            let across = (d - c) * (1. / width);
+                            let on_line = across.cross(point - c).abs() <= 1e-7 * width.max(1.);
+                            let along = (point - c).dot(across);
+                            (tangent.dot(across).abs() <= 1e-7 && on_line && (-1e-7..=width + 1e-7).contains(&along)).then_some(end)
+                        },
+                    )
+                })
+            };
+            if let Some(side) = found.or_else(cap) {
+                roles.push(format!("wall:{id}:{side}"));
+            }
+        }
+        roles
+    }
+}
+
 fn exact_segment_contains(original: &Seg2, generated: &Seg2) -> bool {
     match (original, generated) {
         (Seg2::Line { a, b }, Seg2::Line { a: c, b: d }) => {
@@ -511,18 +663,14 @@ impl Document {
             | Some(solidcraft_kernel::FaceSource::ShellPlanar { producer: Some(producer), .. })
             | Some(solidcraft_kernel::FaceSource::Box { producer: Some(producer), .. })
             | Some(solidcraft_kernel::FaceSource::CylinderCap { producer, .. }) => *producer,
-            _ => name
-                .strip_prefix('F')
-                .and_then(|name| name.split_once(':'))
-                .and_then(|(id, _)| id.parse().ok())
-                .ok_or_else(|| DocError::Invalid("face source producer missing".into()))?,
+            _ => crate::persistent_name::made_by(&name).ok_or_else(|| DocError::Invalid("face source producer missing".into()))?,
         };
         let certificate = self.configuration_face_certificate(body, index)?;
         if let Some(FaceCertificate::ExtrudeSide { curve, .. }) = &certificate {
             name = format!("F{origin}:side:{curve}");
         } else if let Some(FaceCertificate::ShellPlanar { source, inner, .. }) = &certificate {
             name = format!("F{origin}:{}", shell_certificate_role(source, *inner)?);
-        } else if !name.starts_with(&format!("F{origin}:")) {
+        } else if crate::persistent_name::made_by(&name) != Some(origin) {
             name = format!("F{origin}:face:{index}");
         }
         let inverse = crate::mat_inverse(&body.source_transform).ok_or_else(|| DocError::Invalid("invalid definition placement".into()))?;
@@ -656,7 +804,7 @@ impl Document {
         }
         let full = names.faces.get(index)?;
         let stem = crate::naming::strip_piece(full);
-        let origin = stem.strip_prefix('F')?.split_once(':')?.0.parse::<u64>().ok()?;
+        let origin = crate::persistent_name::made_by(stem)?;
         let inverse = crate::mat_inverse(&body.source_transform)?;
         let mut candidates = vec![stem];
         if full != stem {
@@ -750,11 +898,15 @@ impl Document {
             return Ok(indices);
         }
         let names = crate::naming::names(body);
-        let own = format!("F{origin}:");
         let stem = |index: usize| names.faces.get(index).map(|name| crate::naming::strip_piece(name));
-        let seed: Vec<usize> =
-            indices.into_iter().filter(|index| stem(*index).is_some_and(|name| name.starts_with(&own) && !name.contains('@'))).collect();
-        let ambiguous = || DocError::Unknown("attached planar face certificate is missing or ambiguous".into());
+        let seed: Vec<usize> = indices
+            .into_iter()
+            .filter(|index| {
+                stem(*index).is_some_and(|name| crate::persistent_name::made_by(name) == Some(origin) && !crate::persistent_name::is_copy(name))
+            })
+            .collect();
+        let feature = self.feature(origin).map_or_else(|| format!("F{origin}"), |feature| feature.name.clone());
+        let ambiguous = || DocError::Invalid(format!("the attached flat face of {feature} on `{}` is missing or ambiguous", body.name));
         let first = seed.first().and_then(|index| stem(*index)).ok_or_else(ambiguous)?;
         if seed.iter().any(|index| stem(*index) != Some(first)) {
             return Err(ambiguous());
@@ -771,7 +923,7 @@ impl Document {
             return indices;
         }
         let names = crate::naming::names(body);
-        let copy = |index: &usize| names.faces.get(*index).is_some_and(|name| crate::naming::strip_piece(name).contains('@'));
+        let copy = |index: &usize| names.faces.get(*index).is_some_and(|name| crate::persistent_name::is_copy(name));
         if indices.iter().all(copy) {
             return indices;
         }
@@ -795,7 +947,15 @@ mod tests {
 
     fn solved(mut sketch: solidcraft_sketch::Sketch) -> SolvedSketch {
         let report = solidcraft_sketch::solve(&mut sketch);
-        SolvedSketch { feature: 1, name: "sources".into(), plane: solidcraft_geom::Plane::XY, sketch, report, profiles: Vec::new() }
+        SolvedSketch {
+            feature: 1,
+            name: "sources".into(),
+            plane: solidcraft_geom::Plane::XY,
+            sketch,
+            report,
+            profiles: Vec::new(),
+            ends: Default::default(),
+        }
     }
 
     #[test]

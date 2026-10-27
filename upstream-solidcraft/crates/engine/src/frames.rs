@@ -26,6 +26,9 @@ enum K {
     Make,
     /// A direction: turned with the command's frame.
     Dir,
+    /// A point the command's bodies move about: into the frame of those bodies (the command's
+    /// frame, as its directions are).
+    Moved,
     /// An arbitrary axis object in the authoring frame: {origin, dir}.
     Axis,
     /// A plane object (`{face}`, `{origin, normal}`, `{origin, x_dir, y_dir}`) or a plane name.
@@ -36,7 +39,8 @@ enum K {
     /// component frame, whichever component the geometry under it belongs to (a sketch in the
     /// root on a moved component's face finds the face where it is shown).
     Here,
-    /// A plane object for a new sketch or canvas: into the active component's frame.
+    /// A plane object for a new sketch or canvas (or a mirror's copies): into the active
+    /// component's frame.
     HerePlane,
 }
 
@@ -45,7 +49,9 @@ use K::*;
 /// The parameters each command takes in world coordinates.
 fn table(id: &str) -> &'static [(&'static str, K)] {
     match id {
-        "solid.extrude" => &[("face", Pick), ("from", Make), ("to", Make), ("targets", Body), ("participants", Body)],
+        "solid.extrude" => {
+            &[("face", Pick), ("faces", Picks), ("face_body", Body), ("from", Make), ("to", Make), ("targets", Body), ("participants", Body)]
+        }
         "solid.revolve" => &[("face", Pick), ("axis", Axis), ("to", Make), ("targets", Body), ("participants", Body)],
         "solid.box" | "solid.sphere" => &[("corner", Make), ("center", Make)],
         "solid.cylinder" | "solid.coil" | "solid.torus" => &[("base", Make), ("center", Make), ("axis", Dir)],
@@ -58,8 +64,14 @@ fn table(id: &str) -> &'static [(&'static str, K)] {
         "solid.draft" => &[("faces", Picks), ("neutral", Plane), ("pull", Dir), ("body", Body)],
         "solid.press_pull" => &[("face", Pick), ("edges", Picks)],
         "solid.replace_face" => &[("faces", Picks), ("target_face", Pick), ("target", Plane), ("body", Body)],
-        "solid.align" => &[("from", Pick), ("from_face", Pick), ("to", Pick), ("to_face", Pick), ("bodies", Body)],
-        "solid.mirror" | "solid.split_body" => &[("plane", Plane), ("bodies", Body), ("body", Body)],
+        // Align finds its picks where they are shown and takes both ends into the moved bodies'
+        // frame itself: a pick mapped into the frame of the body under it would put the two ends
+        // in different frames when they lie on separately placed components.
+        "solid.align" => &[("bodies", Body)],
+        // A mirror keeps the placement its bodies were picked at (`cmd::features::placed_bodies`);
+        // its plane is in the active component, where the copies go.
+        "solid.mirror" => &[("plane", HerePlane)],
+        "solid.split_body" => &[("plane", Plane), ("bodies", Body), ("body", Body)],
         "plastic.boss" | "plastic.snap_fit" | "plastic.rest" => {
             &[("position", Pick), ("direction", Dir), ("hook", Dir), ("along", Dir), ("body", Body)]
         }
@@ -67,6 +79,8 @@ fn table(id: &str) -> &'static [(&'static str, K)] {
         "sheet.convert" => &[("face", Pick), ("bends", Picks), ("body", Body)],
         "sheet.flange" | "sheet.hem" => &[("edges", Picks), ("body", Body)],
         "sheet.fold" => &[("points", Picks), ("fixed", Pick), ("body", Body)],
+        "sheet.path_flange" => &[("edge", Pick), ("body", Body)],
+        "sheet.perforate" => &[("body", Body)],
         "sketch.create" | "sketch.redefine" => &[("plane", HerePlane)],
         "canvas.decal" => &[("face", Here)],
         "canvas.insert" => &[("plane", HerePlane), ("at", Here)],
@@ -76,7 +90,7 @@ fn table(id: &str) -> &'static [(&'static str, K)] {
         "inspect.curvature_comb" | "inspect.minimum_radius" | "inspect.isocurve" => &[("edges", Picks), ("faces", Picks)],
         "parts.insert" | "parts.fastener" => &[("at", Pick), ("point", Make), ("direction", Dir)],
         "appearance.assign" => &[("faces", Picks), ("bodies", Body), ("body", Body)],
-        "solid.move" => &[("bodies", Body), ("translate", Dir), ("axis", Dir), ("origin", Make)],
+        "solid.move" => &[("bodies", Body), ("translate", Dir), ("axis", Dir), ("origin", Moved)],
         "solid.combine" => &[("target", Body), ("tools", Body)],
         "solid.remove" | "solid.bounding_solid" | "material.assign" => &[("bodies", Body)],
         _ => &[],
@@ -85,20 +99,29 @@ fn table(id: &str) -> &'static [(&'static str, K)] {
 
 /// The world placement of bodies (name → frame), with moves not captured yet.
 struct Frames {
-    bodies: Vec<(String, String, Mat)>,
+    /// Worked out on first use: most commands pick no body, and a large assembly's frames cost
+    /// a walk of every body on every command.
+    bodies: std::cell::OnceCell<Vec<(String, String, Mat)>>,
     active: Mat,
     /// The frame of the sketch being edited (its component), else the active component's.
     sketch: Mat,
 }
 
 fn frames(s: &Session) -> Frames {
-    let st = s.model.state();
-    let doc = s.placed_document();
-    // World name, the component's own body name, and its frame.
-    let bodies = doc.body_frames_with_source(&st).into_iter().map(|(world, own, _, _, m)| (world, own, m)).collect();
-    let sketch_comp = s.active_sketch.and_then(|id| doc.feature(id)).map(|f| f.component).unwrap_or(s.active_component);
+    let sketch_comp = s.active_sketch.and_then(|id| s.doc.feature(id)).map(|f| f.component).unwrap_or(s.active_component);
     let active = s.active_component_frame();
-    Frames { bodies, active, sketch: if sketch_comp == s.active_component { active } else { doc.component_transform(sketch_comp) } }
+    let sketch = if sketch_comp == s.active_component { active } else { s.placed_document().component_transform(sketch_comp) };
+    Frames { bodies: std::cell::OnceCell::new(), active, sketch }
+}
+
+impl Frames {
+    /// World name, the component's own body name, and its frame, for every body.
+    fn bodies(&self, s: &Session) -> &[(String, String, Mat)] {
+        self.bodies.get_or_init(|| {
+            let st = s.model.state();
+            s.placed_document().body_frames_with_source(&st).into_iter().map(|(world, own, _, _, m)| (world, own, m)).collect()
+        })
+    }
 }
 
 /// Does world geometry or its instance naming differ from source components?
@@ -125,14 +148,14 @@ fn pt(p: Vec3) -> Value {
 /// The frame of the body a world point lies on (the nearest), or of the named body.
 fn frame_at(s: &Session, f: &Frames, p: Vec3, body: Option<&str>) -> Option<Mat> {
     if let Some(b) = body
-        && let Some((_, _, m)) = f.bodies.iter().find(|(w, _, _)| w == b)
+        && let Some((_, _, m)) = f.bodies(s).iter().find(|(w, _, _)| w == b)
     {
         return Some(*m);
     }
     let world = s.world_state();
     let mut best: Option<(f64, Mat)> = None;
     for wb in &world.bodies {
-        let Some((_, _, m)) = f.bodies.iter().find(|(w, _, _)| *w == wb.name) else { continue };
+        let Some((_, _, m)) = f.bodies(s).iter().find(|(w, _, _)| *w == wb.name) else { continue };
         let mesh = wb.mesh();
         let bb = mesh.bounds();
         let tol = (bb.diagonal() * 1e-3).max(1e-3);
@@ -199,8 +222,8 @@ impl Mapper<'_> {
     fn make_expr(&mut self, m: &Mat, v: &Value) -> Option<Value> {
         let a = v.as_array().filter(|a| a.len() == 3)?;
         let c = |i: usize| match a.get(i)? {
-            Value::Number(n) => n.as_f64().filter(|x| x.is_finite()).map(|x| format!("{x}")),
-            Value::String(e) => Some(e.clone()),
+            Value::Number(n) => n.as_f64().filter(|x| x.is_finite()).map(|x| solidcraft_doc::Expr::new(format!("{x}"))),
+            Value::String(e) => Some(solidcraft_doc::Expr::new(e.as_str())),
             _ => None,
         };
         let mut p = [c(0)?, c(1)?, c(2)?];
@@ -272,7 +295,7 @@ impl Mapper<'_> {
 
     /// The component's body name for a world (instance) body name.
     fn own_name(&mut self, world: &str) -> Option<String> {
-        let own = self.f.bodies.iter().find(|(w, _, _)| w == world).map(|(_, own, _)| own.clone())?;
+        let own = self.f.bodies(self.s).iter().find(|(w, _, _)| w == world).map(|(_, own, _)| own.clone())?;
         (own != world).then(|| {
             self.changed = true;
             own
@@ -303,6 +326,20 @@ pub fn mapped() -> bool {
     MAPPED.with(std::cell::Cell::get)
 }
 
+/// Author generated geometry directly in the active component's local frame.
+/// Restores the enclosing command's mapping state, including on an error.
+pub(crate) fn local_geometry() -> LocalGeometry {
+    LocalGeometry(MAPPED.with(|m| m.replace(true)))
+}
+
+pub(crate) struct LocalGeometry(bool);
+
+impl Drop for LocalGeometry {
+    fn drop(&mut self) {
+        MAPPED.with(|m| m.set(self.0));
+    }
+}
+
 /// A command running inside another (its parameters are already in component frames).
 pub struct Nested;
 
@@ -330,6 +367,20 @@ impl Drop for Nested {
 
 /// `params` with world picks mapped into component frames (`None`: nothing to change).
 pub fn to_local(s: &Session, id: &str, params: &Value) -> Option<Value> {
+    if id == "library.apply" {
+        // Library targets are the same world selections as appearance.assign,
+        // nested one level down. Convert at the outer boundary exactly once;
+        // run_nested subsequently receives the component-local picks and names.
+        let targets = to_local(s, "appearance.assign", params.get("targets")?)?;
+        let mut out = params.clone();
+        out["targets"] = targets;
+        return Some(out);
+    }
+    // Several placements of one part moved together are moved as placements, in the world
+    // (`placements_moved`): their names and vectors stay as given.
+    if id == "solid.move" && placements_moved(s, params).is_some() {
+        return None;
+    }
     if id == "timeline.redefine" {
         let cmd = params.get("command")?.as_str()?;
         let key = params.get("feature").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|id| id.to_string())))?;
@@ -348,9 +399,9 @@ pub fn to_local(s: &Session, id: &str, params: &Value) -> Option<Value> {
             && let solidcraft_doc::FeatureKind::Revolve { axis: solidcraft_doc::AxisRef::Line { origin, dir }, .. } = &feature.kind
         {
             let frame = context.active_component_frame();
-            let displayed = serde_json::json!({"origin":pt(apply_point(&frame,*origin)),"dir":pt(apply_vector(&frame,*dir))});
+            let displayed = serde_json::json!({"origin":pt(apply_point(&frame,origin.0)),"dir":pt(apply_vector(&frame,dir.0))});
             if params.get("params").and_then(|p| p.get("axis")) == Some(&displayed) {
-                inner["axis"] = serde_json::json!({"origin":pt(*origin),"dir":pt(*dir)});
+                inner["axis"] = serde_json::json!({"origin":pt(origin.0),"dir":pt(dir.0)});
             }
         }
         let points = match (&feature.kind, cmd) {
@@ -360,18 +411,29 @@ pub fn to_local(s: &Session, id: &str, params: &Value) -> Option<Value> {
         };
         for (key, point) in points {
             if let Some(point) = point {
-                let displayed = pt(apply_point(&context.active_component_frame(), point));
+                let displayed = pt(apply_point(&context.active_component_frame(), point.0));
                 if params.get("params").and_then(|p| p.get(key)) == Some(&displayed) {
-                    inner[key] = pt(point);
+                    inner[key] = pt(point.0);
                 }
+            }
+        }
+        // Edit Feature passes a primitive's placement through as saved (it can hold
+        // expressions), as `timeline.inspect` reports it: mapping it again would move a
+        // primitive in a moved component (#2926).
+        for (key, saved) in primitive_placement(&feature.kind, cmd) {
+            if params.get("params").and_then(|p| p.get(key)).is_some_and(|given| same_coordinates(given, &saved)) {
+                inner[key] = saved;
             }
         }
         let mut out = params.clone();
         out["params"] = inner;
         return Some(out);
     }
-    // Exact face capture retains the original world pick and occurrence identity.
-    if matches!(id, "sketch.create" | "sketch.redefine") && params.get("plane").and_then(|plane| plane.get("face")).is_some() {
+    // Exact face capture retains the original world pick and occurrence identity; an explicit
+    // plane with `frame: "component"` is already in the component's own coordinates (#6000).
+    if matches!(id, "sketch.create" | "sketch.redefine")
+        && (params.get("plane").and_then(|plane| plane.get("face")).is_some() || params.get("frame").and_then(Value::as_str) == Some("component"))
+    {
         return None;
     }
     let keys = table(id);
@@ -388,8 +450,20 @@ pub fn to_local(s: &Session, id: &str, params: &Value) -> Option<Value> {
         command_frames.active = frame;
         command_frames.sketch = frame;
     }
-    let mut m = Mapper { s, f: command_frames, first: None, changed: false, here: false };
-    let body = obj.get("body").and_then(Value::as_str).map(str::to_string);
+    // A move has no picks: its vector, axis and pivot are in the world and turn with the frame
+    // of the bodies it moves (an imported part stood upright moved up goes up, not along its
+    // own frame's z). A turn with no pivot is about the world origin.
+    let first = (id == "solid.move")
+        .then(|| obj.get("bodies").and_then(Value::as_array)?.first()?.as_str())
+        .flatten()
+        .and_then(|b| command_frames.bodies(s).iter().find(|(world, own, _)| world == b || own == b).map(|(.., m)| *m));
+    let mut obj = obj.clone();
+    if first.is_some() && obj.contains_key("axis") && !obj.contains_key("origin") {
+        obj.insert("origin".into(), serde_json::json!([0.0, 0.0, 0.0]));
+    }
+    let obj = &obj;
+    let mut m = Mapper { s, f: command_frames, first, changed: false, here: false };
+    let body = obj.get("body").or_else(|| obj.get("face_body")).and_then(Value::as_str).map(str::to_string);
     let mut out: Map<String, Value> = obj.clone();
     // Picks first: their frame turns the directions.
     for pass in [true, false] {
@@ -404,6 +478,10 @@ pub fn to_local(s: &Session, id: &str, params: &Value) -> Option<Value> {
                 Picks => m.picks(v, body.as_deref()),
                 Make => m.make(v),
                 Dir => m.dir(v),
+                Moved => {
+                    let frame = m.first.unwrap_or(m.f.active);
+                    vec3(v).and_then(|p| m.local_point(&frame, p))
+                }
                 Axis => {
                     if let Some(axis) = v.as_object() {
                         let mut axis = axis.clone();
@@ -446,6 +524,95 @@ pub fn to_local(s: &Session, id: &str, params: &Value) -> Option<Value> {
     m.changed.then_some(Value::Object(out))
 }
 
+/// A primitive's saved placement inputs, in its component's frame, for redefining it with `cmd`.
+fn primitive_placement(kind: &solidcraft_doc::FeatureKind, cmd: &str) -> Vec<(&'static str, Value)> {
+    use solidcraft_doc::FeatureKind as Feature;
+    let point = |p: &solidcraft_doc::PointExpr| {
+        Value::Array(
+            p.iter()
+                .map(|e| e.as_str().trim().parse::<f64>().ok().filter(|x| x.is_finite()).map_or_else(|| Value::from(e.as_str()), Value::from))
+                .collect(),
+        )
+    };
+    match (kind, cmd) {
+        (Feature::Box { corner, .. }, "solid.box") => vec![("corner", point(corner))],
+        (Feature::Sphere { center, .. }, "solid.sphere") | (Feature::Torus { center, .. }, "solid.torus") => vec![("center", point(center))],
+        (Feature::Cylinder { base, axis, .. }, "solid.cylinder") | (Feature::Coil { base, axis, .. }, "solid.coil") => {
+            vec![("base", point(base)), ("axis", pt(axis.0))]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Do two coordinate lists hold the same values (`0` and `0.0` and `"0"` alike, expressions
+/// by their text)?
+fn same_coordinates(a: &Value, b: &Value) -> bool {
+    let number = |v: &Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
+    match (a.as_array(), b.as_array()) {
+        (Some(a), Some(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(x, y)| match (number(x), number(y)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => x.as_str().map(str::trim).is_some_and(|x| Some(x) == y.as_str().map(str::trim)),
+                })
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 #[path = "frames_tests.rs"]
 mod tests;
+
+/// What a `solid.move` of the placed model moves as placements (#4768). A part placed more than
+/// once (an imported assembly's screws or fan corners) is one body: moving it once per placement
+/// listed moved it that many times, each placement turning the move its own way, so the copies
+/// flew apart. When `bodies` name one part through two or more placements, each listed body's
+/// placement is moved instead, in the world, as `occurrence.move` moves it. A placement held by
+/// a rigid group (an imported assembly) moves with the outermost placement that holds it, and one
+/// inside another placement being moved is not moved again. Bodies of the root component, which
+/// have no placement, are moved as bodies (`bodies`). `None`: an ordinary move of bodies (no part
+/// named through two placements, or a copy).
+pub(crate) struct PlacementMove {
+    /// Occurrence paths (root first) to move.
+    pub paths: Vec<Vec<u64>>,
+    /// Root-component bodies listed, moved as bodies.
+    pub bodies: Vec<String>,
+}
+
+pub(crate) fn placements_moved(s: &Session, params: &Value) -> Option<PlacementMove> {
+    if params.get("copy").and_then(Value::as_bool) == Some(true) || !placed(s) {
+        return None;
+    }
+    let names: Vec<&str> = params.get("bodies")?.as_array()?.iter().filter_map(Value::as_str).collect();
+    let st = s.model.state();
+    let doc = s.placed_document();
+    let frames = doc.body_frames_with_source(&st);
+    let listed: Vec<&(String, String, u64, Vec<u64>, Mat)> = names.iter().filter_map(|n| frames.iter().find(|f| f.0 == *n)).collect();
+    // One part (a component's body) named through two different placements.
+    let repeated = listed.iter().enumerate().any(|(i, a)| listed[..i].iter().any(|b| b.1 == a.1 && b.2 == a.2 && b.3 != a.3));
+    if !repeated {
+        return None;
+    }
+    let mut paths: Vec<Vec<u64>> = Vec::new();
+    let mut bodies = Vec::new();
+    for (world, _, _, path, _) in listed {
+        if path.is_empty() {
+            bodies.push(world.clone());
+            continue;
+        }
+        // Up through the rigid groups that hold it (as `occurrence.move` asks for).
+        let mut k = path.len();
+        while k > 1 && path.get(k - 1).is_some_and(|o| s.held_by_rigid_group(*o).is_some()) {
+            k -= 1;
+        }
+        let target = path[..k].to_vec();
+        if !paths.contains(&target) {
+            paths.push(target);
+        }
+    }
+    // A placement inside another one being moved goes with it.
+    let all = paths.clone();
+    paths.retain(|p| !all.iter().any(|q| q.len() < p.len() && p.starts_with(q)));
+    Some(PlacementMove { paths, bodies })
+}

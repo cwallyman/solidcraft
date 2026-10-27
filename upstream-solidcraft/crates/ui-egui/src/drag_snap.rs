@@ -1,8 +1,8 @@
-//! Snapping while a sketch point or a line is dragged, like Fusion: the dragged point snaps to
-//! other points (ends, centres, the origin, projected points), to the middle of a line and onto
-//! curves, and lines up horizontally or vertically with other points (a dashed guide). Letting
-//! go on a point, a midpoint or a curve adds the matching constraint; lining up adds none. Ctrl
-//! or Alt held: no snapping (here and while drawing).
+//! Snapping while a sketch point or a line is dragged: the dragged point snaps to other points
+//! (ends, centres, the origin, projected points), to the middle of a line and onto curves, and
+//! lines up horizontally or vertically with other points (a dashed guide). Letting go on a point,
+//! a midpoint or a curve adds the matching constraint; lining up adds none. The suppress-snap
+//! chord is configurable (default Ctrl/Cmd or Alt/Option; see `prefs::suppress_sketch_snap`).
 
 use std::cell::{Cell, RefCell};
 
@@ -60,7 +60,7 @@ thread_local! {
     static SUPPRESSED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Ctrl or Alt held this frame (no snapping).
+/// Whether sketch snap is suppressed this frame (set from the viewport via `prefs::suppress_sketch_snap_held`).
 pub fn set_suppressed(on: bool) {
     SUPPRESSED.with(|s| s.set(on));
 }
@@ -90,7 +90,9 @@ pub fn find(sk: &Sketch, moving: &[(usize, Vec2)], exclude: &[usize], mm_px: f64
         return keep(None);
     }
     let id = |i: usize| sk.points.get(i).map(|p| p.id.clone()).unwrap_or_default();
-    let targets: Vec<(usize, Vec2)> = sk.points.iter().enumerate().filter(|(i, _)| !exclude.contains(i)).map(|(i, p)| (i, p.pos)).collect();
+    let visible = solidcraft_engine::view::SketchPointVisibility::new(sk);
+    let targets: Vec<(usize, Vec2)> =
+        sk.points.iter().enumerate().filter(|(i, p)| !exclude.contains(i) && visible.takes(p)).map(|(i, p)| (i, p.pos)).collect();
     let free_curves: Vec<usize> =
         (0..sk.curves.len()).filter(|&c| sk.curves.get(c).is_some_and(|cu| !exclude.iter().any(|&p| cu.kind.uses(p)))).collect();
     let mut best: Option<(f64, Snap)> = None;
@@ -229,8 +231,8 @@ pub fn show(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let label = s.label();
     if !label.is_empty() {
         let r = egui::Rect::from_min_size(sp + egui::vec2(12.0, -24.0), egui::vec2(24.0, 14.0));
-        painter.rect_filled(r, 3.0, tk.accent_soft);
-        painter.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.0), tk.text);
+        painter.rect_filled(r, tk.radius_sm.saturating_sub(1), tk.accent_soft);
+        painter.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(crate::theme::Tokens::get().font_micro), tk.text);
     }
     crate::scenario::publish_count("drag_guides", s.guides.len() as f64);
 }

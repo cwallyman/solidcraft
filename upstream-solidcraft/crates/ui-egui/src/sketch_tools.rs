@@ -3,6 +3,8 @@
 //! tools for free-form curves and slots, text placement, and constraint glyphs. Like `tools`,
 //! these are UI state only: every action runs a command.
 
+use crate::icons::markers::glyph_icon;
+use crate::icons::markers::glyph_letter;
 use std::cell::{Cell, RefCell};
 
 use egui::{Pos2, Stroke};
@@ -10,12 +12,62 @@ use serde_json::{Value, json};
 use solidcraft_engine::geom::{Vec2, Vec3};
 
 use crate::SolveApp;
+use crate::tool_modifiers::{Audit, Binding, Match, ModAction, ModifierCombo, Scope, ToolModifiers, Trigger};
 use crate::tools::{Kind, Tool};
-use crate::viewport::{Hit, Proj, pick, sketch_point_at};
+use crate::viewport::{Hit, Proj, pick_for_tool as pick, sketch_point_at};
+
+const DRAW_SCOPES: &[Scope] = &[Scope::SketchDraw, Scope::SketchDrag];
+const NONE: &[Scope] = &[];
+
+const ISOCURVE_ALT: &[Binding] = &[Binding {
+    action: ModAction::IsoCurveAlternate,
+    defaults: &[ModifierCombo::SHIFT],
+    matching: Match::AtLeast,
+    trigger: Trigger::Press,
+    rebindable: true,
+}];
+
+/// Per-tool modifier descriptors owned by this host file.
+pub const MODIFIERS: &[ToolModifiers] = &[
+    ToolModifiers { tool: "sketch.project", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.intersect", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.include_3d", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.fit_curves_to_section", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.isoparametric_curve", scopes: NONE, bindings: ISOCURVE_ALT, audit: Audit::Implemented },
+    ToolModifiers { tool: "inspect.curvature_comb", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "inspect.minimum_radius", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "inspect.center_of_mass", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "inspect.isocurve", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "canvas.insert", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "canvas.decal", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.trim", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.extend", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.break", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.line.midpoint", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.arc.tangent", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.ellipse", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.conic", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.slot.center_point", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.slot.arc_three_point", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.slot.arc_center", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.spline.fit_point", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.spline.control_point", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.spline.control_point_5", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.text", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.edit_text", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.blend_curve", scopes: DRAW_SCOPES, bindings: &[], audit: Audit::Implemented },
+    ToolModifiers { tool: "sketch.constraint.curvature", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.circle.two_tangent", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.circle.three_tangent", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.constrainer", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.constraint.polygon", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.centerline", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.project_to_surface", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.intersection_curve", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.spun_profile", scopes: NONE, bindings: &[], audit: Audit::VerifiedNoOp },
+];
 
 thread_local! {
-    /// A placed text waiting for its string (position, text so far).
-    static TEXT: RefCell<Option<(Vec2, String)>> = const { RefCell::new(None) };
     /// Shift held this frame.
     static SHIFT: Cell<bool> = const { Cell::new(false) };
     /// Glyphs drawn this frame (constraint id, screen centre) and the selected one.
@@ -34,42 +86,78 @@ thread_local! {
     static ISO: RefCell<Vec<Vec<[Vec3; 2]>>> = const { RefCell::new(Vec::new()) };
     /// Center of Mass has just started: measure everything on the next frame.
     static DEFERRED: Cell<bool> = const { Cell::new(false) };
+    /// A Trim drag: the pieces its path would remove (sketch polylines), and where the path's
+    /// last point is on screen.
+    static TRIM_REMOVED: RefCell<Vec<Vec<Vec2>>> = const { RefCell::new(Vec::new()) };
+    static TRIM_LAST: Cell<Option<Pos2>> = const { Cell::new(None) };
 }
 
-/// Commands registered on one panel that Fusion also lists on another: the analyses (sketch
-/// INSPECT) on SOLID INSPECT, and Interference (SOLID INSPECT) on sketch INSPECT.
-const ALSO_IN: &[(&str, &str, &str)] = &[
-    ("SOLID", "INSERT", "sketch.insert_dxf"),
-    ("SOLID", "INSERT", "sketch.insert_svg"),
-    ("SOLID", "INSPECT", "inspect.zebra"),
-    ("SOLID", "INSPECT", "inspect.draft"),
-    ("SOLID", "INSPECT", "inspect.curvature_map"),
-    ("SOLID", "INSPECT", "inspect.environment_map"),
-    ("SOLID", "INSPECT", "inspect.accessibility"),
-    ("SOLID", "INSPECT", "inspect.minimum_radius"),
-    ("SOLID", "INSPECT", "inspect.isocurve"),
-    ("SOLID", "INSPECT", "inspect.curvature_comb"),
-    ("SOLID", "INSPECT", "inspect.center_of_mass"),
-    ("SKETCH", "INSPECT", "inspect.interference"),
-];
+/// Screen distance the pointer moves before a Trim drag's path takes another point.
+const TRIM_STEP_PX: f32 = 4.0;
 
-/// A panel's commands plus the ones it shares with another panel (see [`ALSO_IN`]).
-pub fn also_in<'a>(
-    tab: &str,
-    panel: &str,
-    mut cmds: Vec<&'a solidcraft_engine::CommandSpec>,
-    specs: &[&'a solidcraft_engine::CommandSpec],
-) -> Vec<&'a solidcraft_engine::CommandSpec> {
-    for (t, p, id) in ALSO_IN {
-        if *t == tab
-            && *p == panel
-            && !cmds.iter().any(|c| c.id == *id)
-            && let Some(c) = specs.iter().find(|c| c.id == *id)
-        {
-            cmds.push(c);
-        }
+/// The sketch-plane position under screen position `pos`.
+fn on_sketch_plane(app: &SolveApp, proj: &Proj, pos: Pos2) -> Option<Vec2> {
+    let st = app.session.world_state();
+    let ss = st.sketch(active_sketch(app)?)?;
+    let (o, d) = proj.ray(pos);
+    ss.plane.intersect_ray(o, d).map(|w| ss.plane.to_local(w))
+}
+
+/// A press and drag with Trim draws a path from `press`; true when it started one. Each piece
+/// the path crosses is trimmed when it is let go (`sketch.trim.path`).
+pub fn trim_drag_start(app: &mut SolveApp, proj: &Proj, press: Pos2) -> bool {
+    let Some(q) = on_sketch_plane(app, proj, press) else { return false };
+    let Some(tool) = app.tool.as_mut().filter(|t| t.cmd == "sketch.trim") else { return false };
+    tool.pts = vec![(q, None)];
+    TRIM_LAST.with(|c| c.set(Some(press)));
+    TRIM_REMOVED.with(|r| r.borrow_mut().clear());
+    true
+}
+
+/// The Trim drag's path reaches `pos`: the pieces it would remove light up (a dry run of the
+/// command the release runs).
+pub fn trim_drag_to(app: &mut SolveApp, proj: &Proj, pos: Pos2) {
+    if TRIM_LAST.with(Cell::get).is_some_and(|last| last.distance(pos) < TRIM_STEP_PX) {
+        return;
     }
-    cmds
+    let Some(q) = on_sketch_plane(app, proj, pos) else { return };
+    let Some(tool) = app.tool.as_mut().filter(|t| t.cmd == "sketch.trim" && !t.pts.is_empty()) else { return };
+    if tool.pts.len() >= TRIM_PATH_MAX {
+        return;
+    }
+    tool.pts.push((q, None));
+    TRIM_LAST.with(|c| c.set(Some(pos)));
+    let points: Vec<[f64; 2]> = tool.pts.iter().map(|p| [p.0.x, p.0.y]).collect();
+    let removed = app
+        .session
+        .execute("sketch.trim.path", &json!({"points": points, "dry_run": true}))
+        .map(|v| {
+            v["removed"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|piece| piece.as_array().into_iter().flatten().filter_map(solidcraft_engine::params::vec2).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+    TRIM_REMOVED.with(|r| *r.borrow_mut() = removed);
+}
+
+/// Most points a Trim drag's path keeps (the command's limit).
+const TRIM_PATH_MAX: usize = 2_000;
+
+/// The Trim drag is let go: trim every piece its path crossed, in one undo step. False when the
+/// path crossed nothing (the caller takes the release as a click).
+pub fn trim_drag_end(app: &mut SolveApp) -> bool {
+    TRIM_LAST.with(|c| c.set(None));
+    let crossed = TRIM_REMOVED.with(|r| !std::mem::take(&mut *r.borrow_mut()).is_empty());
+    let Some(tool) = app.tool.as_mut().filter(|t| t.cmd == "sketch.trim") else { return false };
+    let points: Vec<[f64; 2]> = std::mem::take(&mut tool.pts).iter().map(|p| [p.0.x, p.0.y]).collect();
+    if !crossed || points.len() < 2 {
+        return false;
+    }
+    let _ = app.run("sketch.trim.path", json!({"points": points}));
+    true
 }
 
 /// Run an analysis and keep its result as a marker.
@@ -83,6 +171,46 @@ fn analysis(app: &mut SolveApp, cmd: &str, p: Value) {
         MARKS.with(|k| k.borrow_mut().push(m));
     } else if cmd == "inspect.minimum_radius" {
         app.set_status("Minimum radius: it is straight (no curvature)", false);
+    }
+}
+
+/// A seam from an `inspect.continuity` reply as a marker label: its class and the measure that
+/// decided it (the gap, the angle between the faces' normals, or the curvature jump).
+fn continuity_label(app: &SolveApp, seam: &Value) -> String {
+    let deg = |key: &str| seam[key]["value"].as_f64().map(|x| format!("{x:.3}\u{b0}")).unwrap_or_default();
+    let jump = seam["curvature_jump_per_mm"]["value"].as_f64().map(|k| format!("\u{394}k {k:.4}/mm")).unwrap_or_default();
+    match seam["verdict"].as_str().unwrap_or_default() {
+        "gap" => format!("Gap {}", seam["gap_mm"]["value"].as_f64().map(|g| crate::prefs::show_mm(app, g, 1)).unwrap_or_default()),
+        "sharp" => format!("G0 {}", deg("normal_angle_deg")),
+        "curvature_jump" => format!("G1 {} {jump}", deg("normal_angle_deg")),
+        "smooth" => format!("G2 {} {jump}", deg("normal_angle_deg")),
+        other => other.to_string(),
+    }
+}
+
+/// The Continuity Analysis legend in the viewport's lower left corner: each class in its
+/// colour, while seams are shaded.
+fn continuity_legend(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
+    if app.session.continuity.is_empty() {
+        return;
+    }
+    let tk = crate::theme::Tokens::get();
+    let [smooth, jump, sharp, gap] = tk.continuity;
+    // Stable ids: this Gap is a hole between faces, not the sheet-metal gap (`ui.sheet_gap`).
+    let tr = crate::i18n::tr;
+    let rows = [(tr("ui.continuity_g2"), smooth), (tr("ui.continuity_g1"), jump), (tr("ui.continuity_g0"), sharp), (tr("ui.continuity_gap"), gap)];
+    let font = egui::FontId::proportional(tk.font_body);
+    let (row, pad, swatch) = (18.0, 8.0, 22.0);
+    let text_width = rows.iter().map(|(label, _)| painter.layout_no_wrap(label.to_string(), font.clone(), tk.text).size().x).fold(0.0, f32::max);
+    let size = egui::vec2(pad + swatch + 8.0 + text_width + pad, rows.len() as f32 * row + 2.0 * pad);
+    let available = crate::shell::bottom_overlay_rect(app, proj.rect);
+    let frame = egui::Rect::from_min_size(available.left_bottom() + egui::vec2(16.0, -(size.y + 16.0)), size);
+    painter.rect_filled(frame, tk.radius_sm, tk.panel.gamma_multiply(0.9));
+    crate::scenario::publish_rect("continuity_legend", frame);
+    for (i, (label, col)) in rows.iter().enumerate() {
+        let y = frame.top() + pad + row * (i as f32 + 0.5);
+        painter.line_segment([egui::pos2(frame.left() + pad, y), egui::pos2(frame.left() + pad + swatch, y)], Stroke::new(3.0, *col));
+        painter.text(egui::pos2(frame.left() + pad + swatch + 8.0, y), egui::Align2::LEFT_CENTER, *label, font.clone(), tk.text);
     }
 }
 
@@ -106,7 +234,7 @@ fn iso_lines(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
 
 /// Analysis markers: a target with its label.
 fn marks(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
-    if !app.tool.as_ref().is_some_and(|t| matches!(t.cmd, "inspect.minimum_radius" | "inspect.center_of_mass")) {
+    if !app.tool.as_ref().is_some_and(|t| matches!(t.cmd, "inspect.minimum_radius" | "inspect.center_of_mass" | "inspect.continuity")) {
         MARKS.with(|m| m.borrow_mut().clear());
         return;
     }
@@ -117,9 +245,21 @@ fn marks(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
             painter.circle(q, 6.0, tk.panel.gamma_multiply(0.8), Stroke::new(1.6, tk.accent));
             painter.line_segment([q - egui::vec2(10.0, 0.0), q + egui::vec2(10.0, 0.0)], Stroke::new(1.2, tk.accent));
             painter.line_segment([q - egui::vec2(0.0, 10.0), q + egui::vec2(0.0, 10.0)], Stroke::new(1.2, tk.accent));
-            let r = painter.text(q + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(12.0), tk.text);
-            painter.rect_filled(r.expand(3.0), 3.0, tk.panel.gamma_multiply(0.85));
-            painter.text(q + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(12.0), tk.text);
+            let r = painter.text(
+                q + egui::vec2(12.0, -12.0),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::proportional(crate::theme::Tokens::get().font_body),
+                tk.text,
+            );
+            painter.rect_filled(r.expand(3.0), tk.radius_sm.saturating_sub(1), tk.panel.gamma_multiply(0.85));
+            painter.text(
+                q + egui::vec2(12.0, -12.0),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::proportional(crate::theme::Tokens::get().font_body),
+                tk.text,
+            );
         }
     });
 }
@@ -151,6 +291,25 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
         }
         return false;
     }
+    if id == "inspect.continuity" {
+        // Every edge of the shown bodies at once; the tool stays for clicking single edges. With
+        // seams shaded, the button turns the analysis off.
+        MARKS.with(|m| m.borrow_mut().clear());
+        if !app.session.continuity.is_empty() {
+            if app.run(id, json!({"clear": true})).is_ok() {
+                app.set_status("Analysis off", false);
+            }
+            return false;
+        }
+        let Ok(v) = app.run(id, json!({})) else { return false };
+        let summary = &v["summary"];
+        let counts: Vec<String> = [("smooth", "G2"), ("curvature_jump", "G1"), ("sharp", "G0"), ("gap", "gap")]
+            .iter()
+            .filter_map(|(key, class)| summary[*key].as_u64().filter(|n| *n > 0).map(|n| format!("{n} {class}")))
+            .collect();
+        app.set_status(format!("Continuity: {} (click the button again to turn it off)", counts.join(", ")), false);
+        return true;
+    }
     if id == "inspect.center_of_mass" {
         // The whole model at once; the tool stays for picking single bodies.
         MARKS.with(|m| m.borrow_mut().clear());
@@ -167,10 +326,16 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
     if !matches!(id, "canvas.insert" | "canvas.decal") {
         return true;
     }
-    let path = app.services.pick_open.as_ref().and_then(|f| f());
-    let ok = path.is_some();
-    IMAGE.with(|i| *i.borrow_mut() = path);
-    ok
+    let command = id.to_string();
+    // Offer the image types first: the default Open filter lists only designs and meshes.
+    app.pick_open_for(&["png", "jpg", "jpeg"], move |app, path| {
+        if let Some(path) = path {
+            IMAGE.with(|i| *i.borrow_mut() = Some(path));
+            app.last_command = solidcraft_engine::find_command(&command).map(|spec| (spec.id.into(), spec.label.into()));
+            app.tool = crate::tools::Tool::for_command(&command);
+        }
+    });
+    false
 }
 
 fn v3(v: &Value) -> Option<Vec3> {
@@ -197,9 +362,9 @@ fn combs(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     });
 }
 
-/// Snap a cursor point on the sketch plane to what Fusion infers while drawing: a line's
-/// midpoint, or alignment (horizontal/vertical) with the previous point of the tool. None:
-/// nothing near, use the grid.
+/// Snap a cursor point on the sketch plane to what is inferred while drawing: a crossing of
+/// two curves, a line's midpoint, or alignment (horizontal/vertical) with the previous point
+/// of the tool. None: nothing near, use the grid.
 pub fn refine_snap(
     app: &SolveApp,
     proj: &Proj,
@@ -219,17 +384,30 @@ pub fn refine_snap(
             return Some((plane.to_local(point), Some(format!("vertex:{},{},{}", point.x, point.y, point.z))));
         }
     }
+    let mid_only = crate::tool_modifiers::target_midpoint();
+    // Shift midpoint mode: widen the midpoint capture a little and skip other inferences.
+    let mid_tol = if mid_only { tol * 1.5 } else { tol };
     let mut best: Option<(f64, &'static str, Vec2)> = None;
     let mut mid_of: Option<String> = None;
-    for (i, c) in sk.curves.iter().enumerate() {
-        if let solidcraft_engine::sketch::CurveKind::Line { .. } = c.kind
-            && let Some(solidcraft_engine::sketch::Shape::Line { a, b }) = sk.shape(i)
-        {
-            let m = (a + b) * 0.5;
-            let d = m.dist(lp);
-            if d < tol && best.is_none_or(|x| d < x.0) {
-                best = Some((d, "Mid", m));
-                mid_of = Some(c.id.clone());
+    // A crossing of two curves, before a midpoint or a point on one curve.
+    if !mid_only
+        && let Some((q, i, j)) = solidcraft_engine::sketch::nearest_curve_intersection(sk, lp, tol)
+        && let (Some(a), Some(b)) = (sk.curves.get(i), sk.curves.get(j))
+    {
+        best = Some((q.dist(lp), "X", q));
+        mid_of = Some(format!("{}+{}:{},{}", a.id, b.id, q.x, q.y));
+    }
+    if best.is_none() {
+        for (i, c) in sk.curves.iter().enumerate() {
+            if let solidcraft_engine::sketch::CurveKind::Line { .. } = c.kind
+                && let Some(solidcraft_engine::sketch::Shape::Line { a, b }) = sk.shape(i)
+            {
+                let m = (a + b) * 0.5;
+                let d = m.dist(lp);
+                if d < mid_tol && best.is_none_or(|x| d < x.0) {
+                    best = Some((d, "Mid", m));
+                    mid_of = Some(c.id.clone());
+                }
             }
         }
     }
@@ -243,17 +421,28 @@ pub fn refine_snap(
         }
         None => PREV.with(Cell::get),
     };
-    // Line tool: the tangent point of a circle or arc (before plain "on the curve").
+    // Line tool: the tangent point of a circle or arc, then a line through its centre
+    // (before plain "on the curve", which would leave a chord free to miss the centre).
     let line_tool = app.tool.as_ref().is_none_or(|t| t.cmd == "sketch.line");
-    if best.is_none()
+    if !mid_only
+        && best.is_none()
         && line_tool
         && let Some(prev) = prev
         && let Some(i) = crate::inference::tangent(sk, prev, lp, tol)
     {
         best = Some((i.dist, i.label(), i.at));
     }
+    if !mid_only
+        && best.is_none()
+        && line_tool
+        && let Some(prev) = prev
+        && let Some(i) = crate::inference::through_center(sk, prev, lp, tol)
+    {
+        best = Some((i.dist, i.label(), i.at));
+        mid_of = i.arg;
+    }
     // On a curve (coincident with it).
-    if best.is_none() {
+    if !mid_only && best.is_none() {
         for (i, c) in sk.curves.iter().enumerate() {
             let Some(sh) = sk.shape(i) else { continue };
             let d = sh.dist(lp);
@@ -264,7 +453,8 @@ pub fn refine_snap(
             }
         }
     }
-    if best.is_none()
+    if !mid_only
+        && best.is_none()
         && let Some(prev) = prev
     {
         let (dx, dy) = ((lp.x - prev.x).abs(), (lp.y - prev.y).abs());
@@ -278,7 +468,8 @@ pub fn refine_snap(
         }
     }
     // Line tool: parallel or perpendicular to a line, or on a line's extension.
-    if best.is_none()
+    if !mid_only
+        && best.is_none()
         && line_tool
         && let Some(prev) = prev
         && let Some(i) = crate::inference::lines(sk, prev, lp, tol)
@@ -287,14 +478,62 @@ pub fn refine_snap(
     }
     SNAP.with(|s| *s.borrow_mut() = best.map(|(_, l, p)| (l, p)));
     // A midpoint snap is a point argument the commands understand ("mid:<line>").
+    // "x:a+b:x,y" is a crossing of two curves; "on:<curve>:x,y" is a point on one curve.
     best.map(|(_, l, p)| {
         let arg = match l {
+            "X" => mid_of.map(|m| format!("x:{m}")),
             "Mid" => mid_of.map(|m| format!("mid:{m}")),
             "On" => mid_of.map(|m| format!("on:{m}")),
+            // Already a point argument (`<id>.center` or `on:<id>:x,y`), or none for a free point.
+            "Ctr" => mid_of,
             _ => None,
         };
         (p, arg)
     })
+}
+
+/// The constraints one glyph stands for. A point that is the midpoint of several lines (their
+/// midpoints meet) shows a single MidPoint glyph, the first constraint's, for all of them;
+/// any other constraint stands for itself.
+pub fn glyph_group(sk: &solidcraft_engine::sketch::Sketch, id: &str) -> Vec<String> {
+    use solidcraft_engine::sketch::ConstraintKind::Midpoint;
+    match sk.constraints.iter().find(|c| c.id == id).map(|c| (c.kind.clone(), c.driven)) {
+        Some((Midpoint { p, .. }, false)) => {
+            sk.constraints.iter().filter(|c| !c.driven && matches!(c.kind, Midpoint { p: q, .. } if q == p)).map(|c| c.id.clone()).collect()
+        }
+        _ => vec![id.to_string()],
+    }
+}
+
+/// What deleting glyph `id` removes: the constraints it stands for, and, for one MidPoint glyph
+/// shared by several lines, their common point once nothing else holds it (it only tied the
+/// midpoints together, so it would be left floating).
+pub fn glyph_deletion(sk: &solidcraft_engine::sketch::Sketch, id: &str) -> Vec<solidcraft_engine::Sel> {
+    use solidcraft_engine::{Sel, sketch::ConstraintKind::Midpoint};
+    let group = glyph_group(sk, id);
+    let shared = match sk.constraints.iter().find(|c| c.id == id).map(|c| &c.kind) {
+        Some(Midpoint { p, .. }) if group.len() > 1 => Some(*p),
+        _ => None,
+    };
+    let orphan = shared.filter(|&p| {
+        !sk.curves.iter().any(|c| c.kind.uses(p))
+            && !sk.constraints.iter().any(|c| !group.contains(&c.id) && c.kind.indices().0.contains(&p))
+            && sk.points.get(p).is_some_and(|q| !q.fixed && q.link.is_none() && q.exprs.is_none())
+    });
+    let mut out: Vec<Sel> = group.into_iter().map(|id| Sel::SketchConstraint { id }).collect();
+    if let Some(q) = orphan.and_then(|p| sk.points.get(p)) {
+        out.push(Sel::SketchPoint { id: q.id.clone() });
+    }
+    out
+}
+
+/// [`glyph_deletion`] in the active sketch.
+pub fn active_glyph_deletion(app: &SolveApp, id: &str) -> Vec<solidcraft_engine::Sel> {
+    let st = app.session.world_state();
+    match active_sketch(app).and_then(|s| st.sketch(s)) {
+        Some(ss) => glyph_deletion(&ss.sketch, id),
+        None => vec![solidcraft_engine::Sel::SketchConstraint { id: id.to_string() }],
+    }
 }
 
 /// The constraint glyph under a screen position (its constraint id).
@@ -307,24 +546,17 @@ pub fn glyph_positions() -> Vec<(String, Pos2)> {
     GLYPHS.with(|g| g.borrow().clone())
 }
 
-/// A click on a constraint glyph selects it (true: the click was used).
-pub fn click_glyph(app: &mut SolveApp, _proj: &Proj, pos: Pos2) -> bool {
-    if app.session.active_sketch.is_none() {
-        return false;
-    }
-    let hit = GLYPHS.with(|g| g.borrow().iter().find(|(_, c)| c.distance(pos) <= GLYPH * 0.6).map(|(id, _)| id.clone()));
-    let used = hit.is_some();
-    PICKED.with(|p| *p.borrow_mut() = hit.clone());
-    if let Some(id) = hit {
-        app.set_status(format!("Constraint {id} selected: Delete removes it"), false);
-    }
-    used
-}
-
 /// Delete the selected constraint glyph (true when one was selected).
 pub fn delete_glyph(app: &mut SolveApp) -> bool {
     let Some(id) = PICKED.with(|p| p.borrow_mut().take()) else { return false };
-    let _ = app.run("sketch.delete", json!({"entities": [id]}));
+    let entities: Vec<String> = active_glyph_deletion(app, &id)
+        .into_iter()
+        .filter_map(|s| match s {
+            solidcraft_engine::Sel::SketchConstraint { id } | solidcraft_engine::Sel::SketchPoint { id } => Some(id),
+            _ => None,
+        })
+        .collect();
+    let _ = app.run("sketch.delete", json!({ "entities": entities }));
     true
 }
 
@@ -339,17 +571,25 @@ enum Mode {
     Points(usize),
     /// Pick sketch entities; `n` run the command (0: until right-click).
     Entities(usize),
-    /// Pick entities until right-click, then one more pick or point (mirror line, centre).
-    EntitiesThen,
     /// Model faces / sketch curves in steps (see the command).
     Steps,
+}
+
+/// Whether a click with tool `id` acts on `hit`: what is under the pointer lights up only when
+/// the tool takes it, so the hover shows what a click does and lights nothing over a view the
+/// tool draws (Continuity Analysis's seam colours on a face the tool ignores).
+pub fn takes(id: &str, hit: &Hit) -> bool {
+    match id {
+        "inspect.continuity" => matches!(hit, Hit::Edge { .. }),
+        _ => true,
+    }
 }
 
 fn mode(id: &str) -> Option<Mode> {
     Some(match id {
         "sketch.project" | "sketch.intersect" | "sketch.include_3d" | "sketch.fit_curves_to_section" | "sketch.isoparametric_curve" => Mode::ModelRef,
         "inspect.curvature_comb" | "canvas.insert" | "canvas.decal" => Mode::ModelRef,
-        "inspect.minimum_radius" | "inspect.center_of_mass" | "inspect.isocurve" => Mode::ModelRef,
+        "inspect.minimum_radius" | "inspect.center_of_mass" | "inspect.isocurve" | "inspect.continuity" => Mode::ModelRef,
         "sketch.trim" | "sketch.extend" | "sketch.break" => Mode::CurveAt,
         "sketch.line.midpoint" => Mode::Points(2),
         "sketch.arc.tangent" => Mode::Points(2),
@@ -359,13 +599,10 @@ fn mode(id: &str) -> Option<Mode> {
         "sketch.text" => Mode::Points(1),
         "sketch.edit_text" => Mode::Entities(1),
         "sketch.blend_curve" => Mode::Points(2),
-        "sketch.offset" => Mode::Entities(1),
-        "sketch.fillet" | "sketch.chamfer.equal_distance" | "sketch.chamfer.distance_angle" | "sketch.chamfer.two_distance" => Mode::Entities(1),
         "sketch.constraint.curvature" | "sketch.circle.two_tangent" => Mode::Entities(2),
         "sketch.circle.three_tangent" => Mode::Entities(3),
         "sketch.constrainer" | "sketch.constraint.polygon" => Mode::Entities(0),
         "sketch.centerline" => Mode::Entities(1),
-        "sketch.mirror" | "sketch.pattern.circular" | "sketch.pattern.rectangular" => Mode::EntitiesThen,
         "sketch.project_to_surface" | "sketch.intersection_curve" | "sketch.spun_profile" => Mode::Steps,
         _ => return None,
     })
@@ -386,6 +623,7 @@ pub fn tool_for(id: &str) -> Option<Tool> {
         pts: Vec::new(),
         hover: None,
         picks: Vec::new(),
+        point_picks: Vec::new(),
         dims: Vec::new(),
         dim_history: Vec::new(),
         dims_stage: usize::MAX,
@@ -405,15 +643,16 @@ pub fn hint(id: &str) -> Option<String> {
             "inspect.minimum_radius" => "Minimum radius: click sketch curves, edges or faces",
             "inspect.center_of_mass" => "Center of mass of all bodies; click a body for its own",
             "inspect.isocurve" => "Isocurves: click faces",
+            "inspect.continuity" => "Continuity: click an edge for its numbers (the button again turns the colours off)",
             "canvas.insert" => "Canvas: click a plane or a planar face where the image's centre goes",
             "canvas.decal" => "Decal: click a planar face where the image's centre goes",
-            "sketch.trim" => "Trim: click the piece of a curve to remove",
+            "sketch.trim" => "Trim: click the piece of a curve to remove, or drag across the pieces to remove",
             "sketch.extend" => "Extend: click a curve near the end to extend",
             "sketch.break" => "Break: click a curve where it should split",
             "sketch.line.midpoint" => "Midpoint line: click the middle, then an end",
             "sketch.arc.tangent" => "Tangent arc: click the end of a line or arc, then the arc's end",
             "sketch.ellipse" => "Ellipse: click the centre, the end of the major axis, then a point on it",
-            "sketch.conic" => "Conic: click the start, the end, then the apex",
+            "sketch.conic" => "Conic: click the start, the end, then the apex; type Rho to shape it (0.5 is a parabola)",
             "sketch.slot.center_point" => "Slot: click the centre, an arc centre, then the width",
             "sketch.slot.arc_three_point" => "Arc slot: click start, a point on the arc, the end, then the width",
             "sketch.slot.arc_center" => "Arc slot: click the centre, the start, the end, then the width",
@@ -422,20 +661,12 @@ pub fn hint(id: &str) -> Option<String> {
             "sketch.text" => "Text: click where the text starts",
             "sketch.edit_text" => "Edit Text: click a letter interior or outline",
             "sketch.blend_curve" => "Blend curve: click the ends of two curves",
-            "sketch.offset" => "Offset: click a curve (its chain is offset), then the side and distance",
-            "sketch.fillet" => "Fillet: click the corner of two lines",
-            "sketch.chamfer.equal_distance" | "sketch.chamfer.distance_angle" | "sketch.chamfer.two_distance" => {
-                "Chamfer: click the corner of two lines"
-            }
             "sketch.constraint.curvature" => "Curvature: click two curves that share an end",
-            "sketch.circle.two_tangent" => "2-tangent circle: click two curves (the circle goes near the second click)",
+            "sketch.circle.two_tangent" => "2-tangent circle: click two curves (the circle goes between the two clicks)",
             "sketch.circle.three_tangent" => "3-tangent circle: click three curves",
             "sketch.constrainer" => "Constrain: click one or two entities; right-click to apply",
             "sketch.constraint.polygon" => "Polygon: click the lines of a closed chain; right-click to apply",
             "sketch.centerline" => "Centerline: click lines",
-            "sketch.mirror" => "Mirror: click entities, right-click, then click the mirror line",
-            "sketch.pattern.circular" => "Circular pattern: click entities, right-click, then click the centre",
-            "sketch.pattern.rectangular" => "Rectangular pattern: click entities, right-click, then click two points (direction and spacing)",
             "sketch.project_to_surface" => "Project to surface: click curves of other sketches, right-click, then click the face",
             "sketch.intersection_curve" => "Intersection curve: click two faces",
             "sketch.spun_profile" => "Spun profile: click the body, then the axis line",
@@ -450,7 +681,7 @@ fn active_sketch(app: &SolveApp) -> Option<u64> {
 }
 
 /// A model reference for a hit (for Project and friends).
-fn model_ref(app: &SolveApp, h: &Hit) -> Option<Value> {
+pub(crate) fn model_ref(app: &SolveApp, h: &Hit) -> Option<Value> {
     let active = active_sketch(app);
     Some(match h {
         Hit::Vertex { body, point } => json!({"vertex": [point.x, point.y, point.z], "body": body}),
@@ -474,9 +705,31 @@ fn sketch_entity(app: &SolveApp, hits: &[Hit]) -> Option<(String, bool)> {
     })
 }
 
+/// The two editable curves that meet at sketch point `pi`, in curve order, which is the order
+/// the corner commands resolve them in from a `point` parameter. Construction curves are
+/// ignored when more than two meet. Each side must be a line, or an arc for a fillet.
+pub(crate) fn corner_curves(sk: &solidcraft_engine::sketch::Sketch, pi: usize, arcs_ok: bool) -> Option<(usize, usize)> {
+    use solidcraft_engine::sketch::CurveKind;
+    let candidates =
+        sk.curves.iter().enumerate().filter(|(ci, c)| !sk.is_linked_curve(*ci) && c.kind.ends().is_some_and(|(a, b)| a == pi || b == pi));
+    let mut curves: Vec<_> = candidates.clone().take(3).collect();
+    // Center rectangles have construction diagonals at their corners. Match the engine's
+    // corner selection: when more than two curves meet, use the profile sides.
+    if curves.len() > 2 {
+        curves = candidates.filter(|(_, c)| !c.construction).take(3).collect();
+    }
+    if curves.iter().any(|(_, c)| !matches!(c.kind, CurveKind::Line { .. }) && !(arcs_ok && matches!(c.kind, CurveKind::Arc { .. }))) {
+        return None;
+    }
+    match curves[..] {
+        [(a, _), (b, _)] => Some((a, b)),
+        _ => None,
+    }
+}
+
 /// Corner tools accept endpoints shared by two editable curves. Pick among those endpoints
 /// directly so the origin, a circle centre or an overlapping loose point cannot hide a corner.
-pub(super) fn corner_point(app: &SolveApp, proj: &Proj, pos: Pos2, cmd: &str) -> Option<(Vec2, String)> {
+pub(crate) fn corner_point(app: &SolveApp, proj: &Proj, pos: Pos2, arcs_ok: bool) -> Option<(Vec2, String)> {
     let st = app.session.world_state();
     let ss = st.sketch(active_sketch(app)?)?;
     let sk = &ss.sketch;
@@ -488,21 +741,7 @@ pub(super) fn corner_point(app: &SolveApp, proj: &Proj, pos: Pos2, cmd: &str) ->
             if distance >= 8.0 {
                 return None;
             }
-            let curves: Vec<_> = sk
-                .curves
-                .iter()
-                .enumerate()
-                .filter(|(ci, c)| !sk.is_linked_curve(*ci) && c.kind.ends().is_some_and(|(a, b)| a == pi || b == pi))
-                .take(3)
-                .collect();
-            if curves.len() != 2
-                || curves.iter().any(|(_, c)| {
-                    !matches!(c.kind, solidcraft_engine::sketch::CurveKind::Line { .. })
-                        && (cmd != "sketch.fillet" || !matches!(c.kind, solidcraft_engine::sketch::CurveKind::Arc { .. }))
-                })
-            {
-                return None;
-            }
+            corner_curves(sk, pi, arcs_ok)?;
             Some((distance, point.pos, point.id.clone()))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
@@ -525,21 +764,6 @@ fn curve_len(app: &SolveApp, id: &str) -> f64 {
     let st = app.session.world_state();
     let Some(ss) = active_sketch(app).and_then(|s| st.sketch(s)) else { return 10.0 };
     ss.sketch.curve_index(id).map(|c| ss.sketch.polyline(c).windows(2).map(|w| w[0].dist(w[1])).sum::<f64>()).unwrap_or(10.0)
-}
-
-/// Lines meeting at a sketch point.
-fn corner_len(app: &SolveApp, point: &str) -> f64 {
-    let st = app.session.world_state();
-    let Some(ss) = active_sketch(app).and_then(|s| st.sketch(s)) else { return 10.0 };
-    let sk = &ss.sketch;
-    let Some(q) = sk.resolve_point(point) else { return 10.0 };
-    sk.curves
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.kind.uses(q) && matches!(c.kind, solidcraft_engine::sketch::CurveKind::Line { .. }))
-        .map(|(i, _)| sk.polyline(i).windows(2).map(|w| w[0].dist(w[1])).sum::<f64>())
-        .fold(f64::INFINITY, f64::min)
-        .min(1e6)
 }
 
 fn round_nice(x: f64) -> f64 {
@@ -618,6 +842,17 @@ pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) {
                 }
             }
         }
+        Mode::ModelRef if cmd == "inspect.continuity" => {
+            // The edge measured again, added to the seams shown, and its numbers pinned there.
+            let edge = hits.iter().filter(|h| takes(cmd, h)).find_map(|h| if let Hit::Edge { mid, .. } = h { Some(*mid) } else { None });
+            if let Some(mid) = edge
+                && let Ok(v) = app.run(cmd, json!({"edges": [[mid.x, mid.y, mid.z]], "add": true}))
+                && let Some(seam) = v["bodies"][0]["edges"].get(0)
+            {
+                let label = continuity_label(app, seam);
+                MARKS.with(|m| m.borrow_mut().push((mid, label)));
+            }
+        }
         Mode::ModelRef if matches!(cmd, "inspect.minimum_radius" | "inspect.center_of_mass") => {
             let params = hits.iter().find_map(|h| match (cmd, h) {
                 ("inspect.minimum_radius", Hit::SketchCurve { sketch, id, .. }) => Some(json!({"sketch": sketch, "curves": [id]})),
@@ -633,9 +868,13 @@ pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) {
         Mode::ModelRef if matches!(cmd, "canvas.insert" | "canvas.decal") => {
             let Some(path) = IMAGE.with(|i| i.borrow().clone()) else { return };
             let decal = cmd == "canvas.decal";
+            // A plane the view shows edge-on can't show the image: at the origin its square is
+            // under the cursor too, and the image went onto it out of sight (#4717).
+            let (_, ray) = proj.ray(pos);
+            let seen = |name: &str| crate::dialogs::plane_by_name(&app.session, name).is_some_and(|pl| pl.normal().dot(ray).abs() > 0.2 * ray.len());
             let target = hits.iter().find_map(|h| match h {
                 Hit::Face { point, .. } => Some((json!({"face": [point.x, point.y, point.z]}), *point)),
-                Hit::Plane { name, point } if !decal => Some((json!(name), *point)),
+                Hit::Plane { name, point } if !decal && seen(name) => Some((json!(name), *point)),
                 _ => None,
             });
             // Empty space while sketching: the sketch plane.
@@ -695,7 +934,7 @@ pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) {
                 let _ = app.run(cmd, json!({"curve": id, "at": xy(p)}));
             }
         }
-        Mode::Points(n) => {
+        Mode::Points(_) => {
             if periodic_start_snap(app, tool, proj, pos).is_some() {
                 // Only this deliberate click selects periodic interpolation. A
                 // right-click finish and all previously saved splines stay natural.
@@ -707,47 +946,13 @@ pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) {
                 return;
             }
             let Some(p) = at else { return };
-            tool.pts.push(p);
-            if n > 0 && tool.pts.len() >= n {
-                run_points(app, tool);
-                tool.pts.clear();
-            }
+            place_point(app, tool, p);
         }
         Mode::Entities(n) => {
-            if cmd == "sketch.fillet" || cmd.starts_with("sketch.chamfer.") {
-                if let Some((_, id)) = corner_point(app, proj, pos, cmd) {
-                    run_corner(app, cmd, &id);
-                }
-                return;
-            }
-            if cmd == "sketch.offset" && !tool.picks.is_empty() {
-                // Dense derived fit nodes must not snap a nearby side click back
-                // onto the source, reducing a deliberate offset to zero.
-                let state = app.session.world_state();
-                let side = active_sketch(app).and_then(|sid| state.sketch(sid)).and_then(|ss| {
-                    let (o, d) = proj.ray(pos);
-                    ss.plane.intersect_ray(o, d).map(|p| ss.plane.to_local(p))
-                });
-                if let Some(p) = side {
-                    offset_side(app, tool, p);
-                }
-                return;
-            }
-            if cmd == "sketch.offset" {
-                if let Some(sid) = active_sketch(app)
-                    && let Some(id) = hits.iter().find_map(|hit| match hit {
-                        Hit::SketchCurve { sketch, id, .. } if *sketch == sid => Some(id.clone()),
-                        _ => None,
-                    })
-                {
-                    tool.picks.push(id);
-                }
-                return;
-            }
             if cmd == "sketch.edit_text" {
                 let selection = hits.first().and_then(|hit| match hit {
                     Hit::SketchCurve { sketch, id, .. } if Some(*sketch) == active_sketch(app) => {
-                        Some(solidcraft_engine::Sel::SketchCurve { id: id.clone() })
+                        Some(solidcraft_engine::Sel::SketchCurve { id: id.clone(), sketch: None })
                     }
                     Hit::Profile { sketch, index } => Some(solidcraft_engine::Sel::Profile { sketch: *sketch, index: *index }),
                     _ => None,
@@ -772,45 +977,6 @@ pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) {
                 run_entities(app, tool);
                 tool.picks.clear();
                 tool.pts.clear();
-            }
-        }
-        Mode::EntitiesThen => {
-            // Stage 2 (after a right-click) is marked by a "|" pick.
-            if tool.picks.last().is_some_and(|x| x == "|") {
-                let ents: Vec<String> = tool.picks.iter().filter(|x| *x != "|").cloned().collect();
-                match cmd {
-                    "sketch.mirror" => {
-                        if let Some((line, false)) = sketch_entity(app, &hits) {
-                            let _ = app.run(cmd, json!({"entities": ents, "line": line}));
-                            tool.picks.clear();
-                        }
-                    }
-                    "sketch.pattern.circular" => {
-                        if let Some(p) = at {
-                            let _ = app.run(cmd, json!({"entities": ents, "center": arg(&p), "count": 6}));
-                            tool.picks.clear();
-                        }
-                    }
-                    _ => {
-                        if let Some(p) = at {
-                            tool.pts.push(p);
-                            if tool.pts.len() >= 2 {
-                                let d = tool.pts[1].0 - tool.pts[0].0;
-                                if d.len() > 1e-9 {
-                                    let _ = app.run(cmd, json!({"entities": ents, "dir": xy(d), "count": 3, "spacing": d.len()}));
-                                }
-                                tool.picks.clear();
-                                tool.pts.clear();
-                            }
-                        }
-                    }
-                }
-                return;
-            }
-            if let Some((id, _)) = sketch_entity(app, &hits)
-                && !tool.picks.contains(&id)
-            {
-                tool.picks.push(id);
             }
         }
         Mode::Steps => match cmd {
@@ -854,52 +1020,62 @@ pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) {
     }
 }
 
-fn run_points(app: &mut SolveApp, t: &Tool) {
+/// Put down the next point of a point tool: a click, or Enter in one of its value boxes. The
+/// last point runs the command. Typed values are checked first, so a rejected one stays in its
+/// box to be corrected rather than reaching the command.
+pub(crate) fn place_point(app: &mut SolveApp, tool: &mut Tool, p: (Vec2, Option<String>)) {
+    let Some(Mode::Points(n)) = mode(tool.cmd) else { return };
+    if let Err(error) = crate::sketch_dims::validate(app, tool) {
+        app.set_status(error, true);
+        return;
+    }
+    let p = crate::sketch_dims::placed(app, tool, &p);
+    tool.pts.push(p);
+    if n > 0 && tool.pts.len() >= n {
+        if run_points(app, tool) {
+            tool.pts.clear();
+            crate::sketch_dims::reset(tool);
+        } else {
+            tool.pts.pop();
+        }
+    }
+}
+
+fn run_points(app: &mut SolveApp, t: &Tool) -> bool {
     let p = &t.pts;
     let width = |a: Vec2, b: Vec2, c: Vec2| -> f64 { 2.0 * (b - a).normalized().map(|d| d.cross(c - a).abs()).unwrap_or(1.0) };
+    let slot_width = |fallback: f64| crate::sketch_dims::locked_value(app, t, "Width").unwrap_or_else(|| fallback.max(1e-3));
     let params = match (t.cmd, p.as_slice()) {
         ("sketch.line.midpoint", [m, e]) => json!({"mid": arg(m), "end": xy(e.0)}),
         ("sketch.arc.tangent", [s, e]) => json!({"start": arg(s), "end": xy(e.0)}),
         ("sketch.ellipse", [c, m, q]) => json!({"center": xy(c.0), "major": xy(m.0), "minor": xy(q.0)}),
-        ("sketch.conic", [a, b, x]) => json!({"start": arg(a), "end": arg(b), "apex": arg(x)}),
-        ("sketch.slot.center_point", [c, e, w]) => json!({"center": xy(c.0), "end": xy(e.0), "width": width(c.0, e.0, w.0).max(1e-3)}),
+        ("sketch.conic", [a, b, x]) => {
+            // The typed Rho box, or the parabola the command defaults to.
+            let rho = crate::sketch_dims::locked_value(app, t, "Rho").unwrap_or(0.5);
+            json!({"start": arg(a), "end": arg(b), "apex": arg(x), "rho": rho})
+        }
+        ("sketch.slot.center_point", [c, e, w]) => json!({"center": xy(c.0), "end": xy(e.0), "width": slot_width(width(c.0, e.0, w.0))}),
         ("sketch.slot.arc_three_point", [a, th, b, w]) => {
-            json!({"start": xy(a.0), "through": xy(th.0), "end": xy(b.0), "width": (2.0 * w.0.dist(b.0)).max(1e-3)})
+            json!({"start": xy(a.0), "through": xy(th.0), "end": xy(b.0), "width": slot_width(2.0 * w.0.dist(b.0))})
         }
         ("sketch.slot.arc_center", [c, a, b, w]) => {
             let r = c.0.dist(a.0);
-            json!({"center": xy(c.0), "start": xy(a.0), "end": xy(b.0), "width": (2.0 * (w.0.dist(c.0) - r).abs()).max(1e-3)})
+            json!({"center": xy(c.0), "start": xy(a.0), "end": xy(b.0), "width": slot_width(2.0 * (w.0.dist(c.0) - r).abs())})
         }
         ("sketch.spline.fit_point" | "sketch.spline.control_point" | "sketch.spline.control_point_5", pts) if pts.len() >= 2 => {
             json!({"points": pts.iter().map(arg).collect::<Vec<_>>()})
         }
         ("sketch.blend_curve", [a, b]) => match (&a.1, &b.1) {
             (Some(x), Some(y)) => json!({"a": x, "b": y}),
-            _ => return,
+            _ => return false,
         },
         ("sketch.text", [at]) => {
-            let at = at.0;
-            TEXT.with(|t| *t.borrow_mut() = Some((at, String::new())));
-            return;
+            crate::sketch_text::place(app, at.0, round_nice(app.cam.half_height() * 0.1));
+            return true;
         }
-        _ => return,
+        _ => return false,
     };
-    let _ = app.run(t.cmd, params);
-}
-
-fn run_corner(app: &mut SolveApp, cmd: &str, point: &str) {
-    let size = round_nice(corner_len(app, point) * 0.2);
-    let params = match cmd {
-        "sketch.fillet" => json!({"point": point, "radius": size}),
-        "sketch.chamfer.distance_angle" => json!({"point": point, "distance": size, "angle": 45}),
-        "sketch.chamfer.two_distance" => json!({"point": point, "distance": size, "distance2": size}),
-        _ => json!({"point": point, "distance": size}),
-    };
-    if let Ok(v) = app.run(cmd, params)
-        && let Some(p) = v["param"].as_str()
-    {
-        app.dialog = Some(crate::dialogs::Dialog::edit_param(&app.session, p));
-    }
+    crate::tools::draw(app, t, params).is_ok()
 }
 
 fn run_entities(app: &mut SolveApp, t: &Tool) {
@@ -908,7 +1084,9 @@ fn run_entities(app: &mut SolveApp, t: &Tool) {
         "sketch.constraint.curvature" => json!({"a": k[0], "b": k[1]}),
         "sketch.circle.two_tangent" => {
             let r = round_nice(curve_len(app, &k[0]).min(curve_len(app, &k[1])) * 0.1);
-            let near = t.pts.last().map(|p| xy(p.0)).unwrap_or(json!([0, 0]));
+            // Between the two clicks: each lies on its curve, so the circle in the corner they
+            // span is the one nearest their midpoint (#3141).
+            let near = xy(t.pts.iter().fold(Vec2::ZERO, |a, p| a + p.0) / t.pts.len().max(1) as f64);
             json!({"curves": k, "radius": r, "near": near})
         }
         "sketch.circle.three_tangent" => {
@@ -939,7 +1117,7 @@ pub fn finish(app: &mut SolveApp, tool: &mut Tool) -> bool {
             tool.pts.clear();
             true
         }
-        Mode::EntitiesThen | Mode::Steps if !tool.picks.is_empty() && tool.picks.last().is_some_and(|x| x != "|") => {
+        Mode::Steps if !tool.picks.is_empty() && tool.picks.last().is_some_and(|x| x != "|") => {
             tool.picks.push("|".into());
             true
         }
@@ -952,28 +1130,56 @@ pub fn finish(app: &mut SolveApp, tool: &mut Tool) -> bool {
     }
 }
 
-/// Offset: the second click sets the side and distance.
-fn offset_side(app: &mut SolveApp, tool: &mut Tool, p: Vec2) -> bool {
-    if tool.cmd != "sketch.offset" || tool.picks.is_empty() {
-        return false;
+/// The cursor's Trim piece, keyed by design revision, sketch, curve and cursor: the viewport's
+/// hover and the preview both ask for it each frame, and it intersects the curve with every other.
+type TrimPieceKey = (u64, u64, String, [u64; 2]);
+
+thread_local! {
+    static TRIM_PIECE: std::cell::RefCell<Option<(TrimPieceKey, Option<Vec<Vec2>>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// With Trim active and the cursor over curve `id` of `sketch` (the active sketch): the piece a
+/// click takes away (#3052), which the hover shows in place of the whole curve. `None` with
+/// another tool, or for a curve trim cuts otherwise (`solidcraft_engine::cmd::trim_piece`).
+pub(crate) fn trim_hover_piece(app: &SolveApp, sketch: u64, id: &str) -> Option<Vec<Vec2>> {
+    let tool = app.tool.as_ref().filter(|t| t.cmd == "sketch.trim")?;
+    let (at, _) = tool.hover.as_ref()?;
+    if active_sketch(app) != Some(sketch) {
+        return None;
+    }
+    let key = (app.session.revision, sketch, id.to_string(), [at.x.to_bits(), at.y.to_bits()]);
+    if let Some(piece) = TRIM_PIECE.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, p)| p.clone())) {
+        return piece;
     }
     let st = app.session.world_state();
-    let d = active_sketch(app)
-        .and_then(|s| st.sketch(s))
-        .and_then(|ss| {
-            let curve = ss.sketch.curve_index(&tool.picks[0])?;
-            if let Some(shape) = ss.sketch.shape(curve) {
-                Some(shape.dist(p))
-            } else {
-                ss.sketch.exact_segs(curve)?.iter().map(|s| s.point_at(s.closest_param(p)).dist(p)).min_by(f64::total_cmp)
-            }
-        })
-        .unwrap_or(0.0);
-    if d > 1e-6 {
-        let _ = app.run("sketch.offset", json!({"curves": [tool.picks[0]], "distance": d, "side": xy(p)}));
+    let piece = solidcraft_engine::cmd::trim_piece(&st.sketch(sketch)?.sketch, id, *at);
+    TRIM_PIECE.with(|c| *c.borrow_mut() = Some((key, piece.clone())));
+    piece
+}
+
+/// Extend preview: the geometry that would be added, based on the hover position over curve `id`
+/// of `sketch`. Returns None when extend is not active or the geometry does not support a
+/// preview. An arc grows along its own circle, in either direction, as a new arc.
+fn extend_preview_piece(app: &SolveApp, sketch: u64, id: &str) -> Option<Vec<Vec2>> {
+    let tool = app.tool.as_ref().filter(|t| t.cmd == "sketch.extend")?;
+    let hover = tool.hover.as_ref()?;
+    if active_sketch(app) != Some(sketch) {
+        return None;
     }
-    tool.picks.clear();
-    true
+    let st = app.session.world_state();
+    let sk = st.sketch(sketch)?;
+    let hover_pos = hover.0;
+    let ci = sk.sketch.curve_index(id)?;
+    let kind = sk.sketch.curves.get(ci)?.kind.clone();
+    // Arcs extend along their circle either way round, up to the first geometry in the way.
+    if let solidcraft_engine::sketch::CurveKind::Arc { .. } = kind {
+        return solidcraft_engine::cmd::extend_arc_preview(&sk.sketch, ci, hover_pos);
+    }
+    let solidcraft_engine::sketch::CurveKind::Line { a, b } = kind else { return None };
+    let at_b = hover_pos.dist(sk.sketch.point(b)?) <= hover_pos.dist(sk.sketch.point(a)?);
+    let end = sk.sketch.point(if at_b { b } else { a })?;
+    let hit = solidcraft_engine::cmd::extend_preview(&sk.sketch, ci, hover_pos)?;
+    Some(vec![end, hit])
 }
 
 /// Rubber band for point tools and pick markers.
@@ -983,26 +1189,67 @@ pub fn preview(app: &SolveApp, t: &Tool, painter: &egui::Painter, proj: &Proj) {
     let Some(ss) = st.sketch(sid) else { return };
     let to = |p: Vec2| proj.to_screen(ss.plane.to_world(p));
     let tk = crate::theme::Tokens::get();
-    let stroke = Stroke::new(1.5, tk.rubber_band);
+    if let Some(crate::viewport::Hit::SketchCurve { sketch, id, .. }) = &app.viewport.hover
+        && let Some(piece) = trim_hover_piece(app, *sketch, id)
+    {
+        let world: Vec<_> = piece.iter().map(|p| ss.plane.to_world(*p)).collect();
+        // In the error colour, thicker than a hover: it is what the click deletes.
+        crate::tools::paint_sketch_path(&world, 0, painter, proj, Stroke::new(4.5, tk.error));
+    }
+    // Extend preview: the line or arc that would be added (or the end that would move).
+    if let Some(crate::viewport::Hit::SketchCurve { sketch, id, .. }) = &app.viewport.hover
+        && let Some(preview_line) = extend_preview_piece(app, *sketch, id)
+    {
+        let world: Vec<_> = preview_line.iter().map(|p| ss.plane.to_world(*p)).collect();
+        // Draw the preview extension line using preview_new color (same as fillet/chamfer preview)
+        crate::tools::paint_sketch_path(&world, 0, painter, proj, Stroke::new(2.0, tk.preview_new.gamma_multiply(0.9)));
+    }
+    let stroke = Stroke::new(1.5, tk.sketch_accent);
+    // A Trim drag: the pieces it will remove, then the path drawn so far.
+    if t.cmd == "sketch.trim" && !t.pts.is_empty() {
+        TRIM_REMOVED.with(|r| {
+            for piece in r.borrow().iter() {
+                let line: Vec<Pos2> = piece.iter().filter_map(|p| to(*p)).collect();
+                painter.add(egui::Shape::line(line, Stroke::new(4.0, tk.error.gamma_multiply(0.8))));
+            }
+        });
+        let path: Vec<Pos2> = t.pts.iter().filter_map(|p| to(p.0)).collect();
+        painter.add(egui::Shape::line(path, stroke));
+        return;
+    }
     if let Some((hp, snap)) = &t.hover
         && let Some(sp) = to(*hp)
     {
         painter.circle_stroke(sp, if snap.is_some() { 6.0 } else { 3.0 }, stroke);
     }
+    let faint = Stroke::new(1.0, tk.sketch_accent.gamma_multiply(0.6));
+    let mode = crate::sketch_palette::mode(app);
     for w in t.pts.windows(2) {
-        crate::tools::paint_sketch_path(
-            &[ss.plane.to_world(w[0].0), ss.plane.to_world(w[1].0)],
-            crate::sketch_palette::mode(app),
-            painter,
-            proj,
-            Stroke::new(1.0, tk.rubber_band.gamma_multiply(0.6)),
-        );
+        crate::tools::paint_sketch_path(&[ss.plane.to_world(w[0].0), ss.plane.to_world(w[1].0)], mode, painter, proj, faint);
     }
+    // Placing a conic's apex: the curve is the preview, and the two tangent legs it is built
+    // from are a faint guide. A full-strength cursor rubber band here read as a straight line
+    // being drawn rather than as a curve being shaped.
+    let legs = t.cmd == "sketch.conic" && t.pts.len() == 2;
     if let (Some(last), Some((h, _))) = (t.pts.last(), t.hover.as_ref()) {
-        crate::tools::paint_sketch_path(&[ss.plane.to_world(last.0), ss.plane.to_world(*h)], crate::sketch_palette::mode(app), painter, proj, stroke);
+        let hw = ss.plane.to_world(*h);
+        if legs {
+            if let Some(first) = t.pts.first() {
+                crate::tools::paint_sketch_path(&[ss.plane.to_world(first.0), hw], mode, painter, proj, faint);
+            }
+            crate::tools::paint_sketch_path(&[ss.plane.to_world(last.0), hw], mode, painter, proj, faint);
+        } else {
+            crate::tools::paint_sketch_path(&[ss.plane.to_world(last.0), hw], mode, painter, proj, stroke);
+        }
     }
-    if let Some((h, _)) = t.hover.as_ref()
-        && let Some(curve) = crate::tools::preview_curve(t, *h, None)
+    if let Some(hover) = t.hover.as_ref()
+        && let Some(curve) = crate::tools::preview_curve(
+            t,
+            crate::sketch_dims::shown(app, t, hover),
+            None,
+            crate::sketch_dims::locked_value(app, t, "Rho"),
+            crate::sketch_dims::locked_value(app, t, "Width"),
+        )
     {
         crate::tools::paint_preview_curve(curve, &ss.plane, painter, proj, stroke, crate::sketch_palette::mode(app));
     }
@@ -1039,8 +1286,25 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
         dim_texts.iter().any(|d| d.intersects(r))
     };
     let mut placed: Vec<(String, Pos2, Pos2)> = Vec::new();
+    // The point of each MidPoint glyph drawn so far: lines whose midpoints meet share one glyph.
+    let mut midpoints: Vec<usize> = Vec::new();
     for c in &ss.sketch.constraints {
         if c.kind.is_dimension() {
+            continue;
+        }
+        if let solidcraft_engine::sketch::ConstraintKind::Midpoint { p, .. } = c.kind
+            && !c.driven
+        {
+            if midpoints.contains(&p) {
+                continue;
+            }
+            midpoints.push(p);
+        }
+        if matches!(
+            c.kind,
+            solidcraft_engine::sketch::ConstraintKind::PatternPoint { .. } | solidcraft_engine::sketch::ConstraintKind::PatternRadius { .. }
+        ) && !ss.sketch.patterns.iter().any(|p| p.instances.first().and_then(|i| i.constraints.first()) == Some(&c.id))
+        {
             continue;
         }
         for (at, dir) in glyph_anchors(&ss.sketch, &c.kind) {
@@ -1075,10 +1339,16 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
     }
     let hovered = hover.and_then(|h| placed.iter().find(|(_, q, _)| q.distance(h) <= GLYPH * 0.6).map(|(id, _, _)| id.clone()));
     // The hovered (or selected) constraint's entities lit up.
-    if let Some(id) = hovered.as_ref().or(picked.as_ref())
-        && let Some(c) = ss.sketch.constraints.iter().find(|c| &c.id == id)
-    {
-        let (cs, ps) = constraint_entities(&c.kind);
+    if let Some(id) = hovered.as_ref().or(picked.as_ref()) {
+        let group = glyph_group(&ss.sketch, id);
+        let (cs, ps) = ss.sketch.constraints.iter().filter(|c| group.contains(&c.id)).map(|c| constraint_entities(&c.kind)).fold(
+            (Vec::new(), Vec::new()),
+            |(mut cs, mut ps), (c, p)| {
+                cs.extend(c);
+                ps.extend(p);
+                (cs, ps)
+            },
+        );
         let mut display_budget = solidcraft_engine::render::SamplingBudget::new(32_768, 65_536);
         for ci in cs {
             crate::tools::paint_curve(&ss.sketch, ci, &ss.plane, painter, proj, Stroke::new(3.0, tk.accent.gamma_multiply(0.7)), &mut display_budget);
@@ -1092,11 +1362,12 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
     let mut drawn: Vec<(String, Pos2)> = Vec::new();
     for (id, sp, base) in &placed {
         let Some(c) = ss.sketch.constraints.iter().find(|c| &c.id == id) else { continue };
-        let failing = ss.report.failing.contains(id);
+        let group = glyph_group(&ss.sketch, id);
+        let failing = group.iter().any(|g| ss.report.failing.contains(g));
         // Redundant (already implied by the others, but holding): dimmed, not an error.
-        let redundant = !failing && ss.report.redundant.contains(id);
+        let redundant = !failing && group.iter().all(|g| ss.report.redundant.contains(g));
         let selected = picked.as_deref() == Some(id.as_str())
-            || app.session.selection.iter().any(|s| matches!(s, solidcraft_engine::Sel::SketchConstraint { id: x } if x == id));
+            || app.session.selection.iter().any(|s| matches!(s, solidcraft_engine::Sel::SketchConstraint { id: x } if group.contains(x)));
         let lit = selected || hovered.as_deref() == Some(id.as_str());
         let col = if failing {
             tk.error
@@ -1112,12 +1383,30 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
             painter.line_segment([*base, *sp], Stroke::new(0.8, tk.text_dim.gamma_multiply(0.6)));
         }
         let r = egui::Rect::from_center_size(*sp, egui::vec2(GLYPH, GLYPH));
-        painter.rect_filled(r, 3.0, if lit { tk.accent_soft } else { tk.glyph_bg });
-        painter.rect_stroke(r, 3.0, Stroke::new(1.0, if failing || lit { col } else { tk.glyph_edge }), egui::StrokeKind::Inside);
-        match glyph_icon(c.kind.name()) {
-            Some(icon) => crate::icons::paint(painter, r.shrink(2.0), icon, col, tk.glyph_bg, col),
+        painter.rect_filled(r, tk.radius_sm.saturating_sub(1), if lit { tk.accent_soft } else { tk.glyph_bg });
+        painter.rect_stroke(
+            r,
+            tk.radius_sm.saturating_sub(1),
+            Stroke::new(1.0, if failing || lit { col } else { tk.glyph_edge }),
+            egui::StrokeKind::Inside,
+        );
+        let pattern_icon = ss.sketch.patterns.iter().find(|p| p.instances.first().and_then(|i| i.constraints.first()) == Some(id)).map(|p| {
+            if matches!(p.kind, solidcraft_engine::sketch::SketchPatternKind::Circular { .. }) {
+                "sketch_circ_pattern"
+            } else {
+                "sketch_rect_pattern"
+            }
+        });
+        match pattern_icon.or_else(|| glyph_icon(c.kind.name())) {
+            Some(icon) => crate::icons::paint_icon(painter, r.shrink(2.0), icon, f32::from(col.a()) / 255.0),
             None => {
-                painter.text(*sp, egui::Align2::CENTER_CENTER, glyph_letter(c.kind.name()), egui::FontId::proportional(10.5), col);
+                painter.text(
+                    *sp,
+                    egui::Align2::CENTER_CENTER,
+                    glyph_letter(c.kind.name()),
+                    egui::FontId::proportional(crate::theme::Tokens::get().font_panel),
+                    col,
+                );
             }
         }
         drawn.push((id.clone(), *sp));
@@ -1125,35 +1414,18 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
     if let (Some(id), Some(h)) = (hovered, hover)
         && let Some(c) = ss.sketch.constraints.iter().find(|c| c.id == id)
     {
+        let ids = glyph_group(&ss.sketch, &id).join(", ");
         let label = if ss.report.redundant.contains(&id) {
-            format!("{} ({id}), redundant: already implied by other constraints", c.kind.name())
+            format!("{} ({ids}), redundant: already implied by other constraints", c.kind.name())
         } else {
-            format!("{} ({id})", c.kind.name())
+            format!("{} ({ids})", c.kind.name())
         };
         let at = h + egui::vec2(12.0, 12.0);
-        let g = painter.layout_no_wrap(label, egui::FontId::proportional(11.0), tk.text);
-        painter.rect_filled(egui::Rect::from_min_size(at, g.size()).expand(3.0), 3.0, tk.panel);
+        let g = painter.layout_no_wrap(label, egui::FontId::proportional(crate::theme::Tokens::get().font_small), tk.text);
+        painter.rect_filled(egui::Rect::from_min_size(at, g.size()).expand(3.0), tk.radius_sm.saturating_sub(1), tk.panel);
         painter.galley(at, g, tk.text);
     }
     GLYPHS.with(|g| *g.borrow_mut() = drawn);
-}
-
-/// Toolbar icons used as glyphs (H and V stay letters, which tell them apart).
-fn glyph_icon(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "Coincident" => "c_coincident",
-        "Parallel" => "c_parallel",
-        "Perpendicular" => "c_perpendicular",
-        "Collinear" => "c_collinear",
-        "Tangent" => "c_tangent",
-        "Smooth" => "c_smooth",
-        "Equal" => "c_equal",
-        "Concentric" => "c_concentric",
-        "MidPoint" => "c_midpoint",
-        "Symmetry" => "c_symmetry",
-        "Fix" => "c_fix",
-        _ => return None,
-    })
 }
 
 /// The curves and points a constraint ties together.
@@ -1161,6 +1433,10 @@ fn constraint_entities(k: &solidcraft_engine::sketch::ConstraintKind) -> (Vec<us
     use solidcraft_engine::sketch::ConstraintKind::*;
     match *k {
         Coincident { p, q } | HorizontalPoints { p, q } | VerticalPoints { p, q } => (vec![], vec![p, q]),
+        PatternPoint { p, q, center, directions, .. } => {
+            (directions.into_iter().flatten().map(|(l, _)| l).collect(), vec![p, q].into_iter().chain(center).collect())
+        }
+        PatternRadius { a, b } => (vec![a, b], vec![]),
         Fix { p } => (vec![], vec![p]),
         Midpoint { p, l } => (vec![l], vec![p]),
         PointOnCurve { p, c } => (vec![c], vec![p]),
@@ -1174,14 +1450,6 @@ fn constraint_entities(k: &solidcraft_engine::sketch::ConstraintKind) -> (Vec<us
         | Tangent { a, b }
         | Smooth { a, b } => (vec![a, b], vec![]),
         _ => (vec![], vec![]),
-    }
-}
-
-fn glyph_letter(name: &str) -> &'static str {
-    match name {
-        "Horizontal" => "H",
-        "Vertical" => "V",
-        _ => "?",
     }
 }
 
@@ -1206,6 +1474,8 @@ fn glyph_anchors(sk: &solidcraft_engine::sketch::Sketch, k: &solidcraft_engine::
     let pt = |p: usize| sk.point(p).map(|q| (q, None));
     match *k {
         Coincident { p, .. } | Fix { p } | Midpoint { p, .. } | PointOnCurve { p, .. } => pt(p).into_iter().collect(),
+        PatternPoint { p, center, .. } => pt(center.unwrap_or(p)).into_iter().collect(),
+        PatternRadius { .. } => Vec::new(),
         HorizontalPoints { p, q } | VerticalPoints { p, q } | Symmetric { p, q, .. } => {
             sk.point(p).zip(sk.point(q)).map(|(a, b)| ((a + b) * 0.5, None)).into_iter().collect()
         }
@@ -1232,13 +1502,16 @@ fn snap_hint(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let Some(sp) = proj.to_screen(ss.plane.to_world(p)) else { return };
     let tk = crate::theme::Tokens::get();
     let r = egui::Rect::from_min_size(sp + egui::vec2(12.0, -24.0), egui::vec2(24.0, 14.0));
-    painter.rect_filled(r, 3.0, tk.accent_soft);
-    painter.text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(10.0), tk.text);
+    painter.rect_filled(r, tk.radius_sm.saturating_sub(1), tk.accent_soft);
+    painter.text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(crate::theme::Tokens::get().font_micro), tk.text);
 }
 
-/// Per frame, after the viewport is drawn: constraint glyphs and the text-entry box.
+/// Per frame, after the viewport is drawn: constraint glyphs, snap hints and analysis marks.
 pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &Proj) {
-    SHIFT.with(|c| c.set(ui.input(|i| i.modifiers.shift)));
+    // IsoCurveAlternate (Shift default) for sketch.isoparametric_curve - via resolve, not raw shift.
+    let held = crate::tool_modifiers::Held::from_modifiers(ui.input(|i| i.modifiers));
+    let iso = crate::tool_modifiers::resolve(&[], crate::tool_modifiers::descriptor("sketch.isoparametric_curve"), held, Trigger::Press);
+    SHIFT.with(|c| c.set(iso.contains(ModAction::IsoCurveAlternate)));
     glyphs(app, painter, proj, ui.input(|i| i.pointer.hover_pos()).filter(|_| ui.rect_contains_pointer(proj.rect)));
     snap_hint(app, painter, proj);
     combs(app, painter, proj);
@@ -1247,41 +1520,17 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
     }
     marks(app, painter, proj);
     iso_lines(app, painter, proj);
-    text_entry(app, ui.ctx());
-}
-
-/// The text-entry box for a placed text.
-fn text_entry(app: &mut SolveApp, ctx: &egui::Context) {
-    let Some((at, mut text)) = TEXT.with(|t| t.borrow_mut().take()) else { return };
-    let mut done = None;
-    crate::frame::window(ctx, "Text", crate::frame::Width::Normal)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            let r = ui.text_edit_singleline(&mut text);
-            r.request_focus();
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    done = Some(true);
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    done = Some(false);
-                }
-            });
-        });
-    match done {
-        Some(true) => {
-            if !text.trim().is_empty() {
-                let h = round_nice(app.cam.half_height() * 0.1);
-                let _ = app.run("sketch.text", json!({"text": text, "at": xy(at), "height": h}));
-            }
-        }
-        Some(false) => {}
-        None => TEXT.with(|t| *t.borrow_mut() = Some((at, text))),
-    }
+    continuity_legend(app, painter, proj);
 }
 
 #[cfg(test)]
 #[path = "sketch_corner_ui_tests.rs"]
 mod corner_ui_tests;
+
+#[cfg(test)]
+#[path = "sketch_continuity_tests.rs"]
+mod continuity_tests;
+
+#[cfg(test)]
+#[path = "sketch_trim_drag_ui_tests.rs"]
+mod trim_drag_ui_tests;

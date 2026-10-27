@@ -94,7 +94,7 @@ fn to_object_noop_retains_dormant_secondary_angle_and_downstream_dimension() {
 #[test]
 fn rotated_owner_to_point_remains_exact_on_noop_edit() {
     let mut h = Harness::new();
-    let owner = h.app.run("component.create", json!({"name":"Owner"})).unwrap();
+    let owner = h.app.run("component.create", json!({"name":"Owner","grounded":false})).unwrap();
     let mut h = make_params(h, json!({"origin":[0,0,0],"dir":[0,2,0]}), json!({"to":[0,2,12],"angle":"45 deg"}));
     h.app.run("occurrence.move", json!({"occurrence":owner["occurrence"],"translate":[100,0,20],"axis":[0,0,1],"angle":"17 deg"})).unwrap();
     h.app.run("component.create", json!({"name":"Other","parent":0})).unwrap();
@@ -127,8 +127,11 @@ fn second_active_occurrence_noop_preserves_definition_axis_target_and_instances(
     let placed = preview.after.bodies.iter().find(|body| body.mesh().bounds().center().x > 50.0).unwrap();
     assert!(placed.mesh().triangles.len() > 10);
     assert_eq!(placed.mesh().bounds(), before.iter().find(|(_, bounds)| bounds.center().x > 50.0).unwrap().1);
-    assert!(h.widget("↖ Custom Axis").is_some());
+    assert_eq!(crate::scenario::count_of("dialog:selection:Axis:filled"), Some(1.0), "the stored custom axis stays selected");
+    // In the floating shell the read-only Sweep badge overlaps OK at this placement.
+    // It must not intercept the dialog's click or leave the timeline rolled back.
     h.step(&json!({"widget":"OK"})).unwrap();
+    assert!(h.app.dialog.is_none(), "OK must apply even underneath the Sweep badge");
     assert_eq!(serde_json::to_value(&h.app.session.doc.find_feature("Turn").unwrap().kind).unwrap(), original);
     let after: Vec<_> = h.app.session.world_state().bodies.iter().map(|b| (b.name.clone(), b.mesh().bounds())).collect();
     assert_eq!(after, before);
@@ -189,7 +192,7 @@ fn revolve_angle_edit_preserves_axis_downstream_binding_and_one_undo() {
 #[test]
 fn rotated_owner_explicit_axis_is_lossless_with_another_component_active() {
     let mut h = Harness::new();
-    let owner = h.app.run("component.create", json!({"name":"Owner"})).unwrap();
+    let owner = h.app.run("component.create", json!({"name":"Owner","grounded":false})).unwrap();
     let mut h = make(h, json!({"origin":[0,0,0],"dir":[0,2,0]}));
     h.app.run("occurrence.move", json!({"occurrence":owner["occurrence"],"translate":[100,0,20],"axis":[0,0,1],"angle":"17 deg"})).unwrap();
     h.app.run("component.create", json!({"name":"Other","parent":0})).unwrap();
@@ -211,7 +214,7 @@ fn rotated_owner_explicit_axis_is_lossless_with_another_component_active() {
 fn world_and_sketch_axis_handles_follow_authoring_occurrence() {
     for selected in [json!("Y"), json!("y")] {
         let mut h = Harness::new();
-        let owner = h.app.run("component.create", json!({"name":"Owner"})).unwrap();
+        let owner = h.app.run("component.create", json!({"name":"Owner","grounded":false})).unwrap();
         let mut h = make(h, selected);
         h.app.run("occurrence.move", json!({"occurrence":owner["occurrence"],"translate":[100,0,20],"axis":[0,0,1],"angle":"17 deg"})).unwrap();
         let original = axis(&h);
@@ -237,4 +240,46 @@ fn sketch_axis_cancel_restores_original_document_and_history() {
     assert_eq!(serde_json::to_value(&*h.app.session.doc).unwrap(), original);
     assert_eq!(h.app.session.undo.len(), undo);
     assert!(matches!(&h.app.session.doc.find_feature("Turn").unwrap().kind,FeatureKind::Revolve{axis:AxisRef::SketchAxis{axis},..} if axis=="y"));
+}
+
+#[test]
+fn only_the_active_selection_field_looks_active() {
+    let mut h = make(Harness::new(), json!("Y"));
+    open(&mut h);
+    let t = crate::theme::Tokens::get();
+    let border = |h: &Harness, label: &str| {
+        let field = crate::scenario::rect_of(&format!("dialog:field:{label}")).unwrap();
+        h.shapes
+            .iter()
+            .rev()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.rect == field || r.rect == field.shrink(t.space_2) => Some(r.stroke.color),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let click = |h: &mut Harness, handle: &str| {
+        let at = crate::scenario::rect_of(handle).map(|r| r.center()).or_else(|| crate::scenario::handle_at(handle)).unwrap();
+        h.step(&json!({"click":[at.x, at.y]})).unwrap();
+        h.frames(2);
+    };
+    for label in ["Profile", "Axis"] {
+        assert_eq!(crate::scenario::count_of(&format!("dialog:selection:{label}:filled")), Some(1.0), "{label} holds its item");
+    }
+    assert_eq!(h.app.dialog.as_ref().unwrap().active, 0);
+    assert_eq!((border(&h, "Profile") == t.form_primary, border(&h, "Axis") == t.form_primary), (true, false));
+    click(&mut h, "dialog:field:Axis");
+    assert_eq!(h.app.dialog.as_ref().unwrap().active, 1);
+    assert_eq!((border(&h, "Profile") == t.form_primary, border(&h, "Axis") == t.form_primary), (false, true));
+    let filled = border(&h, "Profile");
+    click(&mut h, "dialog:Angle");
+    assert_eq!(h.app.dialog.as_ref().unwrap().active, 1, "picks still go to Axis while Angle is typed into");
+    assert_eq!(border(&h, "Axis"), t.form_primary);
+    click(&mut h, "dialog:clear:Axis");
+    click(&mut h, "dialog:field:Profile");
+    assert_eq!(crate::scenario::count_of("dialog:selection:Axis:filled"), Some(0.0));
+    assert_eq!((border(&h, "Profile"), border(&h, "Axis")), (t.form_primary, t.control_border));
+    click(&mut h, "dialog:field:Axis");
+    assert_eq!(border(&h, "Profile"), filled, "filled inactive");
+    assert_ne!(filled, t.control_border, "filled inactive differs from empty inactive");
 }

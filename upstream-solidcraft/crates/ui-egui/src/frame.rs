@@ -1,187 +1,284 @@
-//! The one place windows are made. Every command dialog, panel and pop-up window comes from
-//! here, so they all shrink to their content within the same width limits (a test checks that no
-//! other file creates an `egui::Window`, and that every dialog stays within the limits).
-//!
-//! - [`docked`]: command dialogs and command panels, flush to the right edge of the viewport.
-//! - [`window`]: floating windows (Preferences, Parameters, prompts…), centred by default.
-//! - [`right_aligned`]: right-align a row's last items without widening the window (a
-//!   right-to-left layout would stretch it to its maximum width).
-//! - [`heading`]: a panel's title row and its section headings, each on a band darker than the
-//!   panel ([`Level`]), so every dialog marks them the same way.
+//! Dock dragging and bounded anchors. Outer hosts and surfaces live in `ui_kit::Container`.
 
-use egui::{Align2, Pos2, Ui, WidgetText, vec2};
+use egui::{Pos2, Ui};
 
 /// Width limits of a docked command dialog.
 pub const DIALOG_MIN_W: f32 = 260.0;
 pub const DIALOG_MAX_W: f32 = 380.0;
-/// Docked dialogs holding a table (motion study, configurations, exploded views).
-pub const DIALOG_WIDE_MAX_W: f32 = 560.0;
-/// Floating windows: prompts and panels, and those holding a table (Parameters, Keyboard
-/// Shortcuts).
-pub const WINDOW_MAX_W: f32 = 460.0;
-pub const WINDOW_WIDE_MAX_W: f32 = 760.0;
-
-/// How wide a window may get.
+/// Which edge of the viewport a docked panel sits against. The Sketch Palette holds the right
+/// edge while a sketch is open, so a dialog started there takes the left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Width {
-    Normal,
-    Wide,
+pub enum Side {
+    Right,
+    Left,
 }
 
-/// A command dialog docked at `anchor` (its top right corner), shrink-wrapped to its content.
-pub fn docked<'a>(title: impl Into<WidgetText>, id: egui::Id, anchor: Pos2, max_height: f32, width: Width) -> egui::Window<'a> {
-    let max = match width {
-        Width::Normal => DIALOG_MAX_W,
-        Width::Wide => DIALOG_WIDE_MAX_W,
+impl Side {
+    /// Command dialogs share a position on each side of the viewport.
+    pub fn dialog_offset_key(self) -> &'static str {
+        match self {
+            Side::Right => "sc_command_dialog_right",
+            Side::Left => "sc_command_dialog_left",
+        }
+    }
+
+    /// The x of the viewport edge this side docks against.
+    pub fn anchor_x(self, viewport: egui::Rect) -> f32 {
+        match self {
+            Side::Right => viewport.right(),
+            Side::Left => viewport.left(),
+        }
+    }
+}
+
+/// How far a docked panel with this key was dragged.
+pub fn dock_offset(ctx: &egui::Context, key: &str) -> egui::Vec2 {
+    ctx.data(|d| d.get_temp::<egui::Vec2>(egui::Id::new(("sc_dock_offset", key)))).unwrap_or(egui::Vec2::ZERO)
+}
+
+/// A title drag owns the pointer even when it outruns the dialog's previous position.
+pub(crate) fn dock_dragging(ctx: &egui::Context) -> bool {
+    let frame = ctx.cumulative_frame_nr();
+    // The viewport can draw before the dialog, so retain the preceding frame's marker.
+    ctx.data(|d| d.get_temp::<u64>(egui::Id::new("sc_dock_drag_frame"))).is_some_and(|at| at >= frame.saturating_sub(1))
+        && ctx.input(|i| i.pointer.any_down())
+}
+
+/// A docked dialog's anchor moved by `offset`, kept so its docked corner stays in `vp` with
+/// room for its title band.
+pub fn offset_anchor(docked: Pos2, offset: egui::Vec2, vp: egui::Rect, side: Side) -> Pos2 {
+    let p = docked + offset;
+    let (lo, hi) = match side {
+        Side::Right => (vp.left() + DIALOG_MIN_W, vp.right()),
+        Side::Left => (vp.left(), vp.right() - DIALOG_MIN_W),
     };
-    egui::Window::new(title)
-        .enabled(!crate::issue_report::cad_input_blocked())
-        .id(id)
-        .title_bar(false)
-        .pivot(Align2::RIGHT_TOP)
-        .fixed_pos(anchor)
-        .constrain(false)
-        .auto_sized()
-        .collapsible(false)
-        .max_width(max)
-        .max_height(max_height.max(120.0))
+    let x = if lo <= hi { p.x.clamp(lo, hi) } else { docked.x };
+    let y = if vp.top() <= vp.bottom() - 40.0 { p.y.clamp(vp.top(), vp.bottom() - 40.0) } else { docked.y };
+    egui::pos2(x, y)
 }
 
-/// A floating window, centred on the screen unless the caller places it, shrink-wrapped to its
-/// content up to its width limit.
-pub fn window<'a>(ctx: &egui::Context, title: impl Into<WidgetText>, width: Width) -> egui::Window<'a> {
-    let max = match width {
-        Width::Normal => WINDOW_MAX_W,
-        Width::Wide => WINDOW_WIDE_MAX_W,
-    };
-    let c = ctx.content_rect().center();
-    egui::Window::new(title)
-        .enabled(!crate::issue_report::cad_input_blocked())
-        .collapsible(false)
-        .pivot(Align2::CENTER_CENTER)
-        .default_pos(c - vec2(0.0, 60.0))
-        .max_width(max)
-}
-
-/// Floating model controls share the report's read-only drawing boundary with windows.
-pub fn area(id: egui::Id) -> egui::Area {
-    egui::Area::new(id).enabled(!crate::issue_report::cad_input_blocked())
-}
-
-/// Heading levels inside a panel: its title, and the sections below it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Level {
-    /// The panel's title row (`Tokens::heading_bg`).
-    Title,
-    /// A section heading (`Tokens::subheading_bg`).
-    Section,
-}
-
-/// Horizontal inner margin of a heading band, on each side.
-pub const HEADING_MARGIN: f32 = 4.0;
-
-/// A heading row drawn on a band `width` wide (a content width, so the band never widens the
-/// window); `add` lays out the row left to right in `width - 2 * HEADING_MARGIN`.
-pub fn heading<R>(ui: &mut Ui, level: Level, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let t = crate::theme::Tokens::get();
-    let fill = match level {
-        Level::Title => t.heading_bg,
-        Level::Section => t.subheading_bg,
-    };
-    let inner = (width - 2.0 * HEADING_MARGIN).max(0.0);
-    egui::Frame::new()
-        .fill(fill)
-        .corner_radius(3)
-        .inner_margin(egui::Margin::symmetric(HEADING_MARGIN as i8, 1))
-        .show(ui, |ui| {
-            ui.set_width(inner);
-            ui.horizontal(add).inner
-        })
-        .inner
-}
-
-/// The width a window's content had last frame (at least `min`), for laying out rows that end at
-/// the right edge.
-pub fn content_width(ui: &Ui, key: egui::Id, min: f32) -> f32 {
-    ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(min).max(min)
-}
-
-/// Remember the content width for next frame (call at the end of the window's content).
-pub fn remember_width(ui: &Ui, key: egui::Id) {
-    let w = ui.min_rect().width();
-    ui.ctx().data_mut(|d| d.insert_temp(key, w));
-}
-
-/// In a horizontal row: push what `add` draws (`width` wide) to the right edge of a content
-/// `total` wide, without making the row any wider than that.
-pub fn right_aligned<R>(ui: &mut Ui, total: f32, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let used = ui.min_rect().width();
-    let gap = (total - used - width - ui.spacing().item_spacing.x).max(0.0);
-    ui.add_space(gap);
-    add(ui)
+/// Let `band` (a docked dialog's title band) drag the dialog: the drag adds to its offset
+/// `moved` (as last frame left it; `applied` of it is where the dialog is now, after keeping
+/// it on screen). Called before the band's buttons are added, so they keep their clicks.
+pub fn drag_dock(ui: &Ui, band: egui::Rect, key: &str, moved: egui::Vec2, applied: egui::Vec2) {
+    crate::scenario::publish_handle("dialog:title", band.center());
+    let response = ui.interact(band, ui.id().with("sc_dock_drag"), egui::Sense::drag());
+    if response.dragged() {
+        let frame = ui.ctx().cumulative_frame_nr();
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("sc_dock_drag_frame"), frame));
+    }
+    // The drag runs from where the press started, so no movement is lost while egui decides
+    // it is a drag, nor on the frame it ends.
+    let base = egui::Id::new("sc_dock_drag_base");
+    if response.drag_started()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+    {
+        ui.ctx().data_mut(|d| d.insert_temp(base, (applied, origin)));
+    }
+    if response.dragged() || response.drag_stopped() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let start = ui.ctx().data(|d| d.get_temp::<(egui::Vec2, Pos2)>(base));
+        let to = match (start, ui.input(|i| i.pointer.latest_pos())) {
+            (Some((start, from)), Some(now)) => start + (now - from),
+            _ => applied + response.drag_delta(),
+        };
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("sc_dock_offset", key)), to));
+    } else if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    } else if moved != applied {
+        // Kept on screen: remember where it is, not where it was dragged off to.
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("sc_dock_offset", key)), applied));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn feature_forms_use_available_height_and_keep_actions_visible() {
-        use crate::scenario::Harness;
-        use serde_json::json;
-        for (width, height, scale) in [(1400.0, 900.0, 1.0), (1400.0, 900.0, 2.0)] {
-            let mut h = Harness::new();
-            h.app.preferences.ui_scale = scale;
-            h.call("ui.resize", json!({"width":width / scale,"height":height / scale}));
-            h.app.run("sketch.create", json!({"plane":"XY","name":"Base"})).unwrap();
-            h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[10,10]})).unwrap();
-            h.app.run("sketch.finish", json!({})).unwrap();
-            h.step(&json!({"start":"solid.extrude"})).unwrap();
-            h.frames(10);
-            let dialog = h.app.viewport.dialog_rect.unwrap();
-            let viewport = h.app.viewport.rect.unwrap();
-            assert!(dialog.height() > 230.0, "scale={scale}: {dialog:?}");
-            assert!(viewport.expand(1.0).contains_rect(dialog), "scale={scale}: {dialog:?} outside {viewport:?}");
-            assert!(h.widget("Distance").is_some(), "distance must be visible without scrolling");
-            if scale == 1.0 {
-                assert!(h.widget("Operation").is_some(), "operation must be visible without scrolling");
+        for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+            use crate::scenario::Harness;
+            use serde_json::json;
+            for (width, height, scale) in [(1400.0, 900.0, 1.0), (1400.0, 950.0, 2.0)] {
+                let mut h = Harness::new();
+                h.call("ui.set", json!({"layout":mode}));
+                h.app.preferences.ui_scale = scale;
+                h.call("ui.resize", json!({"width":width / scale,"height":height / scale}));
+                h.app.run("sketch.create", json!({"plane":"XY","name":"Base"})).unwrap();
+                h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[10,10]})).unwrap();
+                h.app.run("sketch.finish", json!({})).unwrap();
+                h.step(&json!({"start":"solid.extrude"})).unwrap();
+                h.frames(10);
+                let dialog = h.app.viewport.dialog_rect.unwrap();
+                let dialog_content = crate::scenario::count_of("dialog:body:content_height").unwrap();
+                let viewport = h.app.viewport.rect.unwrap();
+                assert!(dialog.height() > 230.0, "scale={scale}: {dialog:?}");
+                assert!(viewport.expand(1.0).contains_rect(dialog), "scale={scale}: {dialog:?} outside {viewport:?}");
+                assert!(h.widget("Distance").is_some(), "distance must be visible without scrolling");
+                if scale == 1.0 {
+                    assert!(h.widget("Operation").is_some(), "operation must be visible without scrolling");
+                }
+                assert!(dialog.contains(crate::scenario::handle_at("dialog:OK").unwrap()));
+                assert!(h.widget("Cancel").is_some(), "cancel must be visible without scrolling");
+                h.step(&json!({"widget":"Cancel"})).unwrap();
+                assert!(h.app.dialog.is_none());
+                h.step(&json!({"start":"solid.shell"})).unwrap();
+                h.frames(8);
+                let short = h.app.viewport.dialog_rect.unwrap();
+                let short_content = crate::scenario::count_of("dialog:body:content_height").unwrap();
+                assert!(
+                    short_content < dialog_content,
+                    "short forms have less content even when both need scrolling: {short_content}, {dialog_content}"
+                );
+                assert!(short.height() <= dialog.height(), "short forms cannot grow taller: {short:?}, {dialog:?}");
+                let t = crate::theme::Tokens::get();
+                let chrome = f64::from(t.form_header_height + t.form_footer_height + t.form_gap_y * 2.0 + t.space_2);
+                if short_content + chrome < f64::from(dialog.height()) {
+                    assert!(short.height() < dialog.height(), "unconstrained short forms must shrink: {short:?}, {dialog:?}");
+                }
+                assert!(viewport.expand(1.0).contains_rect(short));
+                assert!(h.widget("Cancel").is_some());
+                h.step(&json!({"widget":"Cancel"})).unwrap();
+                h.step(&json!({"start":"solid.hole"})).unwrap();
+                if let Some(crate::dialogs::Dialog { kind: crate::dialogs::Kind::Hole { kind, opts, .. }, .. }) = h.app.dialog.as_mut() {
+                    *kind = 1;
+                    opts.tapped = true;
+                }
+                h.frames(8);
+                let long = h.app.viewport.dialog_rect.unwrap();
+                assert!(viewport.expand(1.0).contains_rect(long), "long form clipped: {long:?}");
+                assert!(h.widget("Cancel").is_some(), "long-form actions must stay visible");
+                assert!(long.contains(crate::scenario::handle_at("dialog:OK").unwrap()));
+                h.step(&json!({"widget":"Cancel"})).unwrap();
+                assert!(h.app.dialog.is_none());
             }
-            assert!(dialog.contains(crate::scenario::handle_at("dialog:OK").unwrap()));
-            assert!(h.widget("Cancel").is_some(), "cancel must be visible without scrolling");
-            h.step(&json!({"widget":"Cancel"})).unwrap();
-            assert!(h.app.dialog.is_none());
-            h.step(&json!({"start":"solid.shell"})).unwrap();
-            h.frames(8);
-            let short = h.app.viewport.dialog_rect.unwrap();
-            assert!(short.height() < dialog.height(), "short forms should shrink: {short:?}, {dialog:?}");
-            assert!(h.widget("Cancel").is_some());
-            h.step(&json!({"widget":"Cancel"})).unwrap();
-            h.step(&json!({"start":"solid.hole"})).unwrap();
-            if let Some(crate::dialogs::Dialog { kind: crate::dialogs::Kind::Hole { kind, opts, .. }, .. }) = h.app.dialog.as_mut() {
-                *kind = 1;
-                opts.tapped = true;
-            }
-            h.frames(8);
-            let long = h.app.viewport.dialog_rect.unwrap();
-            assert!(viewport.expand(1.0).contains_rect(long), "long form clipped: {long:?}");
-            assert!(h.widget("Cancel").is_some(), "long-form actions must stay visible");
-            assert!(long.contains(crate::scenario::handle_at("dialog:OK").unwrap()));
-            h.step(&json!({"widget":"Cancel"})).unwrap();
-            assert!(h.app.dialog.is_none());
         }
     }
-    /// Windows are made in this file only, so none can skip the width limits.
+
+    /// #5086: while a docked dialog's title is dragged, the pointer can outrun the dialog; the
+    /// model under it must not highlight until the drag ends.
     #[test]
-    fn windows_come_from_the_frame_helper() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut bad = Vec::new();
-        for e in std::fs::read_dir(&dir).unwrap() {
-            let p = e.unwrap().path();
-            if p.extension().is_some_and(|x| x == "rs") && p.file_name().is_some_and(|n| n != "frame.rs") {
-                let text = std::fs::read_to_string(&p).unwrap();
-                if text.contains("Window::new(") {
-                    bad.push(p.display().to_string());
-                }
-            }
+    fn dragging_a_docked_dialog_blocks_viewport_hover() {
+        use crate::scenario::Harness;
+        use serde_json::json;
+
+        for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+            let mut h = Harness::new();
+            h.call("ui.set", json!({"layout": mode}));
+            h.call("ui.resize", json!({"width": 2400, "height": 900}));
+            h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).unwrap();
+            h.call("ui.view", json!({"view": "fit"}));
+            h.app.ui.pick_bodies = true;
+            let p = h.app.viewport.rect.unwrap().center();
+            h.call("ui.move", json!({"x": p.x, "y": p.y}));
+            assert!(h.app.viewport.hover.is_some(), "the uncovered model must highlight");
+            h.step(&json!({"start": "parameters.change"})).unwrap();
+            h.frames(6);
+            let title = crate::scenario::handle_at("dialog:title").unwrap();
+            assert!(!h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_params_dialog"))).unwrap().contains(p));
+            h.call("ui.move", json!({"x": title.x, "y": title.y}));
+            h.app.synthetic.push(egui::Event::PointerButton {
+                pos: title,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            });
+            h.frame();
+            h.app.synthetic.push(egui::Event::PointerMoved(p));
+            h.frame();
+            assert!(h.ctx.dragged_id().is_some(), "the title must own the drag");
+            assert!(!h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_params_dialog"))).unwrap().contains(p), "the pointer must outrun the dialog");
+            assert!(h.app.viewport.hover.is_none(), "dragging a dialog must block model highlights");
+            assert!(h.app.viewport.mouse.is_none(), "the viewport must not receive the drag pointer");
+            h.frames(2);
+            assert!(h.app.viewport.hover.is_none(), "a stationary drag must still block highlights");
+            h.app.synthetic.push(egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            });
+            h.frame();
+            h.app.params = None;
+            h.frames(2);
+            assert!(h.app.viewport.hover.is_some(), "hover must return after the dialog closes");
         }
-        assert!(bad.is_empty(), "use crate::frame::{{docked, window}} instead of egui::Window::new in {bad:?}");
+    }
+
+    /// #1335: a dialog keeps its size while its Select chip is hovered, and its title band
+    /// drags it; reopening keeps its position.
+    #[test]
+    fn a_docked_dialog_keeps_its_size_under_the_pointer_and_moves_by_its_title() {
+        for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+            use crate::scenario::Harness;
+            use serde_json::json;
+            let mut h = Harness::new();
+            h.call("ui.set", json!({"layout":mode}));
+            h.call("ui.resize", json!({"width":1400.0,"height":900.0}));
+            h.step(&json!({"start":"sketch.create"})).unwrap();
+            h.frames(6);
+            let rest = h.app.viewport.dialog_rect.unwrap();
+            let chip = crate::scenario::handle_at("dialog:Plane").unwrap();
+            h.call("ui.move", json!({"x": chip.x, "y": chip.y}));
+            h.frames(6);
+            let hovered = h.app.viewport.dialog_rect.unwrap();
+            assert!((hovered.size() - rest.size()).length() < 0.01, "hovering resized the dialog: {rest:?} -> {hovered:?}");
+            // Drag the published title band, independent of similarly labelled toolbar controls.
+            let title = crate::scenario::handle_at("dialog:title").unwrap();
+            h.call("ui.drag", json!({"x0": title.x, "y0": title.y, "x1": title.x - 300.0, "y1": title.y + 120.0, "steps": 8}));
+            h.frames(4);
+            let moved = h.app.viewport.dialog_rect.unwrap();
+            assert!((moved.min - rest.min - egui::vec2(-300.0, 120.0)).length() < 2.0, "{rest:?} -> {moved:?}");
+            assert!(h.app.dialog.is_some(), "dragging the title keeps the dialog open");
+            // Dragged far off, it stays on screen.
+            let title = crate::scenario::handle_at("dialog:title").unwrap();
+            h.call("ui.drag", json!({"x0": title.x, "y0": title.y, "x1": title.x + 3000.0, "y1": title.y + 3000.0, "steps": 8}));
+            h.frames(4);
+            let viewport = h.app.viewport.rect.unwrap();
+            assert!(viewport.contains(h.app.viewport.dialog_rect.unwrap().min));
+            let last = h.app.viewport.dialog_rect.unwrap();
+            h.step(&json!({"key":"Escape"})).unwrap();
+            h.frames(2);
+            assert!(h.app.dialog.is_none());
+            h.step(&json!({"start":"sketch.create"})).unwrap();
+            h.frames(6);
+            assert!((h.app.viewport.dialog_rect.unwrap().min - last.min).length() < 0.01, "reopening keeps the dragged position");
+        }
+    }
+    #[test]
+    fn command_dialogs_keep_the_dragged_position_after_closing() {
+        use crate::scenario::Harness;
+        use serde_json::json;
+        for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+            let mut h = Harness::new();
+            h.call("ui.set", json!({"layout":mode}));
+            h.call("ui.resize", json!({"width":1400.0,"height":900.0}));
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[10,10]})).unwrap();
+            h.app.run("sketch.finish", json!({})).unwrap();
+            h.app.run("solid.extrude", json!({"distance":10})).unwrap();
+            h.step(&json!({"start":"solid.extrude"})).unwrap();
+            h.frames(6);
+            let rest = h.app.viewport.dialog_rect.unwrap();
+            let title = crate::scenario::handle_at("dialog:title").unwrap();
+            h.call("ui.drag", json!({"x0":title.x,"y0":title.y,"x1":title.x-300.0,"y1":title.y+60.0,"steps":8}));
+            h.frames(4);
+            let moved = h.app.viewport.dialog_rect.unwrap();
+            assert!((moved.min - rest.min - egui::vec2(-300.0, 60.0)).length() < 2.0);
+            h.step(&json!({"key":"Escape"})).unwrap();
+            h.frames(4);
+            assert!(h.app.dialog.is_none());
+            h.step(&json!({"start":"solid.fillet"})).unwrap();
+            h.frames(6);
+            let fillet = h.app.viewport.dialog_rect.unwrap();
+            assert!((fillet.right_top() - moved.right_top()).length() < 2.0, "Extrude: {moved:?}, Fillet: {fillet:?}");
+            // A smaller window keeps the kept place on screen.
+            h.step(&json!({"key":"Escape"})).unwrap();
+            h.frames(4);
+            h.call("ui.resize", json!({"width":700.0,"height":500.0}));
+            h.step(&json!({"start":"solid.fillet"})).unwrap();
+            h.frames(6);
+            let viewport = h.app.viewport.rect.unwrap();
+            assert!(viewport.contains(h.app.viewport.dialog_rect.unwrap().min), "{viewport:?}");
+        }
     }
 }

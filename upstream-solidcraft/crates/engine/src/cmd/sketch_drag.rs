@@ -15,7 +15,7 @@
 use std::f64::consts::{PI, TAU};
 
 use solidcraft_geom::Vec2;
-use solidcraft_sketch::{Analysis, Budget, ConstraintKind, CurveKind, Hold, Sketch};
+use solidcraft_sketch::{Analysis, Budget, ConstraintKind, CurveKind, Hold, Sketch, conic_rho_from_point};
 
 use super::{Ent, Left, counted_solve};
 
@@ -36,6 +36,8 @@ const MAX_STEPS: usize = 64;
 /// After a step fails, the way to it from the last solved state is halved until what is left is
 /// shorter than a step over this; at most `MAX_STEPS` such solves per drag.
 const HALVINGS: usize = 16;
+/// Steps of a drag that isn't live solved at once past a failed step (see [`drag_entity`]).
+const AHEAD: usize = 8;
 /// An arc whose sweep gets this close (radians) to 0 or a full turn has run into its start.
 const SWEEP_EPS: f64 = 1e-6;
 
@@ -47,13 +49,18 @@ enum Path {
     Radius { c: usize, from: f64, to: f64 },
     /// An arc's ends move along their rays from the centre `o` to the cursor's radius.
     ArcRadius { o: Vec2, ends: Vec<(usize, Vec2)>, from: f64, to: f64 },
+    /// A conic's `rho` follows the cursor, read off its position between the chord's midpoint
+    /// and the apex (see [`solidcraft_sketch::conic_rho_from_point`]). `a`, `b` and `apex` stay
+    /// put; only the curve's fullness changes, the way an ellipse's outline changes its minor
+    /// radius rather than sliding the ellipse.
+    ConicRho { c: usize, from: f64, to: f64 },
 }
 
 impl Path {
     fn length(&self) -> f64 {
         match self {
             Path::Slide { d, .. } => d.len(),
-            Path::Radius { from, to, .. } | Path::ArcRadius { from, to, .. } => (to - from).abs(),
+            Path::Radius { from, to, .. } | Path::ArcRadius { from, to, .. } | Path::ConicRho { from, to, .. } => (to - from).abs(),
         }
     }
 
@@ -61,7 +68,7 @@ impl Path {
     fn points(&self) -> impl Iterator<Item = usize> + '_ {
         let pts = match self {
             Path::Slide { pts, .. } | Path::ArcRadius { ends: pts, .. } => pts.as_slice(),
-            Path::Radius { .. } => &[],
+            Path::Radius { .. } | Path::ConicRho { .. } => &[],
         };
         pts.iter().map(|(q, _)| *q)
     }
@@ -90,32 +97,77 @@ impl Path {
                     *r = from + (to - from) * t;
                 }
             }
+            Path::ConicRho { c, from, to } => {
+                if let Some(CurveKind::Conic { rho, .. }) = sk.curves.get_mut(*c).map(|x| &mut x.kind) {
+                    *rho = from + (to - from) * t;
+                }
+            }
         }
     }
 }
 
-/// Drag: the grabbed entity follows the cursor exactly (a point goes to it; a line,
-/// spline or conic slides by the cursor's move; a circle or arc grabbed on its edge changes
-/// radius about its centre) and the rest of the sketch moves as little as it can, staying on the
+/// Drag: the grabbed entity follows the cursor where possible (a point or a material point on a
+/// line moves toward it; a spline slides by the cursor's move; a circle or arc changes radius about its
+/// centre; a conic grabbed on its curve reads its fullness, `rho`, off the cursor) and the rest
+/// of the sketch moves as little as it can, staying on the
 /// solution it started on. Fixed geometry stays. A step that cannot be solved with the entity
 /// held (the path crosses where the geometry cannot reach) is approached by halving the way to
 /// it, and the next steps are tried from the last solved state, the last of them being the whole
-/// remaining move. When none past it solves, the first failed step stays placed but unsolved:
+/// remaining move. A point or line whose exact pin fails instead minimizes cursor distance in
+/// the design's remaining freedom, retaining only corrected, feasible poses. For other entities,
+/// when none past it solves, the first failed step stays placed but unsolved:
 /// the edit's ordinary, non-strict solve that follows (seeded on the last solved state, see
 /// [`Left::MovedFrom`]) then pulls it back (fully constrained geometry) or leaves the sketch
 /// unsolved for the user to see. A step that would sweep an arc through its own start is undone
 /// and the drag ends there. Returns how far it got and what it leaves for the edit's solve
-/// ([`Left::Solved`]: the held solve of the last step it kept left the sketch solved).
+/// ([`Left::Solved`]: the retained pose satisfies the design constraints, even without progress).
 ///
-/// `live`: one frame of an interactive drag, whose held solves share one frame's decomposition
-/// budget ([`Budget::frame`]); otherwise each has a solve's own.
-pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: bool) -> (Dragged, Left) {
-    let Some((path, hold, n, short)) = prepare(sk, e, from, to) else {
-        return (Dragged { reached: 0.0, moving: Vec::new() }, Left::Unsolved);
+/// `with`: the rest of a selection dragged by one of its entities; all of it slides by the
+/// cursor's move as one (see [`plan_group`]).
+///
+/// `live`: one frame of an interactive drag, whose held solves and cursor correction share
+/// one frame's work budget ([`Budget::frame`]); otherwise each has a solve's own.
+///
+/// `solved`: the sketch as last evaluated. When it is unchanged and solved, a grabbed entity it
+/// determined is not dragged.
+pub(super) fn drag_entity(
+    sk: &mut Sketch,
+    e: Ent,
+    with: &[Ent],
+    from: Vec2,
+    to: Vec2,
+    live: bool,
+    solved: Option<&solidcraft_doc::SolvedSketch>,
+) -> (Dragged, Left) {
+    // An unchanged, solved entity with no freedom cannot follow a drag. Holding it at a
+    // different position only makes its constraints conflict, and a large pattern would spend
+    // minutes trying dense solves before returning to the same geometry (#2006).
+    if solved.is_some_and(|ss| {
+        ss.report.ok()
+            && ss.sketch == *sk
+            && match e {
+                Ent::Point(q) => ss.report.point_determined.get(q),
+                Ent::Curve(c) => ss.report.curve_determined.get(c),
+            }
+            .copied()
+            .unwrap_or(false)
+    }) {
+        return (Dragged::default(), Left::Solved);
+    }
+    let Some((path, hold, n, short)) = prepare(sk, e, with, from, to) else {
+        return (Dragged::default(), Left::Unsolved);
     };
+    // A point dragged alone that ends tangent lines: each step first tries with their other ends
+    // held too, and only when that can't be solved lets them move. Unheld, the solver spread its
+    // correction over every free point, so the line's far end moved (towards the dragged one)
+    // where the curve it is tangent to could have taken the change, as holding that end by hand
+    // showed.
+    let keep = keep_line_ends(sk, e, with, &hold);
     #[cfg(test)]
     let (n, short) = (n.min(step_cap::get()), short.min(step_cap::get()));
-    let moving = path.points().filter_map(|q| Some((q, sk.point(q)?))).collect();
+    let moving: Vec<_> = path.points().filter_map(|q| Some((q, sk.point(q)?))).collect();
+    let line_grab = if with.is_empty() { LineGrab::new(sk, e, from) } else { None };
+    let start = line_grab.and_then(|g| g.point(sk)).or_else(|| if let Ent::Point(q) = e { sk.point(q) } else { None });
     let mut frame = live.then(frame_budget);
     // Only success matters to these solves: the degrees of freedom of a sketch with the entity
     // held are not the sketch's. Each is seeded on the last solved state (`last`), so what the
@@ -123,15 +175,28 @@ pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: b
     // undone (a failed solve leaves the step placed). Also returns whether the decomposition ran
     // out of budget.
     let mut solves = Solves::default();
-    let mut step = |sk: &mut Sketch, last: &Geometry, t: f64, solves: &mut Solves| {
+    // Whether the sketch follows step `t` (with the tangent lines' far ends held, else free).
+    let held = |sk: &mut Sketch, last: &Geometry, t: f64, budget: &mut Budget| {
         path.apply(sk, t);
+        let kept = keep.as_ref().is_some_and(|keep| {
+            let ok = counted_solve(sk, keep, Some(&last.pos), Analysis::StatusOnly, Some(&mut *budget)).ok() && !last.sweep_wrapped(sk);
+            if !ok {
+                last.restore(sk);
+                path.apply(sk, t);
+            }
+            ok
+        });
+        kept || counted_solve(sk, &hold, Some(&last.pos), Analysis::StatusOnly, Some(&mut *budget)).ok()
+    };
+    let mut step = |sk: &mut Sketch, last: &Geometry, t: f64, solves: &mut Solves| {
         let mut own = Budget::full();
         let budget = frame.as_mut().unwrap_or(&mut own);
         let spent = budget.spent();
-        let ok = counted_solve(sk, &hold, Some(&last.pos), Analysis::StatusOnly, Some(&mut *budget)).ok();
+        let ok = held(sk, last, t, budget);
         solves.count += 1;
         solves.work += budget.spent() - spent;
         solves.cut |= budget.exhausted();
+        solves.numeric |= budget.numeric_exhausted();
         let outcome = if !ok {
             Step::Failed
         } else if last.sweep_wrapped(sk) {
@@ -150,20 +215,61 @@ pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: b
     // The steps: `k` of `dt` from `base`; once a seed ran out of budget, the rest of the way in
     // short steps.
     let (mut base, mut dt, mut k, mut t) = (0.0, 1.0 / n as f64, 0, 0.0);
+    // The `k`-th step from `base`; the last ends exactly at the cursor.
+    let at = |base: f64, dt: f64, k: usize| {
+        let t = base + dt * k as f64;
+        if 1.0 - t < 0.5 * dt { 1.0 } else { t }
+    };
     let mut shortened = false;
+    let mut wrapped = false;
+    let mut out_of_frame = false;
     'walk: while t < 1.0 {
+        // A live frame whose numerical solves have done their share takes no more steps: the
+        // rest of the way waits for the next frame (`retry`), instead of seconds of held solves
+        // in this one, all failing where the geometry can't follow.
+        if solves.numeric {
+            out_of_frame = true;
+            break 'walk;
+        }
         if solves.cut && !shortened {
             shortened = true;
             let rest = 1.0 - t;
             let m = steps(rest * short as f64, 1.0);
             (base, dt, k) = (t, rest / m as f64, 0);
         }
-        k += 1;
-        t = base + dt * k as f64;
-        // The last step ends exactly at the cursor.
-        if 1.0 - t < 0.5 * dt {
-            t = 1.0;
+        // Past a failed step, every next one starts from the last solved state again and a failed
+        // one leaves nothing for the one after. Unless the drag is live (its steps share the
+        // frame's budget), the next few are solved at once, on all cores, and those that fail
+        // in a row are taken as tried: the walk goes on where it would have, one by one, at the
+        // first of them that doesn't fail, without the seconds of failing solves before it.
+        #[cfg(test)]
+        let ahead = last_drag::ahead();
+        #[cfg(not(test))]
+        let ahead = true;
+        if ahead && !live && failed.is_some() && line_grab.is_none() {
+            let ahead: Vec<f64> =
+                (1..=AHEAD).map(|j| at(base, dt, k + j)).scan(false, |done, t| (!std::mem::replace(done, t >= 1.0)).then_some(t)).collect();
+            let tried = solidcraft_kernel::map_on_threads(&ahead, AHEAD, |&t| {
+                let mut sk = sk.clone();
+                let mut budget = Budget::full();
+                let ok = held(&mut sk, &last, t, &mut budget);
+                (ok, budget.spent(), budget.exhausted())
+            });
+            let failing = tried.iter().take_while(|r| matches!(r, Some((false, _, false)))).flatten().collect::<Vec<_>>();
+            if !failing.is_empty() {
+                for (_, work, _) in &failing {
+                    solves.count += 1;
+                    solves.work += work;
+                }
+                k += failing.len();
+                t = at(base, dt, k);
+                #[cfg(test)]
+                last_drag::add_skipped(failing.len());
+                continue 'walk;
+            }
         }
+        k += 1;
+        t = at(base, dt, k);
         match step(sk, &last, t, &mut solves) {
             Step::Solved => {
                 (good, failed) = (t, None);
@@ -173,10 +279,17 @@ pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: b
                 continue;
             }
             Step::Wrapped => {
+                wrapped = true;
                 failed = None;
                 break 'walk;
             }
             Step::Failed => {}
+        }
+        // Translating both ends can be impossible although a link can rotate. Do not spend
+        // the frame walking more impossible pins: optimize the point actually grabbed.
+        if line_grab.is_some() {
+            failed = Some(t);
+            break 'walk;
         }
         if failed.is_none() {
             // Halve the way to the failed step, so the state the next steps start from (and are
@@ -185,7 +298,7 @@ pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: b
             let fine = dt / HALVINGS as f64;
             let mut miss = t;
             let mut first = true;
-            while spare > 0 && miss - good > fine {
+            while spare > 0 && miss - good > fine && !solves.numeric {
                 spare -= 1;
                 let mid = if std::mem::take(&mut first) { good + fine } else { 0.5 * (good + miss) };
                 match step(sk, &last, mid, &mut solves) {
@@ -193,11 +306,55 @@ pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: b
                         good = mid;
                         last.take(sk);
                     }
-                    Step::Wrapped => break 'walk,
+                    Step::Wrapped => {
+                        wrapped = true;
+                        break 'walk;
+                    }
                     Step::Failed => miss = mid,
                 }
             }
             failed = Some(t);
+        }
+    }
+    // First retain held continuation across unreachable stretches of an otherwise reachable
+    // path (for example an arm dragged through the hole around its shoulder). If it cannot
+    // arrive, optimize the full cursor target without relaxing the design constraints.
+    if !wrapped
+        && with.is_empty()
+        && (matches!(e, Ent::Point(_)) || line_grab.is_some())
+        && (failed.is_some() || line_grab.and_then(|g| g.point(sk)).is_some_and(|at| at.dist(to) > 1e-7))
+    {
+        let (points, radii) = sk.coupled(&hold.points, &hold.radii);
+        let size = smallest_size(sk, &hold, Some(Group { points: &points, radii: &radii }));
+        let max_step = (size * SHORT_STEP_FRACTION).min(path.length()).max(MIN_STEP);
+        #[cfg(test)]
+        let spent = frame.as_ref().map_or(0, Budget::spent);
+        let valid = |before: &Sketch, after: &Sketch| {
+            let mut geometry = Geometry::default();
+            geometry.take(before);
+            !geometry.sweep_wrapped(after) && solidcraft_sketch::fillets_kept(before, after)
+        };
+        let followed = match (e, line_grab) {
+            (Ent::Point(q), _) => solidcraft_sketch::move_point_towards(sk, q, to, max_step, frame.as_mut(), valid),
+            (_, Some(g)) => solidcraft_sketch::move_line_towards(sk, g.curve, g.local, to, max_step, frame.as_mut(), valid),
+            _ => false,
+        };
+        #[cfg(test)]
+        if let Some(budget) = &frame {
+            solves.work += budget.spent() - spent;
+            solves.cut |= budget.exhausted();
+        }
+        if followed {
+            #[cfg(test)]
+            last_drag::set(solves);
+            let at = line_grab.and_then(|g| g.point(sk)).or_else(|| if let Ent::Point(q) = e { sk.point(q) } else { None });
+            let reached = start.zip(at).map_or(0.0, |(start, at)| {
+                let d = to - start;
+                if at.dist(to) < 1e-6 || d.dot(d) == 0.0 { 1.0 } else { ((at - start).dot(d) / d.dot(d)).clamp(0.0, 1.0) }
+            });
+            let spent = out_of_frame || frame.as_ref().is_some_and(Budget::exhausted);
+            let retry = spent && start.zip(at).is_some_and(|(a, b)| a.dist(b) > 1e-9);
+            return (Dragged { reached, moving, line_grab, retry }, Left::Solved);
         }
     }
     #[cfg(test)]
@@ -211,16 +368,19 @@ pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: b
         None if good > 0.0 => Left::Solved,
         None => Left::Unsolved,
     };
-    (Dragged { reached: good, moving }, left)
+    // The next frame goes on only from progress: a grab that can't move asks for no more.
+    (Dragged { reached: good, moving, line_grab, retry: out_of_frame && good > 0.0 }, left)
 }
 
-/// The held solves of one drag: how many, the decomposition work they did, and whether one ran
-/// out of budget.
+/// The held solves of one drag: how many, their shared work (including cursor correction),
+/// and whether it ran out of budget.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Solves {
     pub count: usize,
     pub work: usize,
     pub cut: bool,
+    /// The frame's numerical solves have done their share ([`Budget::numeric_exhausted`]).
+    pub numeric: bool,
 }
 
 /// One live frame's decomposition budget (smaller in tests that set one).
@@ -228,6 +388,10 @@ fn frame_budget() -> Budget {
     #[cfg(test)]
     if let Some(work) = last_drag::frame_work() {
         return Budget::new(work);
+    }
+    #[cfg(test)]
+    if let Some(work) = last_drag::frame_numeric() {
+        return Budget::frame().with_numeric(work);
     }
     Budget::frame()
 }
@@ -240,8 +404,11 @@ pub(super) mod last_drag {
     use super::Solves;
 
     thread_local! {
-        static LAST: Cell<Solves> = const { Cell::new(Solves { count: 0, work: 0, cut: false }) };
+        static LAST: Cell<Solves> = const { Cell::new(Solves { count: 0, work: 0, cut: false, numeric: false }) };
         static FRAME: Cell<Option<usize>> = const { Cell::new(None) };
+        static NUMERIC: Cell<Option<usize>> = const { Cell::new(None) };
+        static AHEAD: Cell<bool> = const { Cell::new(true) };
+        static SKIPPED: Cell<usize> = const { Cell::new(0) };
     }
 
     pub fn set(s: Solves) {
@@ -271,6 +438,53 @@ pub(super) mod last_drag {
         let _restore = Restore(FRAME.with(|c| c.replace(Some(work))));
         f()
     }
+
+    pub fn frame_numeric() -> Option<usize> {
+        NUMERIC.with(Cell::get)
+    }
+
+    /// Restores the numerical allowance when dropped, also when the test panics.
+    struct RestoreNumeric(Option<usize>);
+
+    impl Drop for RestoreNumeric {
+        fn drop(&mut self) {
+            NUMERIC.with(|c| c.set(self.0));
+        }
+    }
+
+    /// Run `f` with live frames given `work` units for their numerical solves.
+    pub fn with_frame_numeric<R>(work: usize, f: impl FnOnce() -> R) -> R {
+        let _restore = RestoreNumeric(NUMERIC.with(|c| c.replace(Some(work))));
+        f()
+    }
+
+    pub fn ahead() -> bool {
+        AHEAD.with(Cell::get)
+    }
+
+    /// Failed steps taken as tried from the steps solved at once, since the last call.
+    pub fn skipped() -> usize {
+        SKIPPED.with(|c| c.replace(0))
+    }
+
+    pub fn add_skipped(n: usize) {
+        SKIPPED.with(|c| c.set(c.get() + n));
+    }
+
+    /// Restores solving steps ahead when dropped, also when the test panics.
+    struct RestoreAhead(bool);
+
+    impl Drop for RestoreAhead {
+        fn drop(&mut self) {
+            AHEAD.with(|c| c.set(self.0));
+        }
+    }
+
+    /// Run `f` with every step of a drag solved one by one, as before steps were solved ahead.
+    pub fn one_by_one<R>(f: impl FnOnce() -> R) -> R {
+        let _restore = RestoreAhead(AHEAD.with(|c| c.replace(false)));
+        f()
+    }
 }
 
 /// How one held solve of a drag went.
@@ -282,12 +496,54 @@ enum Step {
 }
 
 /// How far a drag got.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Dragged {
     /// The part of the way from where it was grabbed to the cursor the geometry followed (0..1).
     pub reached: f64,
     /// The points the drag moves (not the fixed ones it holds), where they were before it.
     pub moving: Vec<(usize, Vec2)>,
+    pub line_grab: Option<LineGrab>,
+    /// Cursor work stopped at its budget after making progress; another frame can continue.
+    pub retry: bool,
+}
+
+impl Dragged {
+    pub(super) fn at(&self, sk: &Sketch, from: Vec2) -> Vec2 {
+        if let Some(at) = self.line_grab.and_then(|g| g.point(sk)) {
+            return at;
+        }
+        let moves: Vec<_> = self.moving.iter().filter_map(|&(q, was)| Some(sk.point(q)? - was)).collect();
+        from + moves.iter().fold(Vec2::ZERO, |a, m| a + *m) * (1.0 / moves.len().max(1) as f64)
+    }
+}
+
+/// The grabbed position in a line's frame, retained through rotation and constraint correction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LineGrab {
+    curve: usize,
+    a: usize,
+    b: usize,
+    local: Vec2,
+}
+
+impl LineGrab {
+    fn new(sk: &Sketch, e: Ent, from: Vec2) -> Option<Self> {
+        let Ent::Curve(curve) = e else { return None };
+        let CurveKind::Line { a, b } = sk.curves.get(curve)?.kind else { return None };
+        let pa = sk.point(a)?;
+        let d = sk.point(b)? - pa;
+        let len2 = d.dot(d);
+        if !(len2 > 1e-18) {
+            return None;
+        }
+        Some(Self { curve, a, b, local: Vec2::new((from - pa).dot(d) / len2, d.cross(from - pa) / len2) })
+    }
+
+    fn point(self, sk: &Sketch) -> Option<Vec2> {
+        let a = sk.point(self.a)?;
+        let d = sk.point(self.b)? - a;
+        Some(a + d * self.local.x + Vec2::new(-d.y, d.x) * self.local.y)
+    }
 }
 
 /// The geometry a step changes (point positions; curves, for radii and the arc ends a solve
@@ -335,16 +591,48 @@ impl Geometry {
 /// `drag_entity` runs, for tests.
 #[cfg(test)]
 pub(super) fn drag_steps(sk: &Sketch, e: Ent, from: Vec2, to: Vec2) -> usize {
-    prepare(sk, e, from, to).map_or(0, |(_, _, n, _)| n)
+    prepare(sk, e, &[], from, to).map_or(0, |(_, _, n, _)| n)
 }
 
 /// A drag's path, what its solves hold and its number of steps (and of short steps, see
 /// `SHORT_STEP_FRACTION`), or `None` if it cannot move.
-fn prepare(sk: &Sketch, e: Ent, from: Vec2, to: Vec2) -> Option<(Path, Hold, usize, usize)> {
+/// `hold` plus the far ends of the tangent lines a lone dragged point ends (not locked ones, nor the
+/// point itself), or `None` when there are none.
+fn keep_line_ends(sk: &Sketch, e: Ent, with: &[Ent], hold: &Hold) -> Option<Hold> {
+    let Ent::Point(q) = e else { return None };
+    if !with.is_empty() {
+        return None;
+    }
+    let locked = sk.locked_points();
+    let mut keep = hold.clone();
+    // Only lines tangent to a curve: there the far end is what the solver chose to move, where a
+    // free curve could take the change. Other drags keep their one solve a frame.
+    let tangent = |line: usize| sk.constraints.iter().any(|k| matches!(k.kind, ConstraintKind::Tangent { a, b } if a == line || b == line));
+    for (i, c) in sk.curves.iter().enumerate() {
+        if let CurveKind::Line { a, b } = c.kind {
+            if !tangent(i) {
+                continue;
+            }
+            let far = if a == q {
+                b
+            } else if b == q {
+                a
+            } else {
+                continue;
+            };
+            if far != q && !locked.get(far).copied().unwrap_or(true) && !keep.points.contains(&far) {
+                keep.points.push(far);
+            }
+        }
+    }
+    (keep.points.len() > hold.points.len()).then_some(keep)
+}
+
+fn prepare(sk: &Sketch, e: Ent, with: &[Ent], from: Vec2, to: Vec2) -> Option<(Path, Hold, usize, usize)> {
     if !(from.is_finite() && to.is_finite()) {
         return None;
     }
-    let (path, hold) = plan(sk, e, from, to)?;
+    let (path, hold) = if with.is_empty() { plan(sk, e, from, to)? } else { plan_group(sk, e, with, to - from)? };
     let n = step_count(sk, &hold, path.length(), STEP_FRACTION);
     let short = step_count(sk, &hold, path.length(), SHORT_STEP_FRACTION);
     Some((path, hold, n, short))
@@ -430,8 +718,18 @@ fn plan(sk: &Sketch, e: Ent, from: Vec2, to: Vec2) -> Option<(Path, Hold)> {
                     hold.radii.push(c);
                     Path::Radius { c, from: r, to: if minor > 1e-9 { minor } else { r } }
                 }
+                CurveKind::Conic { a, b, apex, rho } => {
+                    // Grabbed on the curve itself: its fullness (`rho`) follows the drag, the
+                    // way an ellipse's outline changes its minor radius rather than sliding the
+                    // ellipse. `a`, `b` and the apex (the tangent intersection, dragged
+                    // separately as an ordinary point) stay where they are.
+                    let (pa, px, pb) = (sk.point(a)?, sk.point(apex)?, sk.point(b)?);
+                    hold.points.extend([a, b, apex]);
+                    let to_rho = conic_rho_from_point(pa, px, pb, to);
+                    Path::ConicRho { c, from: rho, to: to_rho }
+                }
                 k => {
-                    // Lines, splines and conics slide with the cursor.
+                    // Lines and splines slide with the cursor.
                     let mut ids = k.point_ids();
                     ids.sort_unstable();
                     ids.dedup();
@@ -443,6 +741,36 @@ fn plan(sk: &Sketch, e: Ent, from: Vec2, to: Vec2) -> Option<(Path, Hold)> {
         }
     };
     Some((path, hold))
+}
+
+/// A selection dragged by one of its entities (`e`, the rest `with`): every free point of all of
+/// them slides by `d` and the solves hold them all (circles and ellipses keep their radii), so
+/// the selection moves as one instead of its free ends trailing behind the grabbed entity.
+fn plan_group(sk: &Sketch, e: Ent, with: &[Ent], d: Vec2) -> Option<(Path, Hold)> {
+    let mut hold = Hold::default();
+    for e in std::iter::once(&e).chain(with) {
+        match *e {
+            Ent::Point(q) => hold.points.push(q),
+            Ent::Curve(c) => {
+                let Some(kind) = sk.curves.get(c).map(|x| &x.kind) else { continue };
+                hold.points.extend(kind.point_ids());
+                if matches!(kind, CurveKind::Circle { .. } | CurveKind::Ellipse { .. }) {
+                    hold.radii.push(c);
+                }
+            }
+        }
+    }
+    hold.points.sort_unstable();
+    hold.points.dedup();
+    hold.radii.sort_unstable();
+    hold.radii.dedup();
+    let locked = sk.locked_points();
+    let pts: Vec<(usize, Vec2)> =
+        hold.points.iter().filter(|q| !locked.get(**q).copied().unwrap_or(true)).filter_map(|&q| Some((q, sk.point(q)?))).collect();
+    if pts.is_empty() {
+        return None;
+    }
+    Some((Path::Slide { pts, d }, hold))
 }
 
 /// Steps for a move of `length`: enough that none is longer than `fraction` of the smallest

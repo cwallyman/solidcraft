@@ -1,7 +1,7 @@
 //! Delete for everything that can be selected, in one undo step: sketch entities (while
 //! sketching), timeline features and sketches (with the features that depend on them),
-//! construction planes, bodies (a Remove feature from here on in the timeline), occurrences and
-//! components, and canvases. `dry_run` reports what would go and what would fail without
+//! construction planes and axes, bodies (a Remove feature from here on in the timeline), occurrences and
+//! components, canvases and joints. `dry_run` reports what would go and what would fail without
 //! changing anything, so the UI can ask first.
 
 use serde_json::{Value, json};
@@ -13,7 +13,7 @@ use crate::params::{bad, bool_};
 use crate::{EngineError, Result, Sel, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("selection.delete", "Delete", delete).icon("delete").params(
-    "items?: [selection items]; components?, occurrences?, canvases?: [ids or names]; dry_run?: bool → deleted, would_fail, skipped (one undo step)",
+    "items?: [selection items]; components?, occurrences?, canvases?, joints?: [ids or names]; dry_run?: bool → deleted, deleted_joints, would_fail, skipped (one undo step)",
 )];
 
 /// Run another command's body inside this one (so the whole delete is one undo step).
@@ -52,7 +52,25 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         }
         Some(_) => return Err(bad(cmd, "`items` must be a list of selection items")),
     };
+    if let Some(value) = p.get("joints").filter(|v| !v.is_null()) {
+        let Some(joints) = value.as_array() else {
+            return Err(bad(cmd, "`joints` must be a list of ids or names"));
+        };
+        if joints.len() > 10_000 || joints.iter().any(|j| !j.is_string() && j.as_u64().is_none()) {
+            return Err(bad(cmd, "`joints` must contain at most 10000 ids or names"));
+        }
+    }
     let before = s.model.clone();
+    let before_doc = s.doc.clone();
+    let mut joints = p
+        .get("joints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|value| super::joints::joint_id(s, Some(value), cmd))
+        .collect::<Result<Vec<_>>>()?;
+    joints.sort_unstable();
+    joints.dedup();
     let features_before: Vec<(u64, String)> = s.doc.features.iter().map(|f| (f.id, f.name.clone())).collect();
     let mut skipped: Vec<String> = Vec::new();
     let mut skip = |why: String| {
@@ -70,7 +88,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
             Sel::Occurrence { path } => {
                 selected_occurrences.push(s.occurrence_placement(path)?.occurrence.to_string());
             }
-            Sel::SketchCurve { id } | Sel::SketchPoint { id } | Sel::SketchConstraint { id } => entities.push(id.clone()),
+            Sel::SketchCurve { id, .. } | Sel::SketchPoint { id } | Sel::SketchConstraint { id } => entities.push(id.clone()),
             Sel::Feature { id } => {
                 if s.doc.feature(*id).is_none() {
                     return Err(bad(cmd, format!("no feature {id}")));
@@ -81,7 +99,15 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
                 Some(f) if matches!(f.kind, FeatureKind::ConstructionPlane { .. }) => features.push(f.id),
                 _ => skip("the origin planes can't be deleted".into()),
             },
-            Sel::Axis { .. } => skip("the origin axes can't be deleted".into()),
+            Sel::Axis { name } => match s.doc.find_feature(name) {
+                Some(f) if matches!(f.kind, FeatureKind::ConstructionAxis { .. }) => features.push(f.id),
+                _ => skip("the origin axes can't be deleted".into()),
+            },
+            Sel::SketchMidpoint { .. } => skip("a midpoint belongs to its sketch edge".into()),
+            Sel::ConstructionPoint { name } => match s.doc.find_feature(name) {
+                Some(f) if matches!(f.kind, FeatureKind::ConstructionPoint { .. }) => features.push(f.id),
+                _ => skip(format!("no construction point named \"{name}\"")),
+            },
             Sel::Body { name } => bodies.push(name.clone()),
             Sel::Face { body, point, .. } => match faces.iter_mut().find(|(b, _)| b == body) {
                 Some((_, ps)) => ps.push(*point),
@@ -94,6 +120,10 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }
     features.dedup();
     let mut done = false;
+    for id in &joints {
+        sub(s, "joint.delete", json!({"joint": id}))?;
+        done = true;
+    }
     if !entities.is_empty() {
         if s.active_sketch.is_none() {
             skip("sketch entities are deleted while editing their sketch".into());
@@ -161,14 +191,10 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.refresh();
     let deleted: Vec<&String> = features_before.iter().filter(|(id, _)| s.doc.feature(*id).is_none()).map(|(_, n)| n).collect();
-    let would_fail: Vec<String> = s
-        .model
-        .results
-        .iter()
-        .filter(|r| r.error.is_some() && before.result(r.id).is_some_and(|b| b.error.is_none() && !b.skipped))
-        .map(|r| r.name.clone())
-        .collect();
-    Ok(json!({ "deleted": deleted, "bodies": bodies, "would_fail": would_fail, "skipped": skipped }))
+    // Features after a rolled-back marker count too (#3471).
+    let would_fail: Vec<String> =
+        super::edit::newly_broken_in_history(&before_doc, &before, &s.doc, &s.model).into_iter().map(|(name, _)| name).collect();
+    Ok(json!({ "deleted": deleted, "deleted_joints": joints, "bodies": bodies, "would_fail": would_fail, "skipped": skipped }))
 }
 
 #[cfg(test)]
@@ -214,6 +240,36 @@ mod tests {
         assert_eq!(bodies(&s), 2);
     }
 
+    /// With the history rolled back, the checks before a delete look past the marker too (#3471):
+    /// deleting the plate (or its extrude) there breaks the hole cut after the marker, and the
+    /// confirmation must say so instead of the hole's error mark turning up only at the end.
+    #[test]
+    fn the_checks_before_a_delete_in_a_rolled_back_history_see_the_features_after_the_marker() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 20]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 5, "name": "Plate"}));
+        run(&mut s, "solid.cylinder", json!({"base": [20, 10, -1], "radius": 2, "height": 10, "operation": "cut", "name": "Hole"}));
+        let body = s.model.state().bodies[0].name.clone();
+        let plate = s.doc.find_feature("Plate").unwrap().id;
+        for marker in [None, Some(2)] {
+            run(&mut s, "timeline.roll_to", marker.map_or(json!({}), |m| json!({"position": m})));
+            let doc = s.doc.clone();
+            let dry = run(&mut s, "selection.delete", json!({"items": [{"type": "body", "name": body}], "dry_run": true}));
+            // At the end the plate's Remove goes after the hole; rolled back, before it.
+            let breaks = if marker.is_some() { json!(["Hole"]) } else { json!([]) };
+            assert_eq!(dry["would_fail"], breaks, "marker {marker:?}: {dry}");
+            let deps = run(&mut s, "timeline.dependents", json!({"feature": plate}));
+            assert_eq!(deps["would_fail"], json!(["Hole"]), "marker {marker:?}: {deps}");
+            assert_eq!(*s.doc, *doc, "the checks change nothing");
+            assert!(s.model.result(s.doc.find_feature("Hole").unwrap().id).is_some_and(|r| r.skipped == marker.is_some() && r.error.is_none()));
+        }
+        // Deleting anyway (rolled back) still reports what it broke.
+        let done = run(&mut s, "selection.delete", json!({"items": [{"type": "body", "name": body}]}));
+        assert_eq!(done["would_fail"], json!(["Hole"]), "{done}");
+    }
+
     #[test]
     fn mixed_selection_is_one_undo_step() {
         let (mut s, _) = part();
@@ -234,6 +290,31 @@ mod tests {
     }
 
     #[test]
+    fn construction_axis_deletes_with_dry_run_and_undo_but_origin_axes_are_refused() {
+        let mut s = Session::default();
+        run(&mut s, "construct.axis.two_points", json!({"a": {"point": [0, 0, 0]}, "b": {"point": [1, 2, 3]}, "name": "CustomAxis"}));
+        let axis = s.doc.find_feature("CustomAxis").unwrap().id;
+        let depth = s.undo.len();
+        let items = json!([{"type": "axis", "name": "CustomAxis"}, {"type": "axis", "name": "X"}]);
+        let dry = run(&mut s, "selection.delete", json!({"items": items, "dry_run": true}));
+        assert_eq!(dry["deleted"], json!(["CustomAxis"]));
+        assert_eq!(dry["skipped"], json!(["the origin axes can't be deleted"]));
+        assert!(s.doc.feature(axis).is_some());
+        assert_eq!(s.undo.len(), depth);
+        let deleted = run(&mut s, "selection.delete", json!({"items": items}));
+        assert_eq!(deleted, dry);
+        assert!(s.doc.feature(axis).is_none());
+        assert_eq!(s.undo.len(), depth + 1);
+        run(&mut s, "edit.undo", json!({}));
+        assert!(s.doc.feature(axis).is_some());
+        for name in ["X", "Y", "Z"] {
+            let error = s.execute("selection.delete", &json!({"items": [{"type": "axis", "name": name}]})).unwrap_err();
+            assert!(error.to_string().contains("the origin axes can't be deleted"), "{error}");
+            assert!(s.doc.feature(axis).is_some());
+        }
+    }
+
+    #[test]
     fn faces_alone_are_refused_and_hostile_input_too() {
         let (mut s, _) = part();
         let b = s.model.state().bodies[0].name.clone();
@@ -248,6 +329,80 @@ mod tests {
             json!({"components": ["0"]}),
         ] {
             assert!(s.execute("selection.delete", &p).is_err(), "{p}");
+        }
+    }
+
+    fn joint_assembly() -> Session {
+        let mut s = Session::default();
+        for (name, x) in [("A", 0), ("B", 30), ("C", 60)] {
+            run(&mut s, "component.activate", json!({"component": "root"}));
+            run(&mut s, "component.create", json!({"name": name}));
+            run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "corner": [x, 0, 0]}));
+        }
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        run(&mut s, "occurrence.ground", json!({"occurrence": "A:1", "grounded": true}));
+        for (name, other, face) in [("Hinge", "B:1", [40, 10, 0]), ("Glue", "C:1", [70, 10, 0])] {
+            run(
+                &mut s,
+                "joint.create",
+                json!({"type": "revolute", "name": name,
+                "a": {"occurrence": "A:1", "face": [10, 10, 10]}, "b": {"occurrence": other, "face": face}}),
+            );
+        }
+        run(&mut s, "joint.motion_link", json!({"a": "Hinge", "b": "Glue", "ratio": 1}));
+        s
+    }
+
+    #[test]
+    fn selected_joints_and_their_link_are_deleted_in_one_undo_step_with_a_read_only_dry_run() {
+        let mut s = joint_assembly();
+        let features = serde_json::to_value(&s.doc.features).unwrap();
+        let hinge = s.doc.assembly.joints[0].id;
+        let dry = run(&mut s, "selection.delete", json!({"joints": [hinge, "Hinge", "Glue"], "dry_run": true}));
+        assert_eq!(dry["deleted_joints"].as_array().unwrap().len(), 2);
+        assert_eq!(s.doc.assembly.joints.len(), 2);
+        assert_eq!(s.doc.assembly.links.len(), 1);
+        assert_eq!(serde_json::to_value(&s.doc.features).unwrap(), features);
+        run(&mut s, "selection.delete", json!({"joints": [hinge, "Hinge", "Glue"]}));
+        assert!(s.doc.assembly.joints.is_empty() && s.doc.assembly.links.is_empty());
+        assert_eq!(serde_json::to_value(&s.doc.features).unwrap(), features);
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(s.doc.assembly.joints.len(), 2);
+        assert_eq!(s.doc.assembly.links.len(), 1);
+        assert_eq!(serde_json::to_value(&s.doc.features).unwrap(), features);
+        run(&mut s, "edit.redo", json!({}));
+        assert!(s.doc.assembly.joints.is_empty() && s.doc.assembly.links.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_joint_refuses_the_whole_delete_without_losing_features_or_other_joints() {
+        let mut s = joint_assembly();
+        let before = serde_json::to_value(&s.doc.features).unwrap();
+        let feature = s.doc.features[0].id;
+        assert!(s.execute("selection.delete", &json!({"items": [{"type": "feature", "id": feature}], "joints": ["Hinge", "missing"]})).is_err());
+        for joints in [json!("Hinge"), json!([null]), json!([-1]), json!([1.5]), json!(vec!["Hinge"; 10_001])] {
+            assert!(s.execute("selection.delete", &json!({"joints": joints})).is_err());
+        }
+        assert_eq!(serde_json::to_value(&s.doc.features).unwrap(), before);
+        assert_eq!(s.doc.assembly.joints.len(), 2);
+        assert_eq!(s.doc.assembly.links.len(), 1);
+    }
+
+    #[test]
+    fn numeric_joint_ids_do_not_delete_a_different_joint_with_that_numeric_name() {
+        for batch in [false, true] {
+            let mut s = joint_assembly();
+            let hinge = s.doc.assembly.joints[0].id;
+            let glue = s.doc.assembly.joints[1].id;
+            run(&mut s, "joint.edit", json!({"joint": hinge, "name": glue.to_string()}));
+            let features = serde_json::to_value(&s.doc.features).unwrap();
+            let (command, params) = if batch { ("selection.delete", json!({"joints": [glue]})) } else { ("joint.delete", json!({"joint": glue})) };
+            run(&mut s, command, params);
+            assert_eq!(s.doc.assembly.joints.len(), 1);
+            assert_eq!(s.doc.assembly.joints[0].id, hinge, "a numeric id must not match another joint's name");
+            assert_eq!(serde_json::to_value(&s.doc.features).unwrap(), features);
+            run(&mut s, "edit.undo", json!({}));
+            assert_eq!(s.doc.assembly.joints.len(), 2);
         }
     }
 

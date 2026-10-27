@@ -1,6 +1,7 @@
 //! Helpers to read hostile JSON parameters.
 
 use serde_json::Value;
+use solidcraft_doc::Expr;
 use solidcraft_geom::{Vec2, Vec3};
 
 use crate::{EngineError, Result};
@@ -57,17 +58,33 @@ pub fn vec2_list(cmd: &str, p: &Value, k: &str, max: usize) -> Result<Vec<Vec2>>
     a.iter().map(|v| vec2(v).ok_or_else(|| bad(cmd, format!("`{k}` must contain [x, y] points")))).collect()
 }
 
+/// A finite number given for an expression, as the expression's text (`8` → `"8"`, which reads
+/// as mm or degrees by context).
+pub fn number_text(n: &serde_json::Number) -> Option<String> {
+    n.as_f64().and_then(finite).map(|v| format!("{v}"))
+}
+
 /// An expression parameter: a number (mm or degrees by context) or an expression string.
-pub fn expr(p: &Value, k: &str) -> Option<String> {
+pub fn expr(p: &Value, k: &str) -> Option<Expr> {
     match p.get(k)? {
-        Value::Number(n) => n.as_f64().and_then(finite).map(|v| format!("{v}")),
-        Value::String(s) if !s.trim().is_empty() && s.len() <= 4096 => Some(s.trim().to_string()),
+        Value::Number(n) => number_text(n).map(Expr::new),
+        Value::String(s) if !s.trim().is_empty() && s.len() <= 4096 => Some(Expr::new(s.trim())),
         _ => None,
     }
 }
 
-pub fn req_expr(cmd: &str, p: &Value, k: &str) -> Result<String> {
-    expr(p, k).ok_or_else(|| bad(cmd, format!("`{k}` must be a number or an expression")))
+/// Why `v` isn't an expression parameter, for the message: a number out of range or a text too
+/// long says so, rather than that it isn't a number or an expression at all.
+pub fn expr_problem(v: Option<&Value>) -> &'static str {
+    match v {
+        Some(Value::Number(n)) if n.as_f64().is_some_and(f64::is_finite) => "must be a number between -1e9 and 1e9",
+        Some(Value::String(s)) if s.len() > 4096 => "must be an expression of at most 4096 characters",
+        _ => "must be a number or an expression",
+    }
+}
+
+pub fn req_expr(cmd: &str, p: &Value, k: &str) -> Result<Expr> {
+    expr(p, k).ok_or_else(|| bad(cmd, format!("`{k}` {}", expr_problem(p.get(k)))))
 }
 
 pub fn string_list(p: &Value, k: &str) -> Vec<String> {

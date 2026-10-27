@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 
 use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, vec2};
-use solidcraft_engine::geom::Vec3;
+use solidcraft_engine::geom::{Ring, Vec3};
 
 use crate::theme::Tokens;
 use crate::viewport::{Proj, projected_polygon};
@@ -68,7 +68,7 @@ struct State {
 
 const DIRS: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
 /// Arrow length on screen (px).
-const LEN_PX: f64 = 110.0;
+pub const LEN_PX: f64 = 110.0;
 
 thread_local! {
     /// The last triad drawn: centre and arrow length in mm (for scenarios and tests).
@@ -114,14 +114,6 @@ fn ring_basis(i: usize) -> (Vec3, Vec3) {
     }
 }
 
-fn axis_color(i: usize) -> Color32 {
-    match i {
-        0 => Color32::from_rgb(225, 70, 60),
-        1 => Color32::from_rgb(80, 190, 80),
-        _ => Color32::from_rgb(70, 130, 240),
-    }
-}
-
 /// Distance from `p` to the screen segment a–b.
 fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -129,13 +121,12 @@ fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     (a + ab * t).distance(p)
 }
 
-fn in_quad(p: Pos2, q: &[Pos2]) -> bool {
+fn in_quad(p: Pos2, q: &Ring<Pos2>) -> bool {
     if q.len() < 3 {
         return false;
     }
     let mut sign = 0.0f32;
-    for i in 0..q.len() {
-        let (a, b) = (q[i], q[(i + 1) % q.len()]);
+    for (&a, &b) in q.edges() {
         let c = (b - a).x * (p - a).y - (b - a).y * (p - a).x;
         if c.abs() < 1e-6 {
             continue;
@@ -150,7 +141,7 @@ fn in_quad(p: Pos2, q: &[Pos2]) -> bool {
 }
 
 /// Where the view ray through `pos` meets the plane through `o` with normal `n`.
-fn on_plane(proj: &Proj, pos: Pos2, o: Vec3, n: Vec3) -> Option<Vec3> {
+pub(crate) fn on_plane(proj: &Proj, pos: Pos2, o: Vec3, n: Vec3) -> Option<Vec3> {
     let (ro, rd) = proj.ray(pos);
     let den = rd.dot(n);
     if den.abs() < 1e-9 {
@@ -174,7 +165,7 @@ fn along(proj: &Proj, pos: Pos2, o: Vec3, d: Vec3) -> Option<f64> {
 /// The triad's shapes: (handle, screen polygon or polyline, is it a filled area).
 struct Shapes {
     arrows: Vec<(usize, Pos2, Pos2)>,
-    planes: Vec<(usize, Vec<Pos2>)>,
+    planes: Vec<(usize, Ring<Pos2>)>,
     rings: Vec<(usize, Vec<Pos2>)>,
     ball: Pos2,
 }
@@ -191,7 +182,7 @@ fn shapes(proj: &Proj, t: &Triad, l: f64) -> Option<Shapes> {
         }
         for i in 0..3 {
             let (e1, e2) = ring_basis(i);
-            let q: Vec<Pos2> = [(0.25, 0.25), (0.45, 0.25), (0.45, 0.45), (0.25, 0.45)]
+            let q: Ring<Pos2> = [(0.25, 0.25), (0.45, 0.25), (0.45, 0.45), (0.25, 0.45)]
                 .iter()
                 .filter_map(|(a, b)| proj.to_screen(c + e1 * (a * l) + e2 * (b * l)))
                 .collect();
@@ -237,6 +228,11 @@ fn mm_per_px(proj: &Proj, c: Vec3) -> Option<f64> {
     (px > 1e-9).then(|| 1.0 / px)
 }
 
+/// Radius shared by the triad rings and the selected-axis Rotate handle.
+pub(crate) fn ring_radius(proj: &Proj, centre: Vec3) -> Option<f64> {
+    Some(mm_per_px(proj, centre)? * LEN_PX * RING)
+}
+
 fn snap(v: f64, step: f64, free: bool) -> f64 {
     if free || step <= 0.0 { v } else { (v / step).round() * step }
 }
@@ -244,6 +240,11 @@ fn snap(v: f64, step: f64, free: bool) -> f64 {
 /// Discard a suspended pointer gesture without reporting a final model change.
 pub(crate) fn cancel(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|d| d.remove::<State>(id));
+}
+
+/// Hit-test before registering the dynamic egui drag widget or changing the camera.
+pub(crate) fn contains_pointer(proj: &Proj, t: &Triad, p: Pos2) -> bool {
+    mm_per_px(proj, t.center).and_then(|scale| shapes(proj, t, scale * LEN_PX)).is_some_and(|sh| hit(&sh, p).is_some())
 }
 
 /// Draw the triad and run a drag on it. `step` is the distance snap step.
@@ -263,7 +264,7 @@ pub fn show(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, id: egui::I
     let hovered = if state.is_none() { pointer.filter(|_| ui.rect_contains_pointer(proj.rect)).and_then(|p| hit(&sh, p)) } else { None };
     let active = state.map(|s| s.handle).or(hovered);
     let hot = |h: Handle| active == Some(h);
-    let col = |h: Handle, i: usize| if hot(h) { tk.accent } else { axis_color(i) };
+    let col = |h: Handle, i: usize| if hot(h) { tk.accent } else { tk.axes()[i.min(2)] };
     for (i, pts) in &sh.rings {
         painter.add(Shape::line(pts.clone(), Stroke::new(if hot(Handle::Ring(*i)) { 3.0 } else { 1.8 }, col(Handle::Ring(*i), *i))));
     }
@@ -280,7 +281,11 @@ pub fn show(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, id: egui::I
     active?;
     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     let r = ui.interact(Rect::from_center_size(p, vec2(24.0, 24.0)), id.with("hit"), Sense::drag());
-    let free = ui.input(|i| i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command);
+    // Free drag is driven by the per-frame thread-local set from prefs::manipulator_free_held.
+    let free = crate::tool_modifiers::manipulator_free();
+    if state.is_some() || r.dragged() || r.drag_started() {
+        crate::tool_modifiers::set_manipulator_dragging(true);
+    }
     let view = proj.ray(sh.ball).1;
     let plane_normal = |h: Handle| match h {
         Handle::Plane(i) | Handle::Ring(i) => DIRS[i],

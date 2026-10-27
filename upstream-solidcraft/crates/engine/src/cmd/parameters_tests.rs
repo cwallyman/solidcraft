@@ -195,6 +195,65 @@ fn deleting_a_used_parameter_lists_its_users() {
     assert!(g["edges"].as_array().unwrap().iter().any(|e| e[0] == "Feature:Base" && e[1] == dim.as_str()), "{g}");
 }
 
+/// #4420: sheet metal and plastic rules and the plane of a canvas hold expressions too. Renaming a
+/// parameter they use renames it there, and they count as its users (so it can't be deleted).
+#[test]
+fn rules_and_canvases_follow_a_renamed_parameter() {
+    let mut s = Session::default();
+    for (name, expression) in [("gauge", "2 mm"), ("lift", "15 mm"), ("taper", "3 deg")] {
+        run(&mut s, "parameters.add", json!({"name": name, "expression": expression}));
+    }
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    png.extend([0, 0, 0, 4, 0, 0, 0, 2, 8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    run(&mut s, "canvas.insert", json!({"data": solidcraft_doc::canvas::base64_encode(&png), "plane": "XY", "offset": "lift"}));
+    run(&mut s, "sheet.manage_rules", json!({"name": "Steel", "thickness": "gauge", "active": true}));
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 2, "body_name": "Tray"}));
+    run(&mut s, "sheet.convert", json!({"body": "Tray", "face": [30, 20, 2], "rule": "Steel"}));
+    run(&mut s, "plastic.manage_rules", json!({"name": "Housing", "draft": "taper", "clearance": "gauge / 10"}));
+    let users = |s: &mut Session, name: &str| -> Vec<String> {
+        let u = run(s, "parameters.users", json!({"name": name}));
+        u["users"].as_array().unwrap().iter().map(|x| x["type"].as_str().unwrap_or_default().to_string()).collect()
+    };
+    assert_eq!(users(&mut s, "gauge"), ["rule", "rule"], "the sheet metal thickness and the plastic clearance");
+    assert_eq!(users(&mut s, "lift"), ["canvas"]);
+    let e = err(&mut s, "parameters.delete", json!({"name": "taper"}));
+    assert!(e.contains("plastic rule Housing (draft)"), "{e}");
+    // The sheet metal features rebuild when a rule's parameter changes, so they are what it drives.
+    let u = run(&mut s, "parameters.users", json!({"name": "gauge"}));
+    assert_eq!(
+        u["drives"].as_array().map(|d| d.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()),
+        Some(vec![json!("ConvertToSheetMetal1")]),
+        "{u}"
+    );
+    let g = run(&mut s, "parameters.graph", json!({}));
+    assert!(g["edges"].as_array().unwrap().iter().any(|e| e[0] == "Feature:ConvertToSheetMetal1" && e[1] == "gauge"), "{g}");
+    assert!(!g["edges"].as_array().unwrap().iter().any(|e| e[0] == "Feature:Box1" && e[1] == "gauge"), "{g}");
+    // Every field of the shared list follows: `gap` was set through `sheet.manage_rules` too.
+    run(&mut s, "parameters.add", json!({"name": "seam", "expression": "0.5 mm"}));
+    run(&mut s, "sheet.manage_rules", json!({"name": "Steel", "gap": "seam"}));
+    run(&mut s, "parameters.rename", json!({"name": "seam", "new_name": "joint_gap"}));
+    assert_eq!(s.doc.sheet.rules[0].gap, "joint_gap");
+    for (old, new) in [("gauge", "sheet_t"), ("lift", "raise"), ("taper", "draft_angle")] {
+        run(&mut s, "parameters.rename", json!({"name": old, "new_name": new}));
+    }
+    let failing: Vec<String> = s.model.results.iter().filter_map(|r| r.error.clone()).collect();
+    assert!(failing.is_empty(), "{failing:?}");
+    assert_eq!(s.doc.sheet.rules[0].thickness, "sheet_t");
+    let housing = s.doc.plastic.rules.iter().find(|r| r.name == "Housing").unwrap();
+    assert_eq!((housing.draft.as_str(), housing.clearance.as_str()), ("draft_angle", "sheet_t / 10"));
+    assert!(run(&mut s, "plastic.rules", json!({}))["rules"].as_array().unwrap().iter().any(|r| r["name"] == "Housing" && !r["values"].is_null()));
+    match &s.doc.canvases[0].plane {
+        solidcraft_doc::PlaneRef::Offset { distance, .. } => assert_eq!(distance.as_ref(), "raise"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(users(&mut s, "raise"), ["canvas"]);
+    // Undo takes the old names back.
+    for _ in 0..3 {
+        run(&mut s, "edit.undo", json!({}));
+    }
+    assert_eq!(s.doc.sheet.rules[0].thickness, "gauge");
+}
+
 #[test]
 fn favorites_comments_and_completion() {
     let mut s = Session::default();
@@ -210,6 +269,27 @@ fn favorites_comments_and_completion() {
     assert_eq!(c["suggestions"][0]["text"], "len", "{c}");
     let c = run(&mut s, "parameters.complete", json!({"prefix": "at"}));
     assert!(c["suggestions"].as_array().unwrap().iter().any(|x| x["text"] == "atan2("), "{c}");
+}
+
+/// #2757: a parameter is suggested for a word anywhere in its name, not only at its start;
+/// names that start with the word come first. Functions still match from the start.
+#[test]
+fn completion_matches_parameters_anywhere_in_their_name() {
+    let mut s = Session::default();
+    for (name, e) in [("cab_side_thickness", "18 mm"), ("side", "40 mm"), ("door_width", "300 mm")] {
+        run(&mut s, "parameters.add", json!({"name": name, "expression": e}));
+    }
+    let texts = |c: &Value| -> Vec<String> {
+        c["suggestions"].as_array().unwrap().iter().filter(|x| x["kind"] == "parameter").map(|x| x["text"].as_str().unwrap().to_string()).collect()
+    };
+    let c = run(&mut s, "parameters.complete", json!({"prefix": "2 * side"}));
+    assert_eq!(texts(&c), ["side", "cab_side_thickness"], "the name starting with it first: {c}");
+    let c = run(&mut s, "parameters.complete", json!({"prefix": "THICK"}));
+    assert_eq!(texts(&c), ["cab_side_thickness"], "any case: {c}");
+    assert!(texts(&run(&mut s, "parameters.complete", json!({"prefix": "xyz"}))).is_empty());
+    // Functions keep matching from the start: `in` is not `sin(`.
+    let c = run(&mut s, "parameters.complete", json!({"prefix": "in"}));
+    assert!(!c["suggestions"].as_array().unwrap().iter().any(|x| x["text"] == "sin("), "{c}");
 }
 
 #[test]
@@ -543,4 +623,133 @@ fn switching_configurations_back_reuses_the_later_features() {
     let r = run(&mut s, "config.activate", json!({"row": "A"}));
     assert!(rel(volume(&mut s), 40.0 * 30.0 * 10.0) < 1e-9);
     assert!(hits(&s) > before, "{r}");
+}
+
+/// The user parameters' names in the order the Parameters dialog lists them.
+fn user_order(s: &mut Session) -> Vec<String> {
+    let v = run(s, "parameters.list", json!({"filter": "user"}));
+    v["parameters"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn user_parameters_reorder_with_undo() {
+    // #1187: move a user parameter before or after another; nothing else changes.
+    let mut s = Session::default();
+    for (n, e) in [("a", "1 mm"), ("b", "2 mm"), ("c", "a + b")] {
+        run(&mut s, "parameters.add", json!({"name": n, "expression": e}));
+    }
+    assert_eq!(user_order(&mut s), ["a", "b", "c"]);
+    let r = run(&mut s, "parameters.move", json!({"name": "c", "before": "a"}));
+    assert_eq!(r["order"], json!(["c", "a", "b"]));
+    assert_eq!(user_order(&mut s), ["c", "a", "b"]);
+    run(&mut s, "parameters.move", json!({"name": "c", "after": "a"}));
+    assert_eq!(user_order(&mut s), ["a", "c", "b"]);
+    // Values and references are untouched; the order is kept in the design file.
+    let list = run(&mut s, "parameters.list", json!({"filter": "user"}));
+    let c = list["parameters"].as_array().unwrap().iter().find(|r| r["name"] == "c").unwrap().clone();
+    assert_eq!(c["expression"], "a + b");
+    assert!((c["value"].as_f64().unwrap() - 3.0).abs() < 1e-9, "{c}");
+    let back = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    let names: Vec<&str> = back.doc.params.iter().filter(|p| !p.model).map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["a", "c", "b"]);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(user_order(&mut s), ["c", "a", "b"]);
+}
+
+#[test]
+fn moving_a_parameter_refuses_bad_targets() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "a", "expression": "1 mm"}));
+    run(&mut s, "parameters.add", json!({"name": "b", "expression": "2 mm"}));
+    let before = s.doc.to_json();
+    for p in [
+        json!({"name": "a", "before": "a"}),
+        json!({"name": "a", "before": "nope"}),
+        json!({"name": "nope", "before": "a"}),
+        json!({"name": "a"}),
+        json!({"name": "a", "before": "b", "after": "b"}),
+    ] {
+        err(&mut s, "parameters.move", p);
+    }
+    assert_eq!(s.doc.to_json(), before);
+}
+
+#[test]
+fn a_large_import_is_checked_once_and_keeps_each_rows_unit() {
+    // 3000 parameters, each the one before plus a millimetre, then an angle, a unit-less
+    // ratio and a row that names a parameter defined further down: all new, in one import.
+    let mut csv = String::from("name,expression\n");
+    csv.push_str("a,later * 2\np0,1 mm\n");
+    for i in 1..3000 {
+        csv.push_str(&format!("p{i},p{} + 1 mm\n", i - 1));
+    }
+    csv.push_str("turn,30 deg\nratio,p10 / p4\nlater,5\n");
+    let mut s = Session::default();
+    let t = std::time::Instant::now();
+    run(&mut s, "parameters.import", json!({"text": csv}));
+    println!("import of {} rows: {:.2} s", 3005, t.elapsed().as_secs_f64());
+    let (vals, errors) = s.doc.param_values();
+    assert!(errors.is_empty(), "{errors:?}");
+    let unit = |n: &str| s.doc.param(n).map(|p| p.unit.clone()).unwrap_or_default();
+    assert_eq!((unit("p2999"), unit("turn"), unit("ratio"), unit("later")), ("mm".into(), "deg".into(), String::new(), "mm".into()));
+    assert!(
+        vals.get("p2999").is_some_and(|v| (v.to_kind(solidcraft_doc::expr::Kind::Length).unwrap_or(f64::NAN) - 3000.0).abs() < 1e-9),
+        "{:?}",
+        vals.get("p2999")
+    );
+    assert!(
+        vals.get("a").is_some_and(|v| (v.to_kind(solidcraft_doc::expr::Kind::Length).unwrap_or(f64::NAN) - 10.0).abs() < 1e-9),
+        "{:?}",
+        vals.get("a")
+    );
+    // Changing the first moves the whole chain; a row that breaks changes nothing.
+    run(&mut s, "parameters.import", json!({"text": "name,expression\np0,101 mm\n"}));
+    assert!(
+        s.doc
+            .param_values()
+            .0
+            .get("p2999")
+            .is_some_and(|v| (v.to_kind(solidcraft_doc::expr::Kind::Length).unwrap_or(f64::NAN) - 3100.0).abs() < 1e-9)
+    );
+    assert!(s.execute("parameters.import", &json!({"text": "name,expression\np0,2 mm\np5,p0 + 1 deg\n"})).is_err());
+    assert_eq!(s.doc.param("p0").map(|p| p.expr.as_str()), Some("101 mm"));
+}
+
+#[test]
+fn several_parameters_change_in_one_rebuild_and_one_undo() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "h", "expression": "10 mm"}));
+    block(&mut s);
+    let d = run(&mut s, "parameters.list", json!({"filter": "feature"}))["parameters"][0]["name"].as_str().unwrap_or_default().to_string();
+    run(&mut s, "parameters.change", json!({"name": d, "expression": "h"}));
+    let r = run(&mut s, "parameters.change", json!({"changes": {"len": "100 mm", "h": 20}}));
+    assert_eq!(r["errors"].as_array().map(Vec::len), Some(0), "{r}");
+    assert_eq!(r["changed"]["len"], 100.0, "{r}");
+    assert!(rel(volume(&mut s), 40.0 * 50.0 * 20.0) < 1e-9);
+    // All or nothing: an unknown name or a broken expression changes nothing.
+    assert!(err(&mut s, "parameters.change", json!({"changes": {"len": "60 mm", "nope": "1 mm"}})).contains("nope"));
+    assert!(s.execute("parameters.change", &json!({"changes": {"len": "60 mm", "h": "1 / 0"}})).is_err());
+    assert!(s.execute("parameters.change", &json!({"changes": {}})).is_err());
+    assert_eq!(expr_of(&mut s, "len"), "100 mm");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!((expr_of(&mut s, "len"), expr_of(&mut s, "h")), ("60 mm".to_string(), "10 mm".to_string()));
+    assert!(rel(volume(&mut s), 40.0 * 30.0 * 10.0) < 1e-9);
+}
+
+/// A sketch made with `flip` on an offset plane follows the offset's parameter (the parameter
+/// walk stopped at the flipped plane, so a change rebuilt nothing).
+#[test]
+fn flipped_offset_sketch_plane_follows_its_parameter() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "d", "expression": "30 mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Near"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-10, -10], "p1": [10, 10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "offset": "d", "flip": "x", "name": "Far"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-10, -10], "p1": [10, 10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.loft", json!({"sections": [{"sketch": "Near"}, {"sketch": "Far"}]}));
+    assert!((volume(&mut s) - 400.0 * 30.0).abs() < 1e-6);
+    run(&mut s, "parameters.change", json!({"name": "d", "expression": "50 mm"}));
+    assert!((volume(&mut s) - 400.0 * 50.0).abs() < 1e-6, "{}", volume(&mut s));
 }

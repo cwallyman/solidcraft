@@ -47,10 +47,52 @@ impl Aabb3 {
     pub fn diagonal(&self) -> f64 {
         self.size().len()
     }
+    /// The box grown by `by` on every side; an empty box stays empty.
+    pub fn inflated(&self, by: f64) -> Aabb3 {
+        if self.is_empty() {
+            return *self;
+        }
+        let d = Vec3::new(by, by, by);
+        Aabb3 { min: self.min - d, max: self.max + d }
+    }
+    /// Whether `p` lies in the box, its sides included (never in an empty box, never for NaN).
+    pub fn contains(&self, p: Vec3) -> bool {
+        p.x >= self.min.x && p.y >= self.min.y && p.z >= self.min.z && p.x <= self.max.x && p.y <= self.max.y && p.z <= self.max.z
+    }
+    /// The box both hold: empty when they do not meet.
+    pub fn intersection(&self, o: &Aabb3) -> Aabb3 {
+        Aabb3 { min: self.min.max(o.min), max: self.max.min(o.max) }
+    }
+    /// Whether the two boxes share a point (never when either is empty).
+    pub fn meets(&self, o: &Aabb3) -> bool {
+        self.min.x <= o.max.x
+            && o.min.x <= self.max.x
+            && self.min.y <= o.max.y
+            && o.min.y <= self.max.y
+            && self.min.z <= o.max.z
+            && o.min.z <= self.max.z
+    }
+}
+
+/// The box around the finite points (non-finite ones are skipped, as [`Aabb3::add`] does).
+impl FromIterator<Vec3> for Aabb3 {
+    fn from_iter<I: IntoIterator<Item = Vec3>>(points: I) -> Aabb3 {
+        let mut b = Aabb3::EMPTY;
+        b.extend(points);
+        b
+    }
+}
+
+impl Extend<Vec3> for Aabb3 {
+    fn extend<I: IntoIterator<Item = Vec3>>(&mut self, points: I) {
+        for p in points {
+            self.add(p);
+        }
+    }
 }
 
 /// An indexed triangle mesh with per-vertex normals, a face id per triangle (the B-rep face it
-/// came from) and edge polylines (the B-rep edges, for display and picking).
+/// came from) and edge polylines (B-rep edges for display and picking, or mesh outlines).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mesh {
     pub positions: Vec<Vec3>,
@@ -59,8 +101,12 @@ pub struct Mesh {
     pub triangles: Vec<[u32; 3]>,
     /// B-rep face index per triangle.
     pub tri_face: Vec<u32>,
-    /// B-rep edges as polylines.
+    /// Edge polylines; mesh outlines have `display_only_edges` set.
     pub edges: Vec<Vec<Vec3>>,
+    /// These polylines belong to a triangle mesh, not selectable B-rep edges. Rebuilt with
+    /// the display mesh; never part of the saved design's geometry.
+    #[serde(skip)]
+    pub display_only_edges: bool,
     /// Per edge: a seam between two pieces of the same smooth surface (not drawn).
     #[serde(default)]
     pub seams: Vec<bool>,
@@ -76,12 +122,145 @@ pub struct Mesh {
     pub edge_faces: Vec<Vec<u32>>,
 }
 
-fn boxes_meet(a: &Aabb3, b: &Aabb3) -> bool {
-    a.min.x <= b.max.x && b.min.x <= a.max.x && a.min.y <= b.max.y && b.min.y <= a.max.y && a.min.z <= b.max.z && b.min.z <= a.max.z
+/// A triangle with its bounding box, as [`find_close_pair`] takes them.
+pub type BoxedTriangle = ([Vec3; 3], Aabb3);
+
+/// Most grid cells one triangle is filed under; a larger one is tested against every triangle.
+const MAX_CELLS_PER_TRIANGLE: usize = 64;
+
+/// Calls `test` on pairs of triangles, one from `a` and one from `b`, whose boxes come within
+/// `gap` of each other (each such pair once), until it returns true, and says whether it did.
+/// The cost follows the number of close pairs, not `a.len() * b.len()`: `b` is filed in a sparse
+/// grid of cells about its typical triangle's size, and each triangle of `a` meets only those in
+/// its cells. The work counts against `budget`, one unit each: a grid cell a triangle of `b` is
+/// filed under, a cell a triangle of `a` visits, and a call of `test`. `None` when the budget runs out.
+pub fn find_close_pair(
+    a: &[BoxedTriangle],
+    b: &[BoxedTriangle],
+    gap: f64,
+    budget: &mut usize,
+    test: impl FnMut(&BoxedTriangle, &BoxedTriangle) -> bool,
+) -> Option<bool> {
+    let work = std::cell::Cell::new(*budget);
+    let mut test = test;
+    let found = find_close_pair_within(a, b, gap, &work, |(_, t), (_, u)| test(t, u));
+    *budget = work.get();
+    found
+}
+
+fn find_close_pair_within(
+    a: &[BoxedTriangle],
+    b: &[BoxedTriangle],
+    gap: f64,
+    work: &std::cell::Cell<usize>,
+    mut test: impl FnMut((usize, &BoxedTriangle), (usize, &BoxedTriangle)) -> bool,
+) -> Option<bool> {
+    let spend = |n: usize| -> Option<()> {
+        work.set(work.get().checked_sub(n)?);
+        Some(())
+    };
+    let gap = if gap.is_finite() { gap.max(0.0) } else { 0.0 };
+    let close = |x: &Aabb3, y: &Aabb3| {
+        x.min.x <= y.max.x + gap
+            && y.min.x <= x.max.x + gap
+            && x.min.y <= y.max.y + gap
+            && y.min.y <= x.max.y + gap
+            && x.min.z <= y.max.z + gap
+            && y.min.z <= x.max.z + gap
+    };
+    let mut call = |t: (usize, &BoxedTriangle), u: (usize, &BoxedTriangle)| -> Option<bool> {
+        spend(1)?;
+        Some(test(t, u))
+    };
+    let (Some(first), true) = (b.first(), !a.is_empty()) else { return Some(false) };
+    // Cell size: the median extent of `b`'s boxes (so most of them span a few cells), at least `gap`.
+    let mut extents: Vec<f64> = b
+        .iter()
+        .map(|(_, bx)| {
+            let d = bx.size();
+            d.x.max(d.y).max(d.z)
+        })
+        .filter(|e| e.is_finite())
+        .collect();
+    let mid = extents.len() / 2;
+    let median = if extents.is_empty() { 0.0 } else { *extents.select_nth_unstable_by(mid, f64::total_cmp).1 };
+    let origin = first.1.min;
+    let cell = median.max(gap).max(1e-9);
+    if !(origin.is_finite() && cell.is_finite()) {
+        return Some(false);
+    }
+    let index = |v: f64, o: f64| ((v - o) / cell).floor() as i64;
+    let span = |bx: &Aabb3, pad: f64| -> Option<[(i64, i64); 3]> {
+        let r = [
+            (index(bx.min.x - pad, origin.x), index(bx.max.x + pad, origin.x)),
+            (index(bx.min.y - pad, origin.y), index(bx.max.y + pad, origin.y)),
+            (index(bx.min.z - pad, origin.z), index(bx.max.z + pad, origin.z)),
+        ];
+        let count = r.iter().try_fold(1usize, |n, (lo, hi)| n.checked_mul(usize::try_from(hi.checked_sub(*lo)?.checked_add(1)?).ok()?))?;
+        (count <= MAX_CELLS_PER_TRIANGLE).then_some(r)
+    };
+    let mut cells: std::collections::HashMap<(i64, i64, i64), Vec<u32>> = std::collections::HashMap::new();
+    let mut big = Vec::new();
+    for (j, (_, bx)) in b.iter().enumerate() {
+        match span(bx, gap) {
+            Some([x, y, z]) => {
+                for ix in x.0..=x.1 {
+                    for iy in y.0..=y.1 {
+                        for iz in z.0..=z.1 {
+                            spend(1)?;
+                            cells.entry((ix, iy, iz)).or_default().push(j as u32);
+                        }
+                    }
+                }
+            }
+            None => big.push(j),
+        }
+    }
+    // Per triangle of `b`: the last triangle of `a` tested against it, plus one.
+    let mut seen = vec![0usize; b.len()];
+    for (i, t) in a.iter().enumerate() {
+        for &j in &big {
+            if let Some(u) = b.get(j).filter(|u| close(&t.1, &u.1)) {
+                seen[j] = i + 1;
+                if call((i, t), (j, u))? {
+                    return Some(true);
+                }
+            }
+        }
+        let Some([x, y, z]) = span(&t.1, 0.0) else {
+            // A large triangle of `a`: against all of `b`.
+            for (j, u) in b.iter().enumerate() {
+                if seen[j] != i + 1 && close(&t.1, &u.1) && call((i, t), (j, u))? {
+                    return Some(true);
+                }
+            }
+            continue;
+        };
+        for ix in x.0..=x.1 {
+            for iy in y.0..=y.1 {
+                for iz in z.0..=z.1 {
+                    spend(1)?;
+                    for &j in cells.get(&(ix, iy, iz)).into_iter().flatten() {
+                        let (Some(mark), Some(u)) = (seen.get_mut(j as usize), b.get(j as usize)) else { continue };
+                        if *mark == i + 1 {
+                            continue;
+                        }
+                        *mark = i + 1;
+                        if close(&t.1, &u.1) && call((i, t), (j as usize, u))? {
+                            return Some(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(false)
 }
 
 /// Two triangles that pass through each other (see [`Mesh::crosses`]).
-fn triangles_cross(t: &[Vec3; 3], u: &[Vec3; 3], tol: f64) -> bool {
+/// Where two triangles pass through each other by more than `tol` (see [`Mesh::crosses`]): the
+/// middle of the stretch of the line their planes share that both span, or `None`.
+fn triangles_cross(t: &[Vec3; 3], u: &[Vec3; 3], tol: f64) -> Option<Vec3> {
     // Signed distances of one triangle's corners from the other's plane, when they lie more
     // than `tol` to both sides of it.
     let sides = |tri: &[Vec3; 3], plane: &[Vec3; 3]| -> Option<(Vec3, [f64; 3])> {
@@ -90,24 +269,31 @@ fn triangles_cross(t: &[Vec3; 3], u: &[Vec3; 3], tol: f64) -> bool {
         let (lo, hi) = d.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
         (lo < -tol && hi > tol).then_some((n, d))
     };
-    let (Some((nu, dt)), Some((nt, du))) = (sides(t, u), sides(u, t)) else { return false };
-    let Some(line) = nt.cross(nu).normalized() else { return false };
+    let (Some((nu, dt)), Some((nt, du))) = (sides(t, u), sides(u, t)) else { return None };
+    let line = nt.cross(nu).normalized()?;
     // Where a triangle's edges pass through the other's plane, measured along the line the
     // two planes share.
-    let reach = |tri: &[Vec3; 3], d: &[f64; 3]| -> (f64, f64) {
-        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    // With the points there, for the middle of the stretch both span.
+    let reach = |tri: &[Vec3; 3], d: &[f64; 3]| -> ((f64, Vec3), (f64, Vec3)) {
+        let (mut lo, mut hi) = ((f64::INFINITY, Vec3::ZERO), (f64::NEG_INFINITY, Vec3::ZERO));
         for (i, j) in [(0, 1), (1, 2), (2, 0)] {
             let (p, q, dp, dq) = (tri[i], tri[j], d[i], d[j]);
             if (dp < 0.0) != (dq < 0.0) && dp != dq {
-                let at = line.dot(p + (q - p) * (dp / (dp - dq)));
-                lo = lo.min(at);
-                hi = hi.max(at);
+                let x = p + (q - p) * (dp / (dp - dq));
+                let at = line.dot(x);
+                if at < lo.0 {
+                    lo = (at, x);
+                }
+                if at > hi.0 {
+                    hi = (at, x);
+                }
             }
         }
         (lo, hi)
     };
     let ((t0, t1), (u0, u1)) = (reach(t, &dt), reach(u, &du));
-    t1.min(u1) - t0.max(u0) > tol
+    let (from, to) = (if t0.0 > u0.0 { t0 } else { u0 }, if t1.0 < u1.0 { t1 } else { u1 });
+    (to.0 - from.0 > tol).then(|| (from.1 + to.1) * 0.5)
 }
 
 /// Mass properties of a closed mesh.
@@ -118,14 +304,85 @@ pub struct MeshMeasure {
     pub centroid: Vec3,
 }
 
+/// Volume, centroid and inertia tensor of a closed mesh at unit density: the inertia is about
+/// the centroid, in the mesh's axes (times a density, mass and inertia in that density's units).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MassProperties {
+    pub volume: f64,
+    pub centroid: Vec3,
+    pub inertia: [[f64; 3]; 3],
+}
+
+impl Mesh {
+    /// [`MassProperties`] of a closed mesh, by the divergence theorem over the tetrahedra its
+    /// triangles make with the origin. `None` unless every edge (by vertex index: weld first) is
+    /// shared by exactly two triangles that cross it in opposite directions (closed, consistently
+    /// oriented), or for a mesh without volume or with non-finite values.
+    pub fn mass_properties(&self) -> Option<MassProperties> {
+        // Closed and consistently oriented: each edge is crossed once in each direction.
+        let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        for t in &self.triangles {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+        if edges.is_empty() || edges.iter().any(|(&(a, b), n)| *n != 1 || edges.get(&(b, a)) != Some(&1)) {
+            return None;
+        }
+        let xyz = |v: Vec3| [v.x, v.y, v.z];
+        let (mut v6, mut first, mut second) = (0.0, Vec3::ZERO, [[0.0f64; 3]; 3]);
+        for t in &self.triangles {
+            let [a, b, c] = self.tri(t)?;
+            let det = a.dot(b.cross(c));
+            v6 += det;
+            first += (a + b + c) * det;
+            // ∫ x xᵀ over the tetrahedron (0, a, b, c) = det/120 · (Σ p pᵀ + s sᵀ), s = a + b + c.
+            let (p, s) = ([xyz(a), xyz(b), xyz(c)], xyz(a + b + c));
+            for (i, row) in second.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    *cell += det / 120.0 * (p.iter().map(|q| q[i] * q[j]).sum::<f64>() + s[i] * s[j]);
+                }
+            }
+        }
+        if !(v6.abs() / 6.0 > 1e-12) {
+            return None;
+        }
+        // Inward-facing: every sum changes sign together.
+        let sign = v6.signum();
+        let volume = v6.abs() / 6.0;
+        let centroid = first / (4.0 * v6);
+        let c = xyz(centroid);
+        let mut about = [[0.0f64; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                about[i][j] = sign * second[i][j] - volume * c[i] * c[j];
+            }
+        }
+        let trace = about[0][0] + about[1][1] + about[2][2];
+        let mut inertia = [[0.0f64; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                inertia[i][j] = if i == j { trace } else { 0.0 } - about[i][j];
+            }
+        }
+        let finite = volume.is_finite() && c.iter().all(|x| x.is_finite()) && inertia.iter().flatten().all(|x| x.is_finite());
+        finite.then_some(MassProperties { volume, centroid, inertia })
+    }
+}
+
 impl Mesh {
     /// Visibility in shaded edge presentation, independent of selection/topology.
     pub fn shaded_edge_visible(&self, index: usize) -> bool {
-        self.edge_pickable(index) && !self.smooth_edges.get(index).copied().unwrap_or(false)
+        self.edge_visible(index) && !self.smooth_edges.get(index).copied().unwrap_or(false)
+    }
+
+    /// Visibility in wireframe, including triangle-mesh outlines without B-rep identities.
+    pub fn edge_visible(&self, index: usize) -> bool {
+        !self.seams.get(index).copied().unwrap_or(false) || self.sharp_edges.get(index).copied().unwrap_or(false)
     }
 
     pub fn edge_pickable(&self, index: usize) -> bool {
-        !self.seams.get(index).copied().unwrap_or(false) || self.sharp_edges.get(index).copied().unwrap_or(false)
+        !self.display_only_edges && self.edge_visible(index)
     }
 
     /// Edges bounding face `f`.
@@ -200,6 +457,34 @@ impl Mesh {
         rim.sort_unstable();
         rim
     }
+    /// Whether the two faces at edge `i` meet tangentially there (a smooth seam, with no corner).
+    fn smooth_seam(&self, i: usize, cos: f64) -> bool {
+        if self.sharp_edges.get(i).copied().unwrap_or(false) {
+            return false;
+        }
+        if self.smooth_edges.get(i).copied().unwrap_or(false) {
+            return true;
+        }
+        let Some([a, b]) = self.edge_faces.get(i).map(Vec::as_slice) else { return false };
+        if a == b {
+            return false;
+        }
+        let Some(p) = self.edges.get(i) else { return false };
+        let (Some(&first), Some(&mid)) = (p.first(), p.get(p.len() / 2)) else { return false };
+        let normal_near = |f: u32, q: Vec3| -> Option<Vec3> {
+            self.triangles
+                .iter()
+                .zip(&self.tri_face)
+                .filter(|(_, tf)| **tf == f)
+                .flat_map(|(t, _)| t.iter().copied())
+                .filter_map(|v| Some((self.positions.get(v as usize)?.dist(q), *self.normals.get(v as usize)?)))
+                .min_by(|x, y| x.0.total_cmp(&y.0))
+                .and_then(|(_, n)| n.normalized())
+        };
+        let both = [first, mid];
+        let sample = if p.len() == 2 { &both[..] } else { std::slice::from_ref(&mid) };
+        sample.iter().all(|&q| matches!((normal_near(*a, q), normal_near(*b, q)), (Some(na), Some(nb)) if na.dot(nb) > cos))
+    }
     /// The edges reached from `e` through vertices where the next edge continues smoothly
     /// (angle between the end tangents below `max_angle`), including `e` itself.
     pub fn tangent_chain(&self, e: usize, max_angle: f64) -> Vec<usize> {
@@ -225,11 +510,45 @@ impl Mesh {
         let tol = size * 1e-7;
         let cos = max_angle.cos();
         let mut chain = vec![e];
+        if self.smooth_seam(e, cos) {
+            return chain;
+        }
+        // The edges by the grid cell of each end, so each step looks only at the edges that end
+        // near it (#3745: scanning every edge for every edge of a long helical chain held a hover
+        // for seconds). Cells are twice the join tolerance: two ends within it share a cell or
+        // touch neighbouring ones.
+        let cell = tol * 2.0;
+        let key = |p: Vec3| [(p.x / cell).floor() as i64, (p.y / cell).floor() as i64, (p.z / cell).floor() as i64];
+        let mut at_end: std::collections::HashMap<[i64; 3], Vec<usize>> = std::collections::HashMap::new();
+        for (i, p) in self.edges.iter().enumerate() {
+            for q in [p.first(), p.last()].into_iter().flatten().filter(|q| q.is_finite()) {
+                let slot = at_end.entry(key(*q)).or_default();
+                if slot.last() != Some(&i) {
+                    slot.push(i);
+                }
+            }
+        }
+        let mut in_chain: std::collections::HashSet<usize> = chain.iter().copied().collect();
         let mut todo = vec![e];
         while let Some(cur) = todo.pop() {
             let Some(ce) = ends(cur) else { continue };
-            for (i, _) in self.edges.iter().enumerate() {
-                if chain.contains(&i) || !self.edge_pickable(i) {
+            // The edges with an end near one of `cur`'s, in edge order (as a scan of every edge
+            // meets them).
+            let mut near: Vec<usize> = Vec::new();
+            for (p, _) in &ce {
+                let [x, y, z] = key(*p);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            near.extend(at_end.get(&[x + dx, y + dy, z + dz]).into_iter().flatten());
+                        }
+                    }
+                }
+            }
+            near.sort_unstable();
+            near.dedup();
+            for i in near {
+                if in_chain.contains(&i) || !self.edge_pickable(i) || self.smooth_seam(i, cos) {
                     continue;
                 }
                 let Some(ne) = ends(i) else { continue };
@@ -237,6 +556,7 @@ impl Mesh {
                 let smooth = ce.iter().any(|(p, d)| ne.iter().any(|(q, dn)| p.dist(*q) < tol && d.dot(-*dn) > cos));
                 if smooth && chain.len() < 10_000 {
                     chain.push(i);
+                    in_chain.insert(i);
                     todo.push(i);
                 }
             }
@@ -323,6 +643,14 @@ impl Mesh {
     /// can still overlap without crossing: one inside the other, or sharing a slab between
     /// faces that are parallel or in one plane.
     pub fn crosses(&self, o: &Mesh, tol: f64) -> bool {
+        self.crosses_except(o, tol, |_, _, _| false)
+    }
+
+    /// [`Mesh::crosses`], leaving out the crossings for which `ignored` holds, asked with the
+    /// middle of the stretch the two triangles share and the faces of this mesh's and `o`'s
+    /// triangle (`u32::MAX` where a mesh has no face for it): where both meshes stand for one
+    /// surface of both bodies, and their facets cross by the facetings' error alone.
+    pub fn crosses_except(&self, o: &Mesh, tol: f64, ignored: impl Fn(Vec3, u32, u32) -> bool) -> bool {
         if !tol.is_finite() {
             return false;
         }
@@ -332,97 +660,113 @@ impl Mesh {
         if region.is_empty() {
             return false;
         }
-        let near = |m: &Mesh| -> Vec<([Vec3; 3], Aabb3)> {
+        // The triangles near the other mesh, with their faces.
+        let near = |m: &Mesh| -> (Vec<BoxedTriangle>, Vec<u32>) {
             m.triangles
                 .iter()
-                .filter_map(|t| {
+                .enumerate()
+                .filter_map(|(i, t)| {
                     let t = m.tri(t)?;
                     let mut bx = Aabb3::EMPTY;
                     t.iter().for_each(|p| bx.add(*p));
-                    (!bx.is_empty() && boxes_meet(&bx, &region)).then_some((t, bx))
+                    (!bx.is_empty() && bx.meets(&region)).then(|| ((t, bx), m.tri_face.get(i).copied().unwrap_or(u32::MAX)))
                 })
-                .collect()
+                .unzip()
         };
-        let (ta, tb) = (near(self), near(o));
+        let ((ta, fa), (tb, fb)) = (near(self), near(o));
         if ta.is_empty() || tb.is_empty() {
             return false;
         }
-        // A grid over the shared box holds the other mesh's triangles.
-        let n = ((tb.len() as f64).cbrt().ceil() as usize).clamp(1, 24);
-        let size = region.size();
-        let cell = |v: f64, lo: f64, s: f64| -> usize { if s > 0.0 { (((v - lo) / s * n as f64).floor().max(0.0) as usize).min(n - 1) } else { 0 } };
-        let span = |bx: &Aabb3| -> [(usize, usize); 3] {
-            [
-                (cell(bx.min.x, region.min.x, size.x), cell(bx.max.x, region.min.x, size.x)),
-                (cell(bx.min.y, region.min.y, size.y), cell(bx.max.y, region.min.y, size.y)),
-                (cell(bx.min.z, region.min.z, size.z), cell(bx.max.z, region.min.z, size.z)),
-            ]
-        };
-        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); n * n * n];
-        for (i, (_, bx)) in tb.iter().enumerate() {
-            let [x, y, z] = span(bx);
-            for ix in x.0..=x.1 {
-                for iy in y.0..=y.1 {
-                    for iz in z.0..=z.1 {
-                        if let Some(c) = cells.get_mut((ix * n + iy) * n + iz) {
-                            c.push(i as u32);
-                        }
-                    }
-                }
-            }
-        }
-        // Per triangle of `o`: the last triangle of `self` tested against it, plus one.
-        let mut seen = vec![0usize; tb.len()];
-        for (i, (t, bx)) in ta.iter().enumerate() {
-            let [x, y, z] = span(bx);
-            for ix in x.0..=x.1 {
-                for iy in y.0..=y.1 {
-                    for iz in z.0..=z.1 {
-                        for j in cells.get((ix * n + iy) * n + iz).into_iter().flatten() {
-                            let (Some(mark), Some((u, ub))) = (seen.get_mut(*j as usize), tb.get(*j as usize)) else { continue };
-                            if *mark == i + 1 {
-                                continue;
-                            }
-                            *mark = i + 1;
-                            if boxes_meet(bx, ub) && triangles_cross(t, u, tol) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
+        let work = std::cell::Cell::new(usize::MAX);
+        let face = |faces: &[u32], i: usize| faces.get(i).copied().unwrap_or(u32::MAX);
+        find_close_pair_within(&ta, &tb, 0.0, &work, |(i, (t, _)), (j, (u, _))| {
+            triangles_cross(t, u, tol).is_some_and(|at| !ignored(at, face(&fa, i), face(&fb, j)))
+        })
+        .unwrap_or(false)
     }
 
     /// Closest intersection of a ray with the mesh: (distance along `dir`, triangle index).
+    ///
+    /// Watertight (Woop, Benthin & Wald, "Watertight Ray/Triangle Intersection", JCGT 2(1),
+    /// 2013): the vertices are moved into a frame where the ray runs along +z through the
+    /// origin, and each edge's side test is computed from those per-vertex values alone, so the
+    /// two triangles that share an edge get exactly opposite values there. A ray through a
+    /// shared edge or vertex hits at least one of them; it never slips between them.
     pub fn raycast(&self, o: Vec3, dir: Vec3) -> Option<(f64, usize)> {
+        let frame = RayFrame::new(o, dir)?;
         let mut best: Option<(f64, usize)> = None;
         for (i, t) in self.triangles.iter().enumerate() {
-            let Some([a, b, c]) = self.tri(t) else { continue };
-            let (e1, e2) = (b - a, c - a);
-            let p = dir.cross(e2);
-            let det = e1.dot(p);
-            if det.abs() < 1e-14 {
-                continue;
-            }
-            let inv = 1.0 / det;
-            let s = o - a;
-            let u = s.dot(p) * inv;
-            if !(0.0..=1.0).contains(&u) {
-                continue;
-            }
-            let q = s.cross(e1);
-            let v = dir.dot(q) * inv;
-            if v < 0.0 || u + v > 1.0 {
-                continue;
-            }
-            let t = e2.dot(q) * inv;
-            if t > 1e-9 && best.is_none_or(|(bt, _)| t < bt) {
+            let Some(p) = self.tri(t) else { continue };
+            if let Some(t) = frame.hit(p)
+                && best.is_none_or(|(bt, _)| t < bt)
+            {
                 best = Some((t, i));
             }
         }
         best
+    }
+}
+
+/// A ray in the frame of [`Mesh::raycast`]'s watertight test: its dominant axis becomes z; x and
+/// y follow it cyclically, swapped to keep the frame right-handed when the ray runs towards −z.
+pub(crate) struct RayFrame {
+    o: Vec3,
+    k: [usize; 3],
+    s: [f64; 3],
+}
+
+fn comp(v: Vec3, k: usize) -> f64 {
+    match k {
+        0 => v.x,
+        1 => v.y,
+        _ => v.z,
+    }
+}
+
+impl RayFrame {
+    /// `None` for a direction that is zero or not finite.
+    pub(crate) fn new(o: Vec3, dir: Vec3) -> Option<RayFrame> {
+        let a = [dir.x.abs(), dir.y.abs(), dir.z.abs()];
+        let kz = if a[0] >= a[1] && a[0] >= a[2] {
+            0
+        } else if a[1] >= a[2] {
+            1
+        } else {
+            2
+        };
+        let dz = comp(dir, kz);
+        if !(dz.is_finite() && dz != 0.0) {
+            return None;
+        }
+        let (mut kx, mut ky) = ((kz + 1) % 3, (kz + 2) % 3);
+        if dz < 0.0 {
+            std::mem::swap(&mut kx, &mut ky);
+        }
+        Some(RayFrame { o, k: [kx, ky, kz], s: [comp(dir, kx) / dz, comp(dir, ky) / dz, 1.0 / dz] })
+    }
+
+    /// A vertex in the ray's frame: (x, y) across the ray, z scaled along it.
+    fn frame(&self, p: Vec3) -> (f64, f64, f64) {
+        let q = p - self.o;
+        let z = comp(q, self.k[2]);
+        (comp(q, self.k[0]) - self.s[0] * z, comp(q, self.k[1]) - self.s[1] * z, self.s[2] * z)
+    }
+
+    /// The distance along the ray to triangle `[pa, pb, pc]` (`None`: missed, or not in front).
+    pub(crate) fn hit(&self, [pa, pb, pc]: [Vec3; 3]) -> Option<f64> {
+        let ((ax, ay, az), (bx, by, bz), (cx, cy, cz)) = (self.frame(pa), self.frame(pb), self.frame(pc));
+        let u = cx * by - cy * bx;
+        let v = ax * cy - ay * cx;
+        let w = bx * ay - by * ax;
+        if (u < 0.0 || v < 0.0 || w < 0.0) && (u > 0.0 || v > 0.0 || w > 0.0) {
+            return None;
+        }
+        let det = u + v + w;
+        if det == 0.0 {
+            return None;
+        }
+        let t = (u * az + v * bz + w * cz) / det;
+        (t.is_finite() && t > 1e-9).then_some(t)
     }
 }
 

@@ -6,6 +6,53 @@ use solidcraft_geom::Vec3;
 
 use super::solve_counts;
 use crate::Session;
+use crate::cmd::sketch_project::refresh_count;
+
+#[test]
+fn determined_pattern_geometry_does_not_attempt_conflicting_held_solves() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 5], "p1": [6.5, 6.5]}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 1.5}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l2"], "value": 1.5}));
+    run(&mut s, "sketch.constraint.fix", json!({"entities": ["l1.start"]}));
+    let pattern = run(
+        &mut s,
+        "sketch.pattern.rectangular",
+        json!({"entities": ["l1", "l2", "l3", "l4"], "count": 3, "count2": 3, "spacing": 2.2, "spacing2": -2.2}),
+    );
+    let line = pattern["curves"][0].as_str().expect("a patterned line");
+    let endpoint = format!("{line}.start");
+    let before = sketch_of(&s);
+    assert!(!before.curve_locked(before.curve_index(line).expect("patterned line index")));
+    for entity in [line, endpoint.as_str()] {
+        for live in [true, false] {
+            reset(&mut s);
+            let result = run(&mut s, "sketch.drag", json!({"entity": entity, "from": [5, 5], "to": [9, 12], "live": live}));
+            assert_eq!(result["reached"], json!(0.0));
+            assert_eq!(result["at"], json!([5.0, 5.0]));
+            assert_eq!(result["sketch"]["solved"], json!(true));
+            let full = usize::from(!live);
+            assert_eq!(solve_counts::take(), (full, full), "no held solve for determined geometry");
+            assert_eq!(sketch_of(&s), before);
+        }
+    }
+    reset(&mut s);
+    run(&mut s, "sketch.move_point", json!({"point": endpoint, "to": [9, 12]}));
+    assert_eq!(solve_counts::take(), (1, 1), "move_point also skips held solves");
+    assert_eq!(sketch_of(&s), before);
+
+    // A cached determined report must not suppress an outstanding dimension edit.
+    let dimension = before
+        .constraints
+        .iter()
+        .find(|c| matches!(c.kind, solidcraft_sketch::ConstraintKind::Length { l: 0, .. }))
+        .and_then(|c| c.param.as_ref())
+        .expect("the first line's dimension");
+    s.doc_mut().params.iter_mut().find(|p| &p.name == dimension).expect("dimension parameter").expr = "3".into();
+    run(&mut s, "sketch.drag", json!({"entity": line, "from": [5, 5], "to": [9, 12], "live": true}));
+    assert!((pt(&s, "l1.start").dist(pt(&s, "l1.end")) - 3.0).abs() < 1e-6);
+}
 
 fn run(s: &mut Session, id: &str, p: Value) -> Value {
     match s.execute(id, &p) {
@@ -136,28 +183,27 @@ fn a_scripted_drag_still_evaluates_the_whole_model() {
 
 #[test]
 fn a_drag_reports_how_far_the_geometry_followed() {
-    let mut s = Session::default();
-    run(&mut s, "sketch.create", json!({"plane": "XY"}));
-    run(&mut s, "sketch.line", json!({"points": [[10, 10], [40, 10]]}));
-    run(&mut s, "sketch.line", json!({"points": [[10, 30], [40, 30]]}));
-    run(&mut s, "sketch.constraint.fix", json!({"entities": ["l1.start"]}));
-    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 30}));
     for live in [false, true] {
-        // A line of fixed length with a fixed end cannot slide: the sketch's own solve only
-        // turns it a little toward the cursor, and the grab follows its free end.
-        let before = pt(&s, "l1.end");
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.line", json!({"points": [[10, 10], [40, 10]]}));
+        run(&mut s, "sketch.line", json!({"points": [[10, 30], [40, 30]]}));
+        run(&mut s, "sketch.constraint.fix", json!({"entities": ["l1.start"]}));
+        run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 30}));
+        // The grabbed midpoint follows a 15 mm circle around the fixed start.
         let r = run(&mut s, "sketch.drag", json!({"entity": "l1", "from": [25, 10], "to": [25, 20], "live": live}));
-        assert_eq!(r["reached"], json!(0.0), "{r}");
-        let moved = pt(&s, "l1.end") - before;
         let at = crate::params::vec2(&r["at"]).expect("`at`");
-        assert!(at.dist(solidcraft_geom::Vec2::new(25.0, 10.0) + moved) < 1e-9 && at.y < 20.0, "{r}");
-        let to = 40 + 10 * usize::from(live);
-        let r = run(&mut s, "sketch.drag", json!({"entity": "l2", "from": [25, to - 10], "to": [25, to]}));
-        assert_eq!((&r["reached"], &r["at"]), (&json!(1.0), &json!([25.0, to as f64])), "{r}");
+        let base = solidcraft_geom::Vec2::new(10.0, 10.0);
+        let expected = base + solidcraft_geom::Vec2::new(15.0, 10.0).normalized().unwrap() * 15.0;
+        assert!(at.dist(expected) < 1e-4, "{r}");
+        assert!(at.dist((pt(&s, "l1.start") + pt(&s, "l1.end")) * 0.5) < 1e-6);
+        assert!((r["reached"].as_f64().unwrap() - (at.y - 10.0) / 10.0).abs() < 1e-6);
+        assert!((pt(&s, "l1.end").dist(base) - 30.0).abs() < 1e-6);
+        let r = run(&mut s, "sketch.drag", json!({"entity": "l2", "from": [25, 30], "to": [25, 40]}));
+        assert_eq!((&r["reached"], &r["at"]), (&json!(1.0), &json!([25.0, 40.0])), "{r}");
+        let r = run(&mut s, "sketch.drag", json!({"entity": "l1.start", "from": [10, 10], "to": [0, 0], "live": true}));
+        assert_eq!(r["reached"], json!(0.0));
     }
-    // A point that cannot move at all.
-    let r = run(&mut s, "sketch.drag", json!({"entity": "l1.start", "from": [10, 10], "to": [0, 0], "live": true}));
-    assert_eq!(r["reached"], json!(0.0));
 }
 
 #[test]
@@ -192,14 +238,13 @@ fn ui_frames(s: &mut Session, entity: &str, grab: [f64; 2], moves: &[[f64; 2]]) 
 
 #[test]
 fn the_grab_follows_the_points_that_move() {
-    // A line with a fixed end, dragged by its middle: only the free end moves, and it keeps the
-    // cursor's offset frame after frame.
+    // With one end fixed, the free end moves twice as far as its grabbed midpoint.
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY"}));
     run(&mut s, "sketch.line", json!({"points": [[10, 10], [30, 10]]}));
     run(&mut s, "sketch.constraint.fix", json!({"entities": ["l1.start"]}));
     ui_frames(&mut s, "l1", [20.0, 10.0], &[[0.0, 1.0]; 6]);
-    assert!(pt(&s, "l1.end").dist(solidcraft_geom::Vec2::new(30.0, 16.0)) < 1e-9, "{:?}", pt(&s, "l1.end"));
+    assert!(pt(&s, "l1.end").dist(solidcraft_geom::Vec2::new(30.0, 22.0)) < 1e-6, "{:?}", pt(&s, "l1.end"));
     assert!(pt(&s, "l1.start").dist(solidcraft_geom::Vec2::new(10.0, 10.0)) < 1e-12);
 }
 
@@ -287,4 +332,91 @@ fn letting_go_on_a_snap_or_undoing_evaluates_once() {
     let r = run(&mut s, "sketch.drag_end", json!({ "constraint": bad }));
     assert!(r["constraint"]["error"].is_string(), "{r}");
     assert!(!s.model.is_stale());
+}
+
+#[test]
+fn a_drag_with_the_rest_of_a_selection_moves_it_as_one() {
+    // A vertical line and a 5 mm tail hanging off its top that keeps only its length (#2621).
+    let start = || {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.line", json!({"points": [[10, 10], [10, 50], [14, 47]]}));
+        run(&mut s, "sketch.constraint.horizontal_vertical", json!({"line": "l1"}));
+        run(&mut s, "sketch.dimension", json!({"entities": ["l2"], "value": 5}));
+        run(&mut s, "sketch.circle.center", json!({"center": [40, 10], "radius": 3, "id": "c1"}));
+        s
+    };
+    let v = solidcraft_geom::Vec2::new;
+    for live in [false, true] {
+        // Dragged alone, the line leaves the tail's free end where it was as far as it can.
+        let mut s = start();
+        run(&mut s, "sketch.drag", json!({"entity": "l1", "from": [10, 30], "to": [20, 20], "live": live}));
+        assert!(pt(&s, "l2.end").dist(v(24.0, 37.0)) > 1.0, "{:?}", pt(&s, "l2.end"));
+        // Dragged with the tail and the circle, all of it slides by the cursor's move.
+        let mut s = start();
+        let r = run(&mut s, "sketch.drag", json!({"entity": "l1", "with": ["l2", "c1"], "from": [10, 30], "to": [20, 20], "live": live}));
+        assert_eq!((&r["reached"], &r["at"]), (&json!(1.0), &json!([20.0, 20.0])), "{r}");
+        for (p, at) in [("l1.start", v(20.0, 0.0)), ("l1.end", v(20.0, 40.0)), ("l2.end", v(24.0, 37.0)), ("c1.center", v(50.0, 0.0))] {
+            assert!(pt(&s, p).dist(at) < 1e-6, "{p}: {:?}", pt(&s, p));
+        }
+        let sk = s.doc.sketch(s.active_sketch.expect("sketch mode")).expect("the sketch");
+        assert_eq!(sk.radius(sk.curve_index("c1").expect("the circle")), Some(3.0));
+    }
+    let mut s = start();
+    for with in [json!("l2"), json!([7]), json!(["nope"])] {
+        assert!(s.execute("sketch.drag", &json!({"entity": "l1", "with": with, "from": [10, 30], "to": [20, 20]})).is_err(), "{with}");
+    }
+}
+
+/// A 5 x 5 square drawn on the top face of a 30 x 20 x 10 box, the face's edges projected into
+/// its sketch; returns the session and a corner of the square (its id and where it is).
+fn on_a_face() -> (Session, String, solidcraft_geom::Vec2) {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 30, "width": 20, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": {"face": [15, 10, 10]}}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 5], "p1": [10, 10]}));
+    let sk = sketch_of(&s);
+    assert!(!sk.links.is_empty(), "the face's edges are projected");
+    let corner = sk.curves.iter().find_map(|c| match c.kind {
+        solidcraft_sketch::CurveKind::Line { a, .. } if c.link.is_none() => sk.points.get(a).map(|p| (p.id.clone(), p.pos)),
+        _ => None,
+    });
+    let (id, at) = corner.expect("a drawn line");
+    (s, id, at)
+}
+
+/// One live frame moving `point` from `at` by `dx`; returns where it went.
+fn live_frame(s: &mut Session, point: &str, at: solidcraft_geom::Vec2, dx: f64) -> solidcraft_geom::Vec2 {
+    let to = [at.x + dx, at.y];
+    run(s, "sketch.drag", json!({"entity": point, "from": [at.x, at.y], "to": to, "live": true}));
+    solidcraft_geom::Vec2::new(to[0], to[1])
+}
+
+#[test]
+fn a_live_gesture_projects_a_face_sketchs_links_once() {
+    // Every frame projected the face's edges again and solved the sketch once more for them,
+    // which on a face with many edges made each frame take a large fraction of a second (#3222).
+    let (mut s, point, mut at) = on_a_face();
+    refresh_count::take();
+    for _ in 0..5 {
+        at = live_frame(&mut s, &point, at, 0.5);
+    }
+    assert_eq!(refresh_count::take(), 1, "the gesture's first frame projects the links, the rest reuse them");
+    assert_eq!(pt(&s, &point), at, "the corner follows the drag");
+    assert!(sketch_of(&s).links.iter().all(|l| !l.lost), "the links are kept");
+    run(&mut s, "sketch.drag_end", json!({}));
+    assert_eq!(pt(&s, &point), at);
+
+    // Anything run between two frames (another command, an undo) may have changed the model the
+    // links come from: the next frame projects them again.
+    refresh_count::take();
+    at = live_frame(&mut s, &point, at, 0.5);
+    run(&mut s, "sketch.solve", json!({}));
+    live_frame(&mut s, &point, at, 0.5);
+    assert_eq!(refresh_count::take(), 2);
+    run(&mut s, "edit.undo", json!({}));
+    let at = pt(&s, &point);
+    refresh_count::take();
+    live_frame(&mut s, &point, at, 0.5);
+    assert_eq!(refresh_count::take(), 1);
 }

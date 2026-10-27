@@ -15,7 +15,7 @@ use crate::params::{bad, num, str_, vec3};
 use crate::{EngineError, Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("parts.library", "Standard Parts", library)
+    CommandSpec::new("parts.library", "Standard Parts", library).icon("library")
         .noundo()
         .params("family? → families (name, standard, sizes, lengths) and, with family, each size's dimensions (mm)"),
     CommandSpec::new("parts.fastener", "Insert Fastener", insert).at("SOLID", "INSERT").icon("fastener").params(
@@ -26,7 +26,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          length? (mm; screws, bolts, set screws, pins; default a standard length near 2.5 d); \
          at?: [x,y,z] on a hole's rim or wall (the part seats on the hole's face with a rigid joint) | point?: [x,y,z] with direction?: [x,y,z] (no joint); name?",
     ),
-    CommandSpec::new("parts.resize", "Change Part Size", resize)
+    CommandSpec::new("parts.resize", "Change Part Size", resize_atomic).icon("scale")
         .params("component: id|name of an inserted part; size?; length? — rebuilds it (joints keep it seated)"),
 ];
 
@@ -42,7 +42,9 @@ const FAMILIES: [(&str, &str, &str); 7] = [
 ];
 
 /// ISO metric coarse: (size, d, pitch).
-const METRIC: [(&str, f64, f64); 9] = [
+const METRIC: [(&str, f64, f64); 14] = [
+    ("M2", 2.0, 0.4),
+    ("M2.5", 2.5, 0.45),
     ("M3", 3.0, 0.5),
     ("M4", 4.0, 0.7),
     ("M5", 5.0, 0.8),
@@ -50,12 +52,17 @@ const METRIC: [(&str, f64, f64); 9] = [
     ("M8", 8.0, 1.25),
     ("M10", 10.0, 1.5),
     ("M12", 12.0, 1.75),
+    ("M14", 14.0, 2.0),
     ("M16", 16.0, 2.0),
     ("M20", 20.0, 2.5),
+    ("M24", 24.0, 3.0),
+    ("M30", 30.0, 3.5),
 ];
 
 /// ISO 4762: (size, head diameter dk, head height k, socket s, socket depth t).
-const SHCS: [(&str, f64, f64, f64, f64); 9] = [
+const SHCS: [(&str, f64, f64, f64, f64); 14] = [
+    ("M2", 3.8, 2.0, 1.5, 1.0),
+    ("M2.5", 4.5, 2.5, 2.0, 1.1),
     ("M3", 5.5, 3.0, 2.5, 1.3),
     ("M4", 7.0, 4.0, 3.0, 2.0),
     ("M5", 8.5, 5.0, 4.0, 2.5),
@@ -63,12 +70,17 @@ const SHCS: [(&str, f64, f64, f64, f64); 9] = [
     ("M8", 13.0, 8.0, 6.0, 4.0),
     ("M10", 16.0, 10.0, 8.0, 5.0),
     ("M12", 18.0, 12.0, 10.0, 6.0),
+    ("M14", 21.0, 14.0, 12.0, 7.0),
     ("M16", 24.0, 16.0, 14.0, 8.0),
     ("M20", 30.0, 20.0, 17.0, 10.0),
+    ("M24", 36.0, 24.0, 19.0, 12.0),
+    ("M30", 45.0, 30.0, 22.0, 15.5),
 ];
 
 /// ISO 4014/4017 hex head: (size, across flats s, head height k).
-const HEX_BOLT: [(&str, f64, f64); 9] = [
+const HEX_BOLT: [(&str, f64, f64); 14] = [
+    ("M2", 4.0, 1.4),
+    ("M2.5", 5.0, 1.7),
     ("M3", 5.5, 2.0),
     ("M4", 7.0, 2.8),
     ("M5", 8.0, 3.5),
@@ -76,12 +88,17 @@ const HEX_BOLT: [(&str, f64, f64); 9] = [
     ("M8", 13.0, 5.3),
     ("M10", 16.0, 6.4),
     ("M12", 18.0, 7.5),
+    ("M14", 21.0, 8.8),
     ("M16", 24.0, 10.0),
     ("M20", 30.0, 12.5),
+    ("M24", 36.0, 15.0),
+    ("M30", 46.0, 18.7),
 ];
 
 /// ISO 4032: (size, across flats s, height m).
-const HEX_NUT: [(&str, f64, f64); 9] = [
+const HEX_NUT: [(&str, f64, f64); 14] = [
+    ("M2", 4.0, 1.6),
+    ("M2.5", 5.0, 2.0),
     ("M3", 5.5, 2.4),
     ("M4", 7.0, 3.2),
     ("M5", 8.0, 4.7),
@@ -89,12 +106,17 @@ const HEX_NUT: [(&str, f64, f64); 9] = [
     ("M8", 13.0, 6.8),
     ("M10", 16.0, 8.4),
     ("M12", 18.0, 10.8),
+    ("M14", 21.0, 12.8),
     ("M16", 24.0, 14.8),
     ("M20", 30.0, 18.0),
+    ("M24", 36.0, 21.5),
+    ("M30", 46.0, 25.6),
 ];
 
 /// ISO 7089: (size, inner d1, outer d2, thickness h).
-const WASHER: [(&str, f64, f64, f64); 9] = [
+const WASHER: [(&str, f64, f64, f64); 14] = [
+    ("M2", 2.2, 5.0, 0.3),
+    ("M2.5", 2.7, 6.0, 0.5),
     ("M3", 3.2, 7.0, 0.5),
     ("M4", 4.3, 9.0, 0.8),
     ("M5", 5.3, 10.0, 1.0),
@@ -102,8 +124,11 @@ const WASHER: [(&str, f64, f64, f64); 9] = [
     ("M8", 8.4, 16.0, 1.6),
     ("M10", 10.5, 20.0, 2.0),
     ("M12", 13.0, 24.0, 2.5),
+    ("M14", 15.0, 28.0, 2.5),
     ("M16", 17.0, 30.0, 3.0),
     ("M20", 21.0, 37.0, 3.0),
+    ("M24", 25.0, 44.0, 4.0),
+    ("M30", 31.0, 56.0, 4.0),
 ];
 
 /// ISO 4026: (size, socket s, socket depth t).
@@ -215,16 +240,21 @@ fn run(s: &mut Session, id: &str, p: Value) -> Result<Value> {
 
 /// A hex prism (across flats `af`) from z0 to z1, joined or cut.
 fn hex(s: &mut Session, af: f64, z0: f64, z1: f64, op: &str) -> Result<()> {
-    run(s, "sketch.create", json!({"plane": "XY", "offset": z0}))?;
+    run(s, "sketch.create", json!({"plane": "XY", "offset": format!("{z0} mm")}))?;
     run(s, "sketch.polygon.circumscribed", json!({"center": [0, 0], "radius": af / 2.0, "sides": 6}))?;
+    fix_all(s)?;
     run(s, "sketch.finish", json!({}))?;
     let (dist, dir) = if z1 >= z0 { (z1 - z0, "positive") } else { (z0 - z1, "negative") };
-    run(s, "solid.extrude", json!({"distance": dist, "direction": dir, "operation": op}))?;
+    run(s, "solid.extrude", json!({"distance": format!("{dist} mm"), "direction": dir, "operation": op}))?;
     Ok(())
 }
 
 fn cyl(s: &mut Session, d: f64, z0: f64, z1: f64, op: &str) -> Result<()> {
-    run(s, "solid.cylinder", json!({"diameter": d, "height": z1 - z0, "base": [0, 0, z0], "axis": [0, 0, 1], "operation": op}))?;
+    run(
+        s,
+        "solid.cylinder",
+        json!({"diameter": format!("{d} mm"), "height": format!("{} mm", z1 - z0), "base": [0, 0, z0], "axis": [0, 0, 1], "operation": op}),
+    )?;
     Ok(())
 }
 
@@ -233,8 +263,24 @@ fn revolve(s: &mut Session, pts: &[(f64, f64)], op: &str) -> Result<()> {
     run(s, "sketch.create", json!({"plane": "XZ"}))?;
     let points: Vec<[f64; 2]> = pts.iter().map(|(r, z)| [*r, -*z]).collect();
     run(s, "sketch.line", json!({"points": points, "closed": true}))?;
+    fix_all(s)?;
     run(s, "sketch.finish", json!({}))?;
     run(s, "solid.revolve", json!({"axis": "y", "operation": op}))?;
+    Ok(())
+}
+
+/// Fix every point and curve of the sketch being drawn: a standard part's outline is its size, so
+/// its sketches are fully defined and a check of the design finds nothing left free in them.
+fn fix_all(s: &mut Session) -> Result<()> {
+    let sketch = s.active_sketch.and_then(|id| s.doc.features.iter().find(|f| f.id == id)).and_then(|f| match &f.kind {
+        solidcraft_doc::FeatureKind::Sketch { sketch, .. } => Some(sketch),
+        _ => None,
+    });
+    let entities: Vec<String> =
+        sketch.map(|sk| sk.points.iter().map(|p| p.id.clone()).chain(sk.curves.iter().map(|c| c.id.clone())).collect()).unwrap_or_default();
+    if !entities.is_empty() {
+        run(s, "sketch.constraint.fix", json!({"entities": entities, "fixed": true}))?;
+    }
     Ok(())
 }
 
@@ -245,6 +291,7 @@ fn thread(s: &mut Session, d: f64, pitch: f64, at: Vec3) {
 
 /// Build a part in the active component.
 fn build(s: &mut Session, sh: &Shape) -> Result<()> {
+    let _frame = crate::frames::local_geometry();
     match *sh {
         Shape::Screw { d, pitch, len, head, socket } => {
             let k = match head {
@@ -316,6 +363,45 @@ fn part_name(family: &str, size: &str, sh: &Shape) -> String {
     }
 }
 
+/// A standard part's part number and description: its standard and size (`ISO 4762 M6x20`), or
+/// a bearing's designation, and the family's name with the size.
+fn identity(family: &str, size: &str, sh: &Shape) -> (String, String) {
+    let size = match sh {
+        Shape::Screw { len, .. } | Shape::Rod { len, .. } => format!("{size}x{len}"),
+        _ => size.to_string(),
+    };
+    let standard = match family {
+        "socket_head_cap_screw" => "ISO 4762",
+        "hex_bolt" => "ISO 4017",
+        "hex_nut" => "ISO 4032",
+        "washer" => "ISO 7089",
+        "set_screw" => "ISO 4026",
+        "dowel_pin" => "ISO 8734",
+        _ => "",
+    };
+    let name = FAMILIES.iter().find(|f| f.0 == family).map_or("Part", |f| f.1);
+    let part_number = if standard.is_empty() { size.clone() } else { format!("{standard} {size}") };
+    (part_number, format!("{name} {size}"))
+}
+
+/// Give a standard part its part number and description; a field someone changed since the last
+/// size (`was`) is theirs and stays.
+fn set_identity(s: &mut Session, comp: u64, now: (String, String), was: Option<(String, String)>) {
+    use solidcraft_doc::metadata::{DESCRIPTION, Owner, PART_NUMBER};
+    let Some(c) = s.doc.components.iter().find(|c| c.id == comp) else { return };
+    let mut m = c.metadata.clone();
+    for (k, new, old) in [(PART_NUMBER, now.0, was.as_ref().map(|w| w.0.as_str())), (DESCRIPTION, now.1, was.as_ref().map(|w| w.1.as_str()))] {
+        if m.text(k).is_none_or(|cur| Some(cur) == old) {
+            let _ = m.set(Owner::Component, k, Value::String(new));
+        }
+    }
+    if m != c.metadata
+        && let Some(c) = s.doc_mut().components.iter_mut().find(|c| c.id == comp)
+    {
+        c.metadata = m;
+    }
+}
+
 fn label(family: &str) -> &'static str {
     match family {
         "socket_head_cap_screw" => "SHCS",
@@ -352,10 +438,12 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let name = str_(p, "name").map(str::to_string).unwrap_or_else(|| part_name(&family, &size, &sh));
     let active = s.active_component;
-    let c = run(s, "component.create", json!({"name": name}))?;
+    // Hardware is fitted to other parts: it starts free even as the design's first part (#2804).
+    let c = run(s, "component.create", json!({"name": name, "grounded": false}))?;
     let (comp, occ) = (c["component"].as_u64().unwrap_or(0), c["occurrence"].as_u64().unwrap_or(0));
     build(s, &sh)?;
     s.doc_mut().parts.insert(comp, solidcraft_doc::StandardPart { family: family.clone(), size: size.clone(), length: shape_len(&sh) });
+    set_identity(s, comp, identity(&family, &size, &sh), None);
     run(s, "component.activate", json!({"component": active}))?;
     let mut out = json!({"component": comp, "occurrence": occ, "name": name});
     if let (Some(a), Some(h)) = (at, host) {
@@ -414,6 +502,19 @@ fn shape_len(sh: &Shape) -> Option<f64> {
     }
 }
 
+/// Building the replacement runs several feature commands. Keep their intermediate history
+/// and any failed build on a scratch session; the outer command records one complete undo.
+fn resize_atomic(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut computed = s.scratch();
+    let result = resize(&mut computed, p)?;
+    computed.undo.clear();
+    computed.active_component = s.active_component;
+    computed.active_occurrence_path = s.active_occurrence_path.clone();
+    computed.active_sketch = s.active_sketch.filter(|id| computed.doc.feature(*id).is_some());
+    s.accept_computed(computed);
+    Ok(result)
+}
+
 fn resize(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "parts.resize";
     let key = match p.get("component") {
@@ -435,6 +536,8 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
     run(s, "component.activate", json!({"component": comp}))?;
     build(s, &sh)?;
     let name = part_name(&part.family, &size, &sh);
+    let was = shape(&part.family, &part.size, part.length).ok().map(|old| identity(&part.family, &part.size, &old));
+    set_identity(s, comp, identity(&part.family, &size, &sh), was);
     s.doc_mut().parts.insert(comp, solidcraft_doc::StandardPart { family: part.family.clone(), size: size.clone(), length: shape_len(&sh) });
     if let Some(c) = s.doc_mut().components.iter_mut().find(|c| c.id == comp) {
         c.name = name.clone();
@@ -463,13 +566,12 @@ mod tests {
     fn bbox(s: &Session, prefix: &str) -> (solidcraft_geom::Vec3, solidcraft_geom::Vec3) {
         let st = s.world_state();
         let comp = s.doc.components.iter().find(|c| c.name.starts_with(prefix)).map(|c| c.id).unwrap_or(0);
-        let (mut lo, mut hi) = (solidcraft_geom::Vec3::new(f64::MAX, f64::MAX, f64::MAX), solidcraft_geom::Vec3::new(f64::MIN, f64::MIN, f64::MIN));
-        for b in st.bodies.iter().filter(|b| s.doc.model_body_component(b) == comp) {
-            let m = b.mesh().bounds();
-            lo = solidcraft_geom::Vec3::new(lo.x.min(m.min.x), lo.y.min(m.min.y), lo.z.min(m.min.z));
-            hi = solidcraft_geom::Vec3::new(hi.x.max(m.max.x), hi.y.max(m.max.y), hi.z.max(m.max.z));
-        }
-        (lo, hi)
+        let b = st
+            .bodies
+            .iter()
+            .filter(|b| s.doc.model_body_component(b) == comp)
+            .fold(solidcraft_geom::Aabb3::EMPTY, |a, b| a.union(&b.mesh().bounds()));
+        (b.min, b.max)
     }
 
     #[test]
@@ -497,6 +599,35 @@ mod tests {
         assert!(b.execute("parts.insert", &json!({"family": "hex_nut", "size": "M7"})).is_err());
     }
 
+    /// #2091: the second and larger ISO sizes, M2, M2.5, M14, M24 and M30, are in the screw, bolt,
+    /// nut and washer tables (they stopped at M3 and M20).
+    #[test]
+    fn small_and_large_iso_sizes_insert() {
+        for family in ["socket_head_cap_screw", "hex_bolt", "hex_nut", "washer"] {
+            let l = run(&mut Session::default(), "parts.library", json!({"family": family}));
+            let sizes: Vec<&str> = l["sizes"].as_array().unwrap().iter().filter_map(|x| x["size"].as_str()).collect();
+            for size in ["M2", "M2.5", "M14", "M24", "M30"] {
+                assert!(sizes.contains(&size), "{family} has {size}: {sizes:?}");
+            }
+        }
+        // An M2.5 x 8 cap screw: head Ø4.5 x 2.5, shank 8 long.
+        let mut s = Session::default();
+        run(&mut s, "parts.insert", json!({"family": "socket_head_cap_screw", "size": "M2.5", "length": 8}));
+        let (lo, hi) = bbox(&s, "SHCS M2.5x8");
+        assert!((hi.x - lo.x - 4.5).abs() < 1e-6 && (lo.z + 8.0).abs() < 1e-6 && (hi.z - 2.5).abs() < 1e-6, "{lo:?} {hi:?}");
+        // An M24 nut: 36 across flats, 21.5 high.
+        let mut n = Session::default();
+        run(&mut n, "parts.insert", json!({"family": "hex_nut", "size": "M24"}));
+        let (lo, hi) = bbox(&n, "Hex Nut M24");
+        let (w, h) = ((hi.x - lo.x).max(hi.y - lo.y), hi.z - lo.z);
+        assert!((w - 36.0 / (std::f64::consts::PI / 6.0).cos()).abs() < 1e-6 && (h - 21.5).abs() < 1e-6, "{w} {h}");
+        // An M30 washer: Ø56 x 4.
+        let mut w = Session::default();
+        run(&mut w, "parts.insert", json!({"family": "washer", "size": "M30"}));
+        let (lo, hi) = bbox(&w, "Washer M30");
+        assert!((hi.x - lo.x - 56.0).abs() < 1e-6 && (hi.z - lo.z - 4.0).abs() < 1e-6, "{lo:?} {hi:?}");
+    }
+
     #[test]
     fn a_screw_seats_in_a_hole_and_resizes() {
         let mut s = Session::default();
@@ -514,5 +645,107 @@ mod tests {
         run(&mut s, "parts.resize", json!({"component": comp, "size": "M8", "length": 25}));
         let (lo, hi) = bbox(&s, "SHCS M8x25");
         assert!((hi.z - 18.0).abs() < 1e-6 && (lo.z + 15.0).abs() < 1e-6, "{lo:?} {hi:?}");
+        assert!(s.model.state().threads.iter().any(|t| t.designation == "M8" && (t.pitch - 1.25).abs() < 1e-9));
+    }
+
+    #[test]
+    fn every_sketch_of_a_standard_part_is_fully_defined() {
+        for (family, size, resized) in [
+            ("socket_head_cap_screw", "M6", "M8"),
+            ("hex_bolt", "M6", "M8"),
+            ("hex_nut", "M6", "M8"),
+            ("washer", "M6", "M8"),
+            ("set_screw", "M6", "M8"),
+            ("dowel_pin", "6", "8"),
+            ("bearing", "608", "6200"),
+        ] {
+            let mut s = Session::default();
+            let part = run(&mut s, "parts.insert", json!({"family": family, "size": size}));
+            for step in ["inserted", "resized"] {
+                let st = s.model.state();
+                let free: Vec<_> =
+                    st.sketches.iter().filter(|k| k.report.dof != 0 || !k.report.fully_constrained()).map(|k| (&k.name, k.report.dof)).collect();
+                assert!(!st.sketches.is_empty() && free.is_empty(), "{family} {step}: {free:?}");
+                assert!(s.model.results.iter().all(|r| r.error.is_none()), "{family} {step}");
+                run(&mut s, "parts.resize", json!({"component": part["component"], "size": resized}));
+            }
+        }
+    }
+
+    #[test]
+    fn resizing_placed_parts_uses_local_geometry_and_millimetres_in_every_design_unit() {
+        for (family, initial, resized, prefix) in [
+            ("socket_head_cap_screw", "M6", "M8", "SHCS"),
+            ("hex_bolt", "M6", "M8", "Hex Bolt"),
+            ("hex_nut", "M6", "M8", "Hex Nut"),
+            ("washer", "M6", "M8", "Washer"),
+            ("set_screw", "M6", "M8", "Set Screw"),
+            ("dowel_pin", "6", "8", "Dowel Pin"),
+            ("bearing", "608", "6200", "Bearing"),
+        ] {
+            let mut bounds = Vec::new();
+            for units in ["mm", "in"] {
+                let mut s = Session::default();
+                run(&mut s, "document.units", json!({"units":units}));
+                let part = run(&mut s, "parts.insert", json!({"family":family,"size":initial,"length":20,"point":[40,50,60],"direction":[1,0,0]}));
+                run(&mut s, "parts.resize", json!({"component":part["component"],"size":resized,"length":30}));
+                assert!(s.model.results.iter().all(|r| r.error.is_none()), "{family} {units}");
+                let b = bbox(&s, prefix);
+                assert!(b.0.x < b.1.x && b.0.y < b.1.y && b.0.z < b.1.z, "{family} {units}: {b:?}");
+                if matches!(family, "socket_head_cap_screw" | "hex_bolt" | "hex_nut" | "set_screw") {
+                    assert!(s.model.state().threads.iter().any(|t| t.designation == "M8" && (t.pitch - 1.25).abs() < 1e-9), "{family} {units}");
+                }
+                if family == "dowel_pin" {
+                    assert!(b.0.dist(solidcraft_geom::Vec3::new(10., 46., 56.)) < 1e-6, "{b:?}");
+                    assert!(b.1.dist(solidcraft_geom::Vec3::new(40., 54., 64.)) < 1e-6, "{b:?}");
+                }
+                bounds.push(b);
+            }
+            assert!(bounds[0].0.dist(bounds[1].0) < 1e-6 && bounds[0].1.dist(bounds[1].1) < 1e-6, "{family}: {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn resizing_a_part_is_one_undo_and_keeps_the_active_occurrence() {
+        let mut s = Session::default();
+        let part = run(&mut s, "parts.insert", json!({"family":"socket_head_cap_screw","size":"M6","length":20}));
+        let id = part["component"].as_u64().unwrap_or(0);
+        let copied = run(&mut s, "occurrence.copy", json!({"component":id,"translate":[40,0,0]}));
+        let path = vec![copied["occurrence"].as_u64().unwrap_or(0)];
+        run(&mut s, "component.activate", json!({"component":id,"occurrence":copied["occurrence"],"path":path}));
+        let before = s.doc.clone();
+        let undo = s.undo.len();
+        run(&mut s, "parts.resize", json!({"component":id,"size":"M8","length":25}));
+        assert_eq!(s.undo.len(), undo + 1);
+        assert_eq!(s.active_component, id);
+        assert_eq!(s.active_occurrence_path, Some(path.clone()));
+        let after = s.doc.clone();
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(s.doc, before);
+        let redo = s.redo.len();
+        assert!(s.execute("parts.resize", &json!({"component":id,"length":0})).is_err());
+        assert_eq!(s.doc, before);
+        assert_eq!(s.redo.len(), redo);
+        assert_eq!(s.active_occurrence_path, Some(path));
+        run(&mut s, "edit.redo", json!({}));
+        assert_eq!(s.doc, after);
+    }
+
+    #[test]
+    fn resizing_a_part_at_the_history_limit_drops_only_one_old_step() {
+        let mut s = Session::default();
+        let part = run(&mut s, "parts.insert", json!({"family":"washer","size":"M6"}));
+        let Some(snapshot) = s.undo.last().cloned() else { panic!("insert did not record history") };
+        s.undo = (0..crate::MAX_UNDO)
+            .map(|index| {
+                let mut old = snapshot.clone();
+                old.label = format!("Earlier step {index}");
+                old
+            })
+            .collect();
+        run(&mut s, "parts.resize", json!({"component":part["component"],"size":"M8"}));
+        assert_eq!(s.undo.len(), crate::MAX_UNDO);
+        assert_eq!(s.undo.first().map(|step| step.label.as_str()), Some("Earlier step 1"));
+        assert_eq!(s.undo.last().map(|step| step.label.as_str()), Some("Change Part Size"));
     }
 }

@@ -193,6 +193,16 @@ pub(crate) struct ProfileRoles<'a> {
     pub region: Option<&'a Region2>,
     /// The start and end caps' roles (`None`: not known).
     pub caps: [Option<String>; 2],
+    /// A thin wall: its sides lie off the sketch curves, and are named by the curve they run
+    /// beside.
+    pub thin: Option<&'a ThinWallRoles>,
+}
+
+/// What names the sides of a thin extrude's wall: the curves it follows and how far its sides lie
+/// from them (the thickness either side).
+pub(crate) struct ThinWallRoles {
+    pub curves: Vec<String>,
+    pub distances: [f64; 2],
 }
 
 impl<'a> ProfileRoles<'a> {
@@ -207,23 +217,35 @@ impl<'a> ProfileRoles<'a> {
         let segments: Vec<&solidcraft_geom::Seg2> =
             self.region.map(|r| std::iter::once(&r.outer).chain(&r.holes).flat_map(|l| &l.segs).collect()).unwrap_or_default();
         let curves = self.sketch.map(crate::config::ExactSketchCurves::new);
-        let curve = |segment: usize| -> Option<String> { curves.as_ref()?.find_along(segments.get(segment)?).map(|id| format!("side:{id}")) };
+        // Every curve the segment is drawn on (one, or several coincident or collinear ones).
+        let curve = |segment: usize| -> Vec<String> {
+            let (Some(curves), Some(segment)) = (curves.as_ref(), segments.get(segment)) else { return Vec::new() };
+            let drawn: Vec<String> = curves.find_all_along(segment).into_iter().map(|id| format!("side:{id}")).collect();
+            match self.thin {
+                // A thin wall's side beside its curve (the other side may lie on it).
+                Some(thin) if drawn.is_empty() => curves.find_offset(segment, &thin.curves, thin.distances),
+                _ => drawn,
+            }
+        };
         let roles = history
             .faces
             .iter()
             .map(|face| {
                 let mut roles: Vec<String> = Vec::new();
                 for origin in &face.origins {
-                    let role = match *origin {
+                    let found = match *origin {
                         FaceOrigin::Profile { segment } => curve(segment),
-                        FaceOrigin::Cap { end } => self.caps.get(usize::from(end)).cloned().flatten(),
-                        _ => None,
+                        FaceOrigin::Cap { end } => self.caps.get(usize::from(end)).cloned().flatten().into_iter().collect(),
+                        _ => Vec::new(),
                     };
-                    match role {
-                        Some(role) if !roles.contains(&role) => roles.push(role),
-                        Some(_) => {}
-                        // One unknown origin leaves the face unknown: never a partial guess.
-                        None => return Vec::new(),
+                    // One unknown origin leaves the face unknown: never a partial guess.
+                    if found.is_empty() {
+                        return Vec::new();
+                    }
+                    for role in found {
+                        if !roles.contains(&role) {
+                            roles.push(role);
+                        }
                     }
                 }
                 roles
@@ -235,7 +257,7 @@ impl<'a> ProfileRoles<'a> {
     /// A body swept from a profile (revolve, sweep, loft): its sides named by the sketch curves,
     /// its caps `start` and `end`.
     pub fn swept(sketch: Option<&'a SolvedSketch>, region: Option<&'a Region2>) -> ProfileRoles<'a> {
-        ProfileRoles { sketch, region, caps: [Some("start".into()), Some("end".into())] }
+        ProfileRoles { sketch, region, caps: [Some("start".into()), Some("end".into())], thin: None }
     }
 
     /// A tool built from the profile (and then moved, from `built`, when given), its faces named
@@ -249,13 +271,54 @@ impl<'a> ProfileRoles<'a> {
     }
 }
 
+/// How a surface built from chains of sketch segments (Surface Extrude, Revolve, Sweep) names
+/// its walls: each `side:<curve>` of the sketch curve its segment lies on exactly, segments
+/// numbered through the chains in order. It has no caps.
+pub(crate) struct ChainRoles<'a> {
+    pub sketch: &'a SolvedSketch,
+    pub chains: &'a [Vec<solidcraft_geom::Seg2>],
+}
+
+impl ChainRoles<'_> {
+    /// The surface `body`, its walls named by their roles where its history gives them.
+    pub fn tool(&self, body: Body) -> Traced {
+        let roles = body.history().filter(|h| h.operands == 0).map(|h| self.of(h));
+        Traced::made(body, roles)
+    }
+
+    fn of(&self, history: &History) -> Vec<Vec<String>> {
+        let segments: Vec<&solidcraft_geom::Seg2> = self.chains.iter().flatten().collect();
+        let curves = crate::config::ExactSketchCurves::new(self.sketch);
+        history
+            .faces
+            .iter()
+            .map(|face| {
+                let mut roles: Vec<String> = Vec::new();
+                for origin in &face.origins {
+                    let role = match *origin {
+                        FaceOrigin::Profile { segment } => segments.get(segment).and_then(|s| curves.find_along(s)).map(|id| format!("side:{id}")),
+                        _ => None,
+                    };
+                    match role {
+                        Some(role) if !roles.contains(&role) => roles.push(role),
+                        Some(_) => {}
+                        // One unknown origin leaves the face unknown: never a partial guess.
+                        None => return Vec::new(),
+                    }
+                }
+                roles
+            })
+            .collect()
+    }
+}
+
 /// How a loft names its faces: each side by the sketch curves of the sections it runs between
 /// (`side:<curve>` for the first section's, `side:s<k>.<curve>` for section `k`'s), named after
 /// the section with the most segments (the one each side spans exactly one segment of) and
 /// answering to the others; its caps `start` and `end`.
 pub(crate) struct SectionRoles<'a> {
-    /// Each section's sketch and the loop lofted through it, in the order given.
-    pub sections: Vec<(&'a SolvedSketch, &'a solidcraft_geom::Loop2)>,
+    /// Each section's sketch and loops (outer, then holes), in the order given.
+    pub sections: Vec<(&'a SolvedSketch, Vec<&'a solidcraft_geom::Loop2>)>,
 }
 
 impl SectionRoles<'_> {
@@ -268,14 +331,19 @@ impl SectionRoles<'_> {
     fn of(&self, history: &History) -> Vec<Vec<String>> {
         // Each profile segment (numbered through the sections in order): its section and role.
         let mut segments: Vec<(usize, Option<String>)> = Vec::new();
-        for (k, (sketch, lp)) in self.sections.iter().enumerate() {
+        for (k, (sketch, loops)) in self.sections.iter().enumerate() {
             let curves = crate::config::ExactSketchCurves::new(sketch);
-            for seg in &lp.segs {
+            for seg in loops.iter().flat_map(|lp| &lp.segs) {
                 let role = curves.find_along(seg).map(|id| if k == 0 { format!("side:{id}") } else { format!("side:s{k}.{id}") });
                 segments.push((k, role));
             }
         }
-        let lead = self.sections.iter().enumerate().max_by_key(|(k, (_, lp))| (lp.segs.len(), std::cmp::Reverse(*k))).map_or(0, |(k, _)| k);
+        let lead = self
+            .sections
+            .iter()
+            .enumerate()
+            .max_by_key(|(k, (_, loops))| (loops.iter().map(|lp| lp.segs.len()).sum::<usize>(), std::cmp::Reverse(*k)))
+            .map_or(0, |(k, _)| k);
         history
             .faces
             .iter()
@@ -359,8 +427,48 @@ pub(crate) fn part_tool(body: Body, part: &str) -> Traced {
 /// Faces named by their place in a body built as a whole (an imported part's faces in the
 /// file's order): `face:<k>`.
 pub(crate) fn numbered_tool(body: Body) -> Traced {
-    let roles = (0..body.face_count()).map(|k| vec![format!("face:{k}")]).collect();
+    linked_tool(body, 0, &[])
+}
+
+/// [`numbered_tool`] for a body of feature `fid` imported from a linked design, whose faces that
+/// design named `carried` (by face, empty where not known): such a face is named after its name
+/// there ([`link_role`]), so a reference to it follows that name, not the face's place in the
+/// file, when the design changes; it still answers to `face:<k>`.
+pub(crate) fn linked_tool(body: Body, fid: u64, carried: &[String]) -> Traced {
+    let roles = (0..body.face_count())
+        .map(|k| {
+            let numbered = format!("face:{k}");
+            match carried.get(k).filter(|n| !n.is_empty()) {
+                Some(name) => vec![link_role(fid, name, 0), numbered],
+                None => vec![numbered],
+            }
+        })
+        .collect();
     Traced::made(body, Some(roles))
+}
+
+/// Nesting of piece qualifiers a carried name is read through (deeper ones are digested whole).
+const MAX_LINK_DEPTH: usize = 32;
+
+/// The role of a face a linked design named `name`: `link:<digest>`, a digest of the name (which
+/// may hold anything: `@`, `|` and feature numbers of that design mean something else here). A
+/// piece keeps its qualifier, with the faces around it named the same way (`F<fid>:link:…`), so
+/// its pieces are told apart and found as they are in that design.
+pub(crate) fn link_role(fid: u64, name: &str, depth: usize) -> String {
+    let Some((stem, around)) = crate::piece_names::piece_parts(name).filter(|_| depth < MAX_LINK_DEPTH) else {
+        // FNV-1a: the same digest on every build and platform.
+        let digest = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        return format!("link:{digest:016x}");
+    };
+    let mut role = link_role(fid, stem, depth + 1);
+    if name.get(stem.len()..).is_some_and(|rest| rest.starts_with("#[")) {
+        let around: Vec<String> = around.iter().map(|a| format!("F{fid}:{}", link_role(fid, a, depth + 1))).collect();
+        role.push_str(&format!("#[{}]", around.join(",")));
+    }
+    if let Some((_, k)) = name.rsplit_once('#').filter(|(_, k)| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())) {
+        role.push_str(&format!("#{k}"));
+    }
+    role
 }
 
 /// The role of an extrude's cap at `height` along the sketch normal: on the sketch plane, above

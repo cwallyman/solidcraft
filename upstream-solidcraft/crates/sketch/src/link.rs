@@ -7,7 +7,7 @@
 //! constants; they still bound profiles and take constraints and dimensions like any curve.
 
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Vec2, Vec3};
+use solidcraft_geom::{Aabb2, Vec2, Vec3};
 
 use crate::model::{Curve, CurveKind, Result, Sketch, SketchError, in_range, radius_in_range};
 
@@ -81,7 +81,53 @@ pub enum LinkSource {
         angle: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         font: Option<String>,
+        /// Bold or italic, alignment, spacing and the curve the text follows.
+        #[serde(default, skip_serializing_if = "crate::text::TextStyle::is_plain")]
+        style: crate::text::TextStyle,
+        /// The expressions behind the numbers above that were typed as expressions.
+        #[serde(default, skip_serializing_if = "TextExprs::is_empty")]
+        exprs: TextExprs,
     },
+}
+
+/// The expressions behind a text's numbers that were typed as expressions: its place (`x`, `y`),
+/// its height and its angle; and behind its words (`text`), an expression of the design's text
+/// parameters. A number or text without an expression is the one typed. The numbers and words
+/// of `LinkSource::Text` are what the expressions gave last: the document evaluates them against
+/// its parameters before the text's outlines are rebuilt (`Document::apply_text_values`), and
+/// the sketch crate, which knows no parameters, only keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TextExprs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<String>,
+    /// The words: text parameters and quoted texts joined by `+` (`Label + '-L'`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl TextExprs {
+    pub fn is_empty(&self) -> bool {
+        *self == TextExprs::default()
+    }
+
+    /// The expressions of numbers set, each with what it sets (the words' expression is of
+    /// texts, not numbers: [`TextExprs::text`]).
+    pub fn list(&self) -> Vec<(&'static str, &String)> {
+        [("Text X", &self.x), ("Text Y", &self.y), ("Text height", &self.height), ("Text angle", &self.angle)]
+            .into_iter()
+            .filter_map(|(what, e)| e.as_ref().map(|e| (what, e)))
+            .collect()
+    }
+
+    pub fn list_mut(&mut self) -> Vec<&mut String> {
+        [&mut self.x, &mut self.y, &mut self.height, &mut self.angle].into_iter().filter_map(Option::as_mut).collect()
+    }
 }
 
 impl LinkSource {
@@ -103,6 +149,31 @@ impl LinkSource {
             LinkSource::Spun { body, .. } => format!("spun profile of {body}"),
             LinkSource::Iso { body, .. } => format!("isoparametric curve of {body}"),
             LinkSource::Text { text, .. } => format!("text \"{}\"", text.chars().take(20).collect::<String>()),
+        }
+    }
+
+    /// The bodies this source reads geometry from (an intersection reads two).
+    pub fn bodies(&self) -> Vec<&str> {
+        match self {
+            LinkSource::Edge { body, .. }
+            | LinkSource::Face { body, .. }
+            | LinkSource::Body { body }
+            | LinkSource::Vertex { body, .. }
+            | LinkSource::OnSurface { body, .. }
+            | LinkSource::Iso { body, .. }
+            | LinkSource::Spun { body, .. } => vec![body.as_str()],
+            LinkSource::Intersection { a, b } => {
+                let mut bodies = a.bodies();
+                bodies.extend(b.bodies());
+                bodies
+            }
+            LinkSource::SketchCurve { .. }
+            | LinkSource::SketchPoint { .. }
+            | LinkSource::Origin
+            | LinkSource::Axis { .. }
+            | LinkSource::SketchAxis { .. }
+            | LinkSource::Plane { .. }
+            | LinkSource::Text { .. } => Vec::new(),
         }
     }
 }
@@ -130,6 +201,10 @@ pub struct Link {
     /// Persistent model face identity, resolved by the document before geometry refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_name: Option<String>,
+    /// Persistent model edge identity of an `Edge` source, resolved by the document before
+    /// geometry refresh. None: the edge is the one nearest the source's point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_name: Option<String>,
     /// Automatically projected borders owned by a durable sketch face attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_face: bool,
@@ -186,7 +261,7 @@ impl LinkGeom {
                 (!*periodic || (!*control && *degree == 3 && crate::periodic_beziers(pts).is_ok()))
                     && (2..=crate::curves::MAX_SPLINE_POINTS).contains(&pts.len())
                     && pts.iter().all(ok)
-                    && (1..=7).contains(degree)
+                    && (1..=solidcraft_geom::MAX_BEZIER_DEGREE as u8).contains(degree)
             }
         }
     }
@@ -224,6 +299,8 @@ fn layout(geom: &[LinkGeom]) -> Result<Layout> {
         pts.push(p);
         pts.len() - 1
     }
+    // A face seen edge-on projects its edges onto one another; one line stands for them.
+    let same_line = |cs: &[LCurve], a: usize, b: usize| cs.iter().any(|k| matches!(*k, LCurve::Line(x, y) if (x, y) == (a, b) || (x, y) == (b, a)));
     for g in geom.iter().filter(|g| g.finite()) {
         match g.clone() {
             LinkGeom::Point(p) => {
@@ -234,7 +311,7 @@ fn layout(geom: &[LinkGeom]) -> Result<Layout> {
             }
             LinkGeom::Line(a, b) => {
                 let (a, b) = (pt(&mut l.pts, a), pt(&mut l.pts, b));
-                if a != b {
+                if a != b && !same_line(&l.curves, a, b) {
                     l.curves.push(LCurve::Line(a, b));
                 }
             }
@@ -286,7 +363,31 @@ fn layout(geom: &[LinkGeom]) -> Result<Layout> {
     };
     let curves = l.curves.clone();
     l.lone.retain(|i| !used(*i, &curves));
+    // A face seen edge-on: every edge falls on one line, and one line end to end stands for
+    // them all (its vertices can be projected one by one).
+    if l.lone.is_empty() && l.curves.len() > 1 && flat(&l.curves, &l.pts) {
+        let (a, b) = extent(&l.pts);
+        l = Layout { pts: vec![a, b], lone: Vec::new(), curves: vec![LCurve::Line(0, 1)] };
+    }
     Ok(l)
+}
+
+/// The two points farthest apart.
+fn extent(pts: &[Vec2]) -> (Vec2, Vec2) {
+    let farthest = |from: Vec2| pts.iter().copied().max_by(|p, q| p.dist(from).total_cmp(&q.dist(from))).unwrap_or(from);
+    let a = farthest(pts.first().copied().unwrap_or(Vec2::ZERO));
+    (a, farthest(a))
+}
+
+/// Straight pieces along one line: a face seen edge-on, whose silhouette encloses nothing.
+fn flat(curves: &[LCurve], pts: &[Vec2]) -> bool {
+    if !curves.iter().all(|c| matches!(c, LCurve::Line(..))) {
+        return false;
+    }
+    let (a, b) = extent(pts);
+    let Some(dir) = (b - a).normalized() else { return true };
+    let tol = MERGE_TOL.max(1e-9 * a.dist(b));
+    pts.iter().all(|p| (*p - a).cross(dir).abs() <= tol)
 }
 
 fn same_shape(a: &LCurve, b: &LCurve) -> bool {
@@ -349,6 +450,44 @@ fn same_geometry(a: &[(LCurve, Vec<Vec2>)], b: &[(LCurve, Vec<Vec2>)]) -> bool {
 }
 
 /// The point indices a layout curve uses, in order.
+/// Is `fresh` the boundary `old` was, with only the stations along its straight lines gone
+/// (#1049: straight edges that booleans left split at vertices nothing else used are now one
+/// edge)? Every old line lies along exactly one fresh line and the old pieces cover it end to
+/// end; every other curve is unchanged. A link saved with the stations keeps its pieces then:
+/// the region they bound is the same, and the features that name them by id still find them.
+fn only_stations_gone(old: &[(LCurve, Vec<Vec2>)], fresh: &[(LCurve, Vec<Vec2>)]) -> bool {
+    const TOL: f64 = 1e-6;
+    let is_line = |c: &&(LCurve, Vec<Vec2>)| matches!(c.0, LCurve::Line(..));
+    let ends = |c: &(LCurve, Vec<Vec2>)| match c.1.as_slice() {
+        [a, b] => Some((*a, *b)),
+        _ => None,
+    };
+    let (old_lines, old_rest): (Vec<_>, Vec<_>) = old.iter().partition(is_line);
+    let (fresh_lines, fresh_rest): (Vec<_>, Vec<_>) = fresh.iter().partition(is_line);
+    if fresh_lines.len() >= old_lines.len() || old_lines.len() > 512 {
+        return false;
+    }
+    let rest = |xs: Vec<&(LCurve, Vec<Vec2>)>| xs.into_iter().cloned().collect::<Vec<_>>();
+    if !same_geometry(&rest(old_rest), &rest(fresh_rest)) {
+        return false;
+    }
+    let Some(fresh_segs) = fresh_lines.iter().map(|c| ends(c)).collect::<Option<Vec<_>>>() else { return false };
+    let mut covered = vec![0.0; fresh_segs.len()];
+    for c in &old_lines {
+        let Some((p, q)) = ends(c) else { return false };
+        let on = |x: Vec2, (a, b): (Vec2, Vec2)| {
+            let ab = b - a;
+            let t = ((x - a).dot(ab) / ab.dot(ab).max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
+            x.dist(a + ab * t) <= TOL * (1.0 + a.len().max(b.len()))
+        };
+        let Some(k) = fresh_segs.iter().position(|seg| on(p, *seg) && on(q, *seg)) else { return false };
+        if let Some(slot) = covered.get_mut(k) {
+            *slot += p.dist(q);
+        }
+    }
+    fresh_segs.iter().zip(&covered).all(|((a, b), len)| (a.dist(*b) - len).abs() <= TOL * (1.0 + a.len().max(b.len())))
+}
+
 fn curve_points(c: &LCurve) -> Vec<usize> {
     match *c {
         LCurve::Line(a, b) => vec![a, b],
@@ -412,6 +551,55 @@ impl Sketch {
         self.links.iter().find(|l| l.id == id)
     }
 
+    /// The expressions of the sketch's texts and of its points placed by parameters, each with
+    /// what it sets (`Text height`, `Point X`…).
+    pub fn text_exprs(&self) -> Vec<(&'static str, &String)> {
+        self.links
+            .iter()
+            .filter_map(|l| match &l.source {
+                LinkSource::Text { exprs, .. } => Some(exprs.list()),
+                _ => None,
+            })
+            .flatten()
+            .chain(self.points.iter().filter_map(|p| p.exprs.as_deref()).flat_map(crate::PointExprs::list))
+            .collect()
+    }
+
+    /// The expressions of the words of the sketch's texts (of text parameters).
+    pub fn text_word_exprs(&self) -> Vec<&String> {
+        self.links
+            .iter()
+            .filter_map(|l| match &l.source {
+                LinkSource::Text { exprs, .. } => exprs.text.as_ref(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Mutable view of [`Sketch::text_word_exprs`], for renaming the parameters they refer to.
+    pub fn text_word_exprs_mut(&mut self) -> Vec<&mut String> {
+        self.links
+            .iter_mut()
+            .filter_map(|l| match &mut l.source {
+                LinkSource::Text { exprs, .. } => exprs.text.as_mut(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Mutable view of [`Sketch::text_exprs`], for renaming the parameters they refer to.
+    pub fn text_exprs_mut(&mut self) -> Vec<&mut String> {
+        self.links
+            .iter_mut()
+            .filter_map(|l| match &mut l.source {
+                LinkSource::Text { exprs, .. } => Some(exprs.list_mut()),
+                _ => None,
+            })
+            .flatten()
+            .chain(self.points.iter_mut().filter_map(|p| p.exprs.as_deref_mut()).flat_map(crate::PointExprs::list_mut))
+            .collect()
+    }
+
     /// Curves owned by a link, in creation order.
     pub fn link_curves(&self, id: &str) -> Vec<usize> {
         self.curves.iter().enumerate().filter(|(_, c)| c.link.as_deref() == Some(id)).map(|(i, _)| i).collect()
@@ -465,6 +653,29 @@ impl Sketch {
         curves.first().copied().map(Some).ok_or_else(|| SketchError::Invalid(format!("sketch {name} axis")))
     }
 
+    /// Is all of `geom` already linked into this sketch: the border of the face the sketch was
+    /// put on, or an edge projected before? Linking it again would lay a second copy over the
+    /// first. Lines match with either end first, circles by centre and radius, arcs by centre
+    /// and ends; other curves, and points on their own (the origin, a vertex), never count as
+    /// present.
+    pub fn link_geometry_present(&self, geom: &[LinkGeom]) -> bool {
+        let Ok(lay) = layout(geom) else { return false };
+        if lay.curves.is_empty() || !lay.lone.is_empty() {
+            return false;
+        }
+        let at = |i: usize| self.points.get(i).map(|p| p.pos);
+        let near = |i: usize, q: Option<Vec2>| lay.pts.get(i).zip(q).is_some_and(|(p, q)| p.dist(q) <= MERGE_TOL);
+        let curve_present = |c: &LCurve| {
+            self.curves.iter().filter(|k| k.link.is_some()).any(|k| match (*c, &k.kind) {
+                (LCurve::Line(a, b), CurveKind::Line { a: p, b: q }) => (near(a, at(*p)) && near(b, at(*q))) || (near(a, at(*q)) && near(b, at(*p))),
+                (LCurve::Circle(c, r), CurveKind::Circle { c: p, r: s }) => near(c, at(*p)) && (r - s).abs() <= MERGE_TOL,
+                (LCurve::Arc(c, a, b), CurveKind::Arc { c: p, a: q, b: e }) => near(c, at(*p)) && near(a, at(*q)) && near(b, at(*e)),
+                _ => false,
+            })
+        };
+        lay.curves.iter().all(curve_present)
+    }
+
     /// Add linked geometry. Returns the link id; the new curve and point ids are
     /// [`Sketch::link_curves`] / [`Sketch::link_points`] of it.
     pub fn add_link(&mut self, kind: LinkKind, source: LinkSource, geom: &[LinkGeom]) -> Result<String> {
@@ -476,7 +687,7 @@ impl Sketch {
             return Err(SketchError::TooLarge);
         }
         let id = self.fresh("j")?;
-        self.links.push(Link { id: id.clone(), kind, source, face_name: None, auto_face: false, lost: false });
+        self.links.push(Link { id: id.clone(), kind, source, face_name: None, edge_name: None, auto_face: false, lost: false });
         self.build_link(&id, &lay)?;
         Ok(id)
     }
@@ -523,6 +734,7 @@ impl Sketch {
                 link: Some(id.to_string()),
                 centerline: false,
                 fixed: false,
+                infinite: false,
             });
         }
         for li in &lay.lone {
@@ -545,6 +757,7 @@ impl Sketch {
             && lay.curves.len() <= 512
             && lay.pts.len() <= 512
             && lay.curves.iter().all(|c| matches!(c, LCurve::Line(..) | LCurve::Arc(..) | LCurve::Circle(..)))
+            && !flat(&lay.curves, &lay.pts)
             && !loops::valid(&lay.curves, &lay.pts)
         {
             self.set_link_lost(id, true);
@@ -670,9 +883,8 @@ impl Sketch {
             let lone_old: Vec<Vec2> = points.iter().filter_map(|pi| pos(*pi)).collect();
             if let (Some(old), Some(fresh)) = (old, fresh)
                 && lay.lone.is_empty()
-                && points.len() == lay.pts.len()
                 && lone_old.len() == points.len()
-                && same_geometry(&old, &fresh)
+                && (points.len() == lay.pts.len() && same_geometry(&old, &fresh) || only_stations_gone(&old, &fresh))
             {
                 return Ok(false);
             }
@@ -687,13 +899,14 @@ impl Sketch {
         {
             let old: Vec<Vec2> = points.iter().filter_map(|i| self.point(*i)).collect();
             let normalized = |ps: &[Vec2]| -> Vec<Vec2> {
-                let lo = ps.iter().fold(Vec2::new(f64::INFINITY, f64::INFINITY), |a, p| Vec2::new(a.x.min(p.x), a.y.min(p.y)));
-                let hi = ps.iter().fold(Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY), |a, p| Vec2::new(a.x.max(p.x), a.y.max(p.y)));
-                ps.iter().map(|p| Vec2::new((p.x - lo.x) / (hi.x - lo.x).max(1e-9), (p.y - lo.y) / (hi.y - lo.y).max(1e-9))).collect()
+                let b: Aabb2 = ps.iter().copied().collect();
+                ps.iter().map(|p| b.relative(*p)).collect()
             };
             let loop_roles_required = self.link(id).is_some_and(|l| matches!(l.source, LinkSource::Face { .. }))
                 && cur.iter().chain(&lay.curves).all(|c| matches!(c, LCurve::Line(..) | LCurve::Arc(..) | LCurve::Circle(..)))
-                && lay.lone.is_empty();
+                && lay.lone.is_empty()
+                && !flat(cur, &old)
+                && !flat(&lay.curves, &lay.pts);
             let loop_roles = loop_roles_required.then(|| loops::roles(cur, &old, &lay.curves, &lay.pts)).flatten();
             if loop_roles_required && loop_roles.is_none() {
                 self.set_link_lost(id, true);

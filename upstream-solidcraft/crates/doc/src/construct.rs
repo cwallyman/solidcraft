@@ -1,9 +1,10 @@
 //! Construction geometry from the model: references to vertices, edges, faces, planes, axes,
 //! points and sketch entities, resolved on each evaluation, and the axes, points and planes
-//! built from them (Fusion's CONSTRUCT panel).
+//! built from them (the CONSTRUCT panel).
 //!
-//! Face and edge references carry the persistent name of what was picked (see `naming`), so
-//! they follow the model when earlier features change; the picked point is the fallback.
+//! Face and edge references carry the persistent name of what was picked (see `naming`), and a
+//! vertex the names of the edges that meet there, so they follow the model when earlier features
+//! change; the picked point is the fallback.
 
 use std::collections::BTreeMap;
 
@@ -23,8 +24,13 @@ pub enum GeoRef {
     Point { p: Vec3 },
     /// The design origin.
     Origin,
-    /// A body vertex (the one nearest `at`).
-    Vertex { at: Vec3 },
+    /// A body vertex: where the edges named `edges` meet (the end they share), else the one
+    /// nearest `at`.
+    Vertex {
+        at: Vec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edges: Option<Vec<String>>,
+    },
     /// A body edge: the one named `name`, else the one nearest `at`.
     Edge {
         at: Vec3,
@@ -42,9 +48,9 @@ pub enum GeoRef {
     /// World X, Y or Z axis.
     World { axis: String },
     /// A construction axis feature, by name.
-    Axis { name: String },
+    Axis { name: crate::FeatureName },
     /// A construction point feature, by name.
-    ConstructPoint { name: String },
+    ConstructPoint { name: crate::FeatureName },
     /// A sketch point (by sketch feature id and point id).
     SketchPoint { sketch: u64, point: String },
     /// A sketch curve (by sketch feature id and curve id).
@@ -82,18 +88,30 @@ pub enum PointDef {
     /// Where an edge (line) crosses a plane.
     EdgeAndPlane { edge: GeoRef, plane: GeoRef },
     /// At a fraction `t` (0…1) of the way along an edge or sketch curve.
-    AlongPath { path: GeoRef, t: String },
+    AlongPath { path: GeoRef, t: crate::Expr },
 }
 
 /// Resolved construction geometry, kept in the model state by feature.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ConstructGeom {
     Plane(Plane),
     Axis { origin: Vec3, dir: Vec3 },
     Point(Vec3),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl ConstructGeom {
+    /// The geometry moved by `m` (where its component is placed).
+    pub fn placed(&self, m: &crate::Mat) -> ConstructGeom {
+        let (point, vector) = (|p: Vec3| crate::apply_point(m, p), |v: Vec3| crate::apply_vector(m, v));
+        match self {
+            ConstructGeom::Plane(p) => Plane::new(point(p.origin), vector(p.x), vector(p.y)).map_or_else(|| self.clone(), ConstructGeom::Plane),
+            ConstructGeom::Axis { origin, dir } => ConstructGeom::Axis { origin: point(*origin), dir: vector(*dir) },
+            ConstructGeom::Point(p) => ConstructGeom::Point(point(*p)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Construct {
     pub feature: u64,
     pub name: String,
@@ -125,10 +143,15 @@ fn construct<'a>(st: &'a ModelState, name: &str) -> Result<&'a ConstructGeom> {
 
 /// The face picked: (body, face index, point on it).
 fn face_of<'a>(st: &'a ModelState, at: Vec3, name: &Option<String>) -> Result<(&'a ModelBody, usize, Vec3)> {
-    let at = match name.as_deref().and_then(|n| crate::naming::point_on_face(st, n, at)) {
-        Some((q, _)) => q,
-        None => at,
-    };
+    // The named face itself: its nearest point to the old pick can lie on an edge it shares
+    // (a corner round that a parameter moved away from the pick), where picking again by the
+    // point finds the flat face beside it (#1255).
+    if let Some(hit) = name.as_deref().and_then(|n| crate::name_lookup::locate_face(st, n, at))
+        && let Some(b) = st.bodies.get(hit.body).filter(|b| !b.body.is_mesh())
+        && hit.face < b.body.face_count()
+    {
+        return Ok((b, hit.face, hit.point));
+    }
     for b in bodies(st) {
         if let Some(fi) = crate::appearance::face_index_at(b, at) {
             return Ok((b, fi, at));
@@ -139,6 +162,11 @@ fn face_of<'a>(st: &'a ModelState, at: Vec3, name: &Option<String>) -> Result<(&
 
 /// The edge picked, as a polyline.
 fn edge_points(st: &ModelState, at: Vec3, name: &Option<String>) -> Result<Vec<Vec3>> {
+    edge_pick(st, at, name).map(|(_, _, pts)| pts)
+}
+
+/// The edge picked: its body, its index there (as `Body::edges` lists it) and its polyline.
+fn edge_pick<'a>(st: &'a ModelState, at: Vec3, name: &Option<String>) -> Result<(&'a ModelBody, usize, Vec<Vec3>)> {
     let mut at = at;
     if let Some(n) = name {
         for b in bodies(st) {
@@ -148,21 +176,58 @@ fn edge_points(st: &ModelState, at: Vec3, name: &Option<String>) -> Result<Vec<V
             }
         }
     }
-    let mut best: Option<(f64, Vec<Vec3>)> = None;
+    let mut best: Option<(f64, &ModelBody, usize, Vec<Vec3>)> = None;
     for b in bodies(st) {
         let tol = (b.body.size() * 1e-3).max(1e-3);
         let Ok(edges) = b.body.edges(tol) else { continue };
-        for e in edges {
+        for (i, e) in edges.into_iter().enumerate() {
             let d = e.points.windows(2).map(|w| at.dist_to_segment(w[0], w[1])).fold(f64::MAX, f64::min);
-            if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
-                best = Some((d, e.points));
+            if best.as_ref().is_none_or(|(bd, ..)| d < *bd) {
+                best = Some((d, b, i, e.points));
             }
         }
     }
     match best {
-        Some((d, pts)) if pts.len() >= 2 && d <= 1e-3 + 1e-2 * pts.iter().fold(0.0, |m: f64, p| m.max(p.len())).max(1.0) => Ok(pts),
+        Some((d, b, i, pts)) if pts.len() >= 2 && d <= 1e-3 + 1e-2 * pts.iter().fold(0.0, |m: f64, p| m.max(p.len())).max(1.0) => Ok((b, i, pts)),
         _ => Err(bad(format!("no edge at {at:?}"))),
     }
+}
+
+/// The circle a picked edge lies on, from its exact curve (`kernel::edge_circle`) when the drawn
+/// edge lies on it, else fitted to the drawn points: (centre, unit normal).
+fn edge_circle(b: &ModelBody, index: usize, pts: &[Vec3]) -> Option<(Vec3, Vec3)> {
+    let exact = kernel::edge_circle(&b.body, index).filter(|c| {
+        let tol = (b.body.size() * 1e-6).max(1e-9) * 10.0;
+        pts.iter().all(|p| (p.dist(c.center) - c.radius).abs() <= tol && (*p - c.center).dot(*c.axis).abs() <= tol)
+    });
+    exact.map(|c| (c.center, *c.axis)).or_else(|| as_circle(pts).map(|(c, n, _)| (c, n)))
+}
+
+/// The most edge names a vertex reference keeps.
+const MAX_VERTEX_EDGES: usize = 16;
+
+/// Where the edges named `names` meet: the end every one of them has, nearest `at` (two edges
+/// between the same two vertices share both). `None` when an edge is gone or they share no end.
+fn named_vertex(st: &ModelState, at: Vec3, names: &[String]) -> Option<Vec3> {
+    if names.len() < 2 || names.len() > MAX_VERTEX_EDGES {
+        return None;
+    }
+    let ends: Vec<[Vec3; 2]> = names
+        .iter()
+        .map(|n| {
+            // The edge with that name itself, never the one nearest the old pick.
+            let on = bodies(st).find_map(|b| crate::naming::find_edge(b, n, at).ok())?.0;
+            let pts = edge_points(st, on, &None).ok()?;
+            Some([*pts.first()?, *pts.last()?])
+        })
+        .collect::<Option<_>>()?;
+    let (first, rest) = ends.split_first()?;
+    let tol = |p: Vec3| 1e-6 * (1.0 + p.len());
+    first
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite() && rest.iter().all(|e| e.iter().any(|q| q.dist(*p) <= tol(*p))))
+        .min_by(|p, q| p.dist(at).total_cmp(&q.dist(at)))
 }
 
 /// A polyline that is straight: its line.
@@ -223,7 +288,10 @@ pub(crate) fn point(ctx: &Ctx, g: &GeoRef) -> Result<Vec3> {
     match g {
         GeoRef::Point { p } => Ok(*p),
         GeoRef::Origin => Ok(Vec3::ZERO),
-        GeoRef::Vertex { at } => {
+        GeoRef::Vertex { at, edges } => {
+            if let Some(v) = edges.as_deref().and_then(|names| named_vertex(ctx.st, *at, names)) {
+                return Ok(v);
+            }
             let mut best: Option<(f64, Vec3)> = None;
             for b in bodies(ctx.st) {
                 let tol = (b.body.size() * 1e-3).max(1e-3);
@@ -253,13 +321,52 @@ pub(crate) fn point(ctx: &Ctx, g: &GeoRef) -> Result<Vec3> {
     }
 }
 
+/// An edge or face of the model as a line: along a straight edge, through the centre of a
+/// circular edge along its normal, or the axis of a cylinder, cone or torus face.
+fn model_line(st: &ModelState, g: &GeoRef) -> Result<(Vec3, Vec3)> {
+    match g {
+        GeoRef::Edge { at, name } => {
+            let (b, i, pts) = edge_pick(st, *at, name)?;
+            as_line(&pts).or_else(|| edge_circle(b, i, &pts)).ok_or_else(|| bad("the edge is neither straight nor circular"))
+        }
+        GeoRef::Face { at, name } => {
+            let (b, fi, _) = face_of(st, *at, name)?;
+            match kernel::face_surface(&b.body, fi) {
+                Some(FaceSurface::Cylinder { origin, axis, .. }) => Ok((origin, *axis)),
+                Some(FaceSurface::Cone { apex, axis, .. }) => Ok((apex, *axis)),
+                Some(FaceSurface::Torus { center, axis, .. }) => Ok((center, *axis)),
+                _ => Err(bad("the face is not a cylinder, cone or torus")),
+            }
+        }
+        _ => Err(bad("pick a straight or circular edge, or a cylinder, cone or torus face")),
+    }
+}
+
+/// The axis a feature turns about when an edge or face of the model is picked for it (a revolve,
+/// a circular pattern, a plane at an angle), as [`model_line`] finds it. The direction is
+/// oriented the same way however the edge or surface runs (its largest component positive), so
+/// the feature keeps its turn when an edit rebuilds the edge reversed.
+pub fn model_axis(st: &ModelState, g: &GeoRef) -> Result<(Vec3, Vec3)> {
+    let (o, d) = model_line(st, g)?;
+    let d = d.normalized().filter(|_| o.is_finite()).ok_or_else(|| bad("the axis has no direction"))?;
+    Ok((o, canonical_dir(d)))
+}
+
+/// `d` or `-d`, whichever has its largest component (the first of equal ones) positive: how
+/// [`model_axis`] orients an axis, for a preview of one to point the same way.
+pub fn canonical_dir(d: Vec3) -> Vec3 {
+    let c = [d.x, d.y, d.z];
+    let big = c.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    match c.iter().find(|v| v.abs() >= big - 1e-9) {
+        Some(v) if *v < 0.0 => -d,
+        _ => d,
+    }
+}
+
 /// A reference as a line (origin, unit direction).
 pub(crate) fn line(ctx: &Ctx, g: &GeoRef) -> Result<(Vec3, Vec3)> {
     match g {
-        GeoRef::Edge { at, name } => {
-            let pts = edge_points(ctx.st, *at, name)?;
-            as_line(&pts).or_else(|| as_circle(&pts).map(|(c, n, _)| (c, n))).ok_or_else(|| bad("the edge is neither straight nor circular"))
-        }
+        GeoRef::Edge { .. } | GeoRef::Face { .. } => model_line(ctx.st, g),
         GeoRef::SketchCurve { sketch, curve } => {
             let pts = sketch_curve_points(ctx, *sketch, curve)?;
             as_line(&pts).ok_or_else(|| bad(format!("sketch curve `{curve}` is not a line")))
@@ -277,15 +384,6 @@ pub(crate) fn line(ctx: &Ctx, g: &GeoRef) -> Result<(Vec3, Vec3)> {
             ConstructGeom::Axis { origin, dir } => Ok((*origin, *dir)),
             _ => Err(bad(format!("`{name}` is not an axis"))),
         },
-        GeoRef::Face { at, name } => {
-            let (b, fi, _) = face_of(ctx.st, *at, name)?;
-            match kernel::face_surface(&b.body, fi) {
-                Some(FaceSurface::Cylinder { origin, axis, .. }) => Ok((origin, axis)),
-                Some(FaceSurface::Cone { apex, axis, .. }) => Ok((apex, axis)),
-                Some(FaceSurface::Torus { center, axis, .. }) => Ok((center, axis)),
-                _ => Err(bad("the face is not a cylinder, cone or torus")),
-            }
-        }
         _ => Err(bad("pick an edge, line or axis")),
     }
 }
@@ -362,7 +460,7 @@ fn path_points(ctx: &Ctx, g: &GeoRef) -> Result<Vec<Vec3>> {
 /// The surface's unit normal at (the point of the surface nearest) `p`, and that point.
 fn surface_normal(s: FaceSurface, p: Vec3) -> Option<(Vec3, Vec3)> {
     match s {
-        FaceSurface::Plane { normal, point } => Some((p - normal * (p - point).dot(normal), normal)),
+        FaceSurface::Plane { normal, point } => Some((p - normal * (p - point).dot(normal), *normal)),
         FaceSurface::Cylinder { origin, axis, radius } => {
             let w = p - origin;
             let r = (w - axis * w.dot(axis)).normalized()?;
@@ -398,7 +496,7 @@ fn face_surface_at(ctx: &Ctx, g: &GeoRef) -> Result<(FaceSurface, Vec3)> {
         }
         GeoRef::Plane { .. } => {
             let pl = plane(ctx, g)?;
-            Ok((FaceSurface::Plane { normal: pl.normal(), point: pl.origin }, pl.origin))
+            Ok((FaceSurface::Plane { normal: pl.normal().unit().ok_or_else(|| bad("degenerate plane"))?, point: pl.origin }, pl.origin))
         }
         _ => Err(bad("pick a face")),
     }
@@ -539,22 +637,42 @@ pub(crate) fn resolve_geo_plane(ctx: &Ctx, p: &PlaneRef) -> Result<Plane> {
             let (p, tan) = along(&path_points(ctx, path)?, t).ok_or_else(|| bad("the path has no length"))?;
             Plane::from_normal(p, tan).ok_or_else(degenerate)
         }
+        PlaneRef::ThroughPoint { base, point: at } => {
+            let b = ctx.doc.resolve_plane_in(ctx.vals, base, ctx.depth + 1, Some(ctx.st))?;
+            let n = b.normal().normalized().ok_or_else(degenerate)?;
+            Ok(Plane { origin: b.origin + n * (point(ctx, at)? - b.origin).dot(n), ..b })
+        }
         _ => ctx.doc.resolve_plane_in(ctx.vals, p, ctx.depth + 1, Some(ctx.st)),
     }
 }
 
 impl GeoRef {
+    /// Where a picked edge or face is now, found the way evaluation finds it (by its persistent
+    /// name, else at the picked point): a point on it. `None` for other references and for an
+    /// edge or face that is gone.
+    pub fn picked_point(&self, st: &ModelState) -> Option<Vec3> {
+        match self {
+            GeoRef::Edge { at, name } => {
+                let on = name.as_deref().and_then(|n| bodies(st).find_map(|b| crate::naming::find_edge(b, n, *at).ok())).map_or(*at, |(q, _)| q);
+                edge_pick(st, on, &None).ok().map(|_| on)
+            }
+            GeoRef::Face { at, name } => face_of(st, *at, name).ok().map(|(_, _, p)| p),
+            _ => None,
+        }
+    }
+
     /// Map the reference's world points (component frames).
     pub fn map_points(&mut self, pt: &mut dyn FnMut(&mut Vec3), plane: &mut dyn FnMut(&mut PlaneRef)) {
         match self {
             GeoRef::Point { p } => pt(p),
-            GeoRef::Vertex { at } | GeoRef::Edge { at, .. } | GeoRef::Face { at, .. } => pt(at),
+            GeoRef::Vertex { at, .. } | GeoRef::Edge { at, .. } | GeoRef::Face { at, .. } => pt(at),
             GeoRef::Plane { plane: p } => plane(p),
             _ => {}
         }
     }
 
-    /// Picked faces and edges get their persistent names (and only those still missing one).
+    /// Picked faces and edges get their persistent names, and picked vertices the names of the
+    /// edges that meet there (only those still missing them).
     pub fn name_picks(&mut self, st: &ModelState) {
         match self {
             GeoRef::Face { at, name: name @ None } => {
@@ -569,17 +687,26 @@ impl GeoRef {
                     }
                 }
             }
+            GeoRef::Vertex { at, edges: edges @ None } => {
+                for b in bodies(st) {
+                    let tol = (b.body.size() * 1e-3).max(1e-3);
+                    let m = b.mesh();
+                    let ends_here = |e: &Vec<Vec3>| [e.first(), e.last()].into_iter().flatten().any(|q| q.dist(*at) <= tol);
+                    let mut meet: Vec<String> =
+                        m.edges.iter().zip(crate::naming::edge_names(b)).filter(|(e, n)| !n.is_empty() && ends_here(e)).map(|(_, n)| n).collect();
+                    if meet.is_empty() {
+                        continue;
+                    }
+                    meet.sort();
+                    meet.dedup();
+                    if (2..=MAX_VERTEX_EDGES).contains(&meet.len()) {
+                        *edges = Some(meet);
+                    }
+                    break;
+                }
+            }
             GeoRef::Plane { plane } => plane.name_picks(st),
             _ => {}
-        }
-    }
-}
-
-impl GeoRef {
-    fn plane_ref(&self) -> Option<&PlaneRef> {
-        match self {
-            GeoRef::Plane { plane } => Some(plane),
-            _ => None,
         }
     }
 }
@@ -592,11 +719,6 @@ impl AxisDef {
             AxisDef::NormalToFace { face, point } => vec![face, point],
             AxisDef::TwoPlanes { a, b } | AxisDef::TwoPoints { a, b } => vec![a, b],
         }
-    }
-
-    /// Planes it refers to (whose expressions it depends on).
-    pub fn planes(&self) -> Vec<&PlaneRef> {
-        self.refs().into_iter().filter_map(GeoRef::plane_ref).collect()
     }
 
     pub fn refs_mut(&mut self) -> Vec<&mut GeoRef> {
@@ -621,10 +743,6 @@ impl PointDef {
         }
     }
 
-    pub fn planes(&self) -> Vec<&PlaneRef> {
-        self.refs().into_iter().filter_map(GeoRef::plane_ref).collect()
-    }
-
     pub fn refs_mut(&mut self) -> Vec<&mut GeoRef> {
         match self {
             PointDef::At { point } => vec![point],
@@ -646,7 +764,17 @@ impl PlaneRef {
             PlaneRef::ThreePoints { a, b, c } => vec![a.as_mut(), b.as_mut(), c.as_mut()],
             PlaneRef::Tangent { face, .. } => vec![face.as_mut()],
             PlaneRef::AlongPath { path, .. } => vec![path.as_mut()],
-            PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => base.refs_mut(),
+            PlaneRef::ThroughPoint { base, point } => {
+                let mut refs = base.refs_mut();
+                refs.push(point.as_mut());
+                refs
+            }
+            PlaneRef::AtAngle { base, line, .. } => {
+                let mut v = base.refs_mut();
+                v.extend(line.as_deref_mut());
+                v
+            }
+            PlaneRef::Offset { base, .. } | PlaneRef::Flipped { base, .. } => base.refs_mut(),
             _ => Vec::new(),
         }
     }

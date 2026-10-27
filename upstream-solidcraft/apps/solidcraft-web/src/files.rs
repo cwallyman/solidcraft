@@ -2,22 +2,26 @@
 //! the engine's in-memory files (`solidcraft_engine::io::vfs`) at start, written back whenever a
 //! command writes one. Files come in from the computer through a file picker (the File System
 //! Access API where the browser has it, an `<input type=file>` otherwise) or a drop on the page,
-//! and go out as downloads (exports, and "Download design"). An autosave of unsaved work is kept
-//! in OPFS too and offered again after a reload or a crash.
+//! and go out as downloads (exports, and "Download design"). Where the File System Access API
+//! exists a design also lives on the computer's disk, saved and opened through the browser's file
+//! dialogs (`disk.rs`). An autosave of unsaved work is kept in OPFS and offered again after a
+//! reload or a crash.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use solidcraft_engine::io::vfs;
+
+use crate::disk;
 use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetFileOptions, FileSystemWritableFileStream};
 
 /// Where OPFS files appear to the engine.
-pub const OPFS: &str = "/opfs/";
+pub const OPFS: &str = disk::OPFS_PREFIX;
 /// Paths written here are handed to the user as downloads.
-pub const DOWNLOADS: &str = "/downloads/";
+pub const DOWNLOADS: &str = disk::DOWNLOADS_PREFIX;
 /// Files brought in from the computer.
 pub const UPLOAD: &str = "/upload/";
 /// The autosave of unsaved work (in OPFS: `recovery.solidcraft` and `recovery.json`).
@@ -51,6 +55,14 @@ pub struct Files {
     pub entries: RefCell<Vec<Entry>>,
     /// Files read from the computer: (name, bytes, what to do).
     pub incoming: RefCell<Vec<(String, Vec<u8>, Intent)>>,
+    /// Designs opened from the computer's disk: their paths in the engine's files.
+    pub opened: RefCell<Vec<String>>,
+    /// The ids of the files remembered from earlier sessions (see `disk::restore`).
+    pub disk_known: RefCell<std::collections::HashSet<String>>,
+    /// Recent designs whose file is gone: to drop from the recent list.
+    pub gone: RefCell<Vec<String>>,
+    /// Disk designs whose last write failed: they are not saved.
+    pub unsaved: RefCell<Vec<String>>,
     /// Messages for the status line (errors and confirmations).
     pub messages: RefCell<Vec<(String, bool)>>,
     /// The stored designs are loaded (the app may open them).
@@ -64,9 +76,15 @@ pub struct Files {
 }
 
 impl Files {
-    fn say(&self, text: impl Into<String>, error: bool) {
+    pub fn say(&self, text: impl Into<String>, error: bool) {
         self.messages.borrow_mut().push((text.into(), error));
         self.wake();
+    }
+
+    /// Writing the design at disk `path` failed: say so, and take its "saved" back.
+    pub fn failed_disk(&self, path: &str, error: &str) {
+        self.unsaved.borrow_mut().push(path.to_string());
+        self.say(format!("Not saved to your computer: {error}"), true);
     }
 
     /// A file arrived from the computer.
@@ -76,7 +94,7 @@ impl Files {
     }
 
     /// Run a frame (the app sleeps until something happens).
-    fn wake(&self) {
+    pub fn wake(&self) {
         if let Some(c) = self.ctx.borrow().as_ref() {
             c.request_repaint();
         }
@@ -127,7 +145,7 @@ pub fn local_only() -> bool {
     LOCAL.with(Cell::get)
 }
 
-fn err(e: JsValue) -> String {
+pub(crate) fn err(e: JsValue) -> String {
     e.as_string().or_else(|| Reflect::get(&e, &"message".into()).ok().and_then(|m| m.as_string())).unwrap_or_else(|| format!("{e:?}"))
 }
 
@@ -148,6 +166,11 @@ async fn root() -> Result<FileSystemDirectoryHandle, String> {
     let sm = storage_manager().filter(|sm| has(sm, "getDirectory")).ok_or("this page has no private file storage (it needs https or localhost)")?;
     let dir = JsFuture::from(sm.get_directory()).await.map_err(err)?;
     dir.dyn_into::<FileSystemDirectoryHandle>().map_err(|_| "this browser has no private file storage (OPFS)".to_string())
+}
+
+pub(crate) async fn read_handle(h: &FileSystemFileHandle) -> Result<Vec<u8>, String> {
+    let file: web_sys::File = JsFuture::from(h.get_file()).await.map_err(err)?.dyn_into().map_err(|_| "not a file".to_string())?;
+    blob_bytes(&file).await
 }
 
 async fn blob_bytes(b: &web_sys::Blob) -> Result<Vec<u8>, String> {
@@ -248,6 +271,10 @@ pub fn start(files: &Rc<Files>) {
     }
     let files = files.clone();
     spawn_local(async move {
+        match disk::known_ids().await {
+            Ok(ids) => files.disk_known.borrow_mut().extend(ids),
+            Err(e) => log::info!("no remembered files: {e}"),
+        }
         match read_all().await {
             Ok(all) => {
                 if local_only() {
@@ -290,26 +317,32 @@ pub fn start(files: &Rc<Files>) {
 /// Store what commands wrote: OPFS paths into OPFS, download paths as downloads.
 pub fn flush(files: &Rc<Files>) {
     for (path, bytes) in vfs::take_writes() {
-        if let Some(name) = path.strip_prefix(OPFS) {
-            let name = name.to_string();
-            {
-                let mut e = files.entries.borrow_mut();
-                e.retain(|x| x.name != name);
-                if name != RECOVERY && name != RECOVERY_META {
-                    e.push(Entry { name: name.clone(), size: bytes.len() as u64, modified: js_sys::Date::now() });
-                    e.sort_by_key(|a| a.name.to_lowercase());
+        match disk::route(&path) {
+            disk::WriteTo::Opfs => {
+                let name = path.strip_prefix(OPFS).unwrap_or(&path).to_string();
+                {
+                    let mut e = files.entries.borrow_mut();
+                    e.retain(|x| x.name != name);
+                    if name != RECOVERY && name != RECOVERY_META {
+                        e.push(Entry { name: name.clone(), size: bytes.len() as u64, modified: js_sys::Date::now() });
+                        e.sort_by_key(|a| a.name.to_lowercase());
+                    }
                 }
+                let files = files.clone();
+                spawn_local(async move {
+                    if let Err(e) = write_file(&name, &bytes).await {
+                        files.say(format!("{name}: {e}"), true);
+                    }
+                });
             }
-            let files = files.clone();
-            spawn_local(async move {
-                if let Err(e) = write_file(&name, &bytes).await {
+            disk::WriteTo::Disk => disk::enqueue(files, &path, bytes),
+            disk::WriteTo::Download => {
+                let name = path.strip_prefix(DOWNLOADS).unwrap_or(&path);
+                if let Err(e) = download(name, &bytes) {
                     files.say(format!("{name}: {e}"), true);
                 }
-            });
-        } else if let Some(name) = path.strip_prefix(DOWNLOADS)
-            && let Err(e) = download(name, &bytes)
-        {
-            files.say(format!("{name}: {e}"), true);
+            }
+            disk::WriteTo::Memory => {}
         }
     }
 }
@@ -415,6 +448,18 @@ pub fn recovery_path() -> String {
     format!("{OPFS}{RECOVERY}")
 }
 
+/// A recovery file lives in OPFS, but its relative links belong to the original design's
+/// folder (which can be on disk). Resolve them before Open sees the temporary file location.
+pub fn prepare_recovery(original_path: Option<&str>) -> Result<String, String> {
+    let path = recovery_path();
+    let bytes = vfs::read(&path, solidcraft_engine::io::MAX_DESIGN_BYTES).map_err(|e| e.to_string())?;
+    let mut doc = solidcraft_engine::io::read_design(&bytes).map_err(|e| e.to_string())?;
+    solidcraft_engine::resolve_design_links(&mut doc, original_path);
+    let bytes = solidcraft_engine::io::write_design_container(&doc).map_err(|e| e.to_string())?;
+    vfs::insert(&path, bytes);
+    Ok(path)
+}
+
 /// Pick files on the computer: the File System Access picker where there is one, else an
 /// `<input type=file>`. Read files arrive in `files.incoming`.
 pub fn pick_from_disk(files: &Rc<Files>, intent: Intent) {
@@ -422,8 +467,15 @@ pub fn pick_from_disk(files: &Rc<Files>, intent: Intent) {
     let picker = Reflect::get(&window, &"showOpenFilePicker".into()).ok().and_then(|f| f.dyn_into::<Function>().ok());
     match picker {
         Some(f) => {
-            let opts = Object::new();
-            let _ = Reflect::set(&opts, &"multiple".into(), &JsValue::FALSE);
+            // A design from the computer's disk keeps its file, so Save writes back to it.
+            let on_disk = intent == Intent::Open && disk::supported();
+            let opts = if on_disk {
+                disk::open_options()
+            } else {
+                let opts = Object::new();
+                let _ = Reflect::set(&opts, &"multiple".into(), &JsValue::FALSE);
+                opts
+            };
             let promise = f.call1(&window, &opts);
             let files = files.clone();
             spawn_local(async move {
@@ -433,18 +485,30 @@ pub fn pick_from_disk(files: &Rc<Files>, intent: Intent) {
                     for h in handles.iter() {
                         // Native Apple hosts provide a structural getFile handle rather
                         // than a browser FileSystemFileHandle instance.
-                        let name = Reflect::get(&h, &"name".into()).map_err(err)?.as_string().ok_or("file has no name")?;
-                        if name.is_empty() || name.len() > 200 || name.contains('/') || name.contains('\\') {
-                            return Err("invalid file name".into());
+                        if !h.is_instance_of::<FileSystemFileHandle>() {
+                            let name = Reflect::get(&h, &"name".into()).map_err(err)?.as_string().ok_or("file has no name")?;
+                            if name.is_empty() || name.len() > 200 || name.contains('/') || name.contains('\\') {
+                                return Err("invalid file name".into());
+                            }
+                            let get: Function = Reflect::get(&h, &"getFile".into()).map_err(err)?.dyn_into().map_err(|_| "file has no reader")?;
+                            let promise: js_sys::Promise = get.call0(&h).map_err(err)?.dyn_into().map_err(|_| "file reader returned no promise")?;
+                            let file: web_sys::File = JsFuture::from(promise).await.map_err(err)?.dyn_into().map_err(|_| "not a file".to_string())?;
+                            if file.size() > 128.0 * 1024.0 * 1024.0 {
+                                return Err("file exceeds the 128 MB import limit".into());
+                            }
+                            let bytes = blob_bytes(&file).await?;
+                            files.arrive(name, bytes, intent);
+                            continue;
                         }
-                        let get: Function = Reflect::get(&h, &"getFile".into()).map_err(err)?.dyn_into().map_err(|_| "file has no reader")?;
-                        let promise: js_sys::Promise = get.call0(&h).map_err(err)?.dyn_into().map_err(|_| "file reader returned no promise")?;
-                        let file: web_sys::File = JsFuture::from(promise).await.map_err(err)?.dyn_into().map_err(|_| "not a file".to_string())?;
-                        if file.size() > 128.0 * 1024.0 * 1024.0 {
-                            return Err("file exceeds the 128 MB import limit".into());
+                        let h: FileSystemFileHandle = h.dyn_into().map_err(|_| "not a file".to_string())?;
+                        let bytes = read_handle(&h).await?;
+                        if on_disk && solidcraft_engine::io::is_design_path(&h.name()) {
+                            let path = disk::arrive(&h, bytes);
+                            files.opened.borrow_mut().push(path);
+                            files.wake();
+                        } else {
+                            files.arrive(h.name(), bytes, intent);
                         }
-                        let bytes = blob_bytes(&file).await?;
-                        files.arrive(name, bytes, intent);
                     }
                     Ok::<(), String>(())
                 };
@@ -464,7 +528,11 @@ fn input_picker(files: &Rc<Files>, intent: Intent) {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
     let Ok(input) = doc.create_element("input").map(|e| e.unchecked_into::<web_sys::HtmlInputElement>()) else { return };
     input.set_type("file");
-    input.set_accept(".solidcraft,.solvecraft,.json,.step,.stp,.3mf,.stl,.dxf,.svg");
+    // Everything the browser build imports, from the format registry: cadmpeg is pure Rust, so
+    // FreeCAD and Rhino files are part of it; plus the DXF and SVG drawings Open and Insert take.
+    let accept =
+        solidcraft_engine::io::formats::open_extensions(true).iter().chain(&["dxf", "svg"]).map(|e| format!(".{e}")).collect::<Vec<_>>().join(",");
+    input.set_accept(&accept);
     // Attached (hidden) while it is open: some browsers ignore a click on a detached input.
     let _ = input.set_attribute("style", "display:none");
     if let Some(body) = doc.body() {
@@ -487,6 +555,67 @@ fn input_picker(files: &Rc<Files>, intent: Intent) {
     });
     input.set_onchange(Some(on_change.unchecked_ref()));
     input.click();
+}
+
+/// Ask for one file of these types (`extensions`, e.g. `["dxf"]`) with a plain file input, the
+/// dialog every browser has. The answer is the file's path in the engine's files (under
+/// [`UPLOAD`], as for a file picked in the disk dialog), so the command that asked runs on it;
+/// `None` when the dialog was closed or the file could not be read.
+pub fn pick_upload(files: &Rc<Files>, extensions: &[&str]) -> impl std::future::Future<Output = Option<String>> + use<> {
+    // Shown now, in the click: a file dialog needs the user's gesture.
+    let chosen = choose_file(&disk::accept_list(extensions));
+    let limit = disk::upload_limit(extensions);
+    let files = files.clone();
+    async move {
+        let read = async {
+            let value = JsFuture::from(chosen?).await.map_err(err)?;
+            // Closing the dialog answers no file: nothing to say.
+            let Ok(file) = value.dyn_into::<web_sys::File>() else { return Ok(None) };
+            let name = file.name();
+            if limit.is_some_and(|max| !file.size().is_finite() || file.size() > max as f64) {
+                return Err(format!("{name}: the file is too large"));
+            }
+            let bytes = blob_bytes(&file).await.map_err(|e| format!("{name}: {e}"))?;
+            let path = format!("{UPLOAD}{name}");
+            vfs::insert(&path, bytes);
+            Ok(Some(path))
+        };
+        match read.await {
+            Ok(path) => path,
+            Err(e) => {
+                files.say(format!("open: {e}"), true);
+                None
+            }
+        }
+    }
+}
+
+/// Show a hidden `<input type=file>` offering `accept` (call in the click). The promise answers
+/// the picked `File`, or `null` when the dialog is closed (the input's `cancel` event).
+fn choose_file(accept: &str) -> Result<js_sys::Promise, String> {
+    let doc = web_sys::window().and_then(|w| w.document()).ok_or("this page can't show a file dialog")?;
+    let input = doc.create_element("input").map_err(err)?.dyn_into::<web_sys::HtmlInputElement>().map_err(|_| "no file input".to_string())?;
+    input.set_type("file");
+    input.set_accept(accept);
+    // Attached (hidden) while it is open: some browsers ignore a click on a detached input.
+    input.set_attribute("style", "display:none").map_err(err)?;
+    doc.body().ok_or("this page has no body")?.append_child(&input).map_err(err)?;
+    let promise = js_sys::Promise::new(&mut |resolve: Function, _reject: Function| {
+        // One answer for a pick or a cancel; read from the event, so it does not keep the input.
+        let done = Closure::once_into_js(move |event: web_sys::Event| {
+            let file = event.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()).and_then(|input| {
+                input.set_onchange(None);
+                input.set_oncancel(None);
+                input.remove();
+                input.files().and_then(|list| list.get(0))
+            });
+            let _ = resolve.call1(&JsValue::UNDEFINED, &file.map_or(JsValue::NULL, JsValue::from));
+        });
+        input.set_onchange(Some(done.unchecked_ref()));
+        input.set_oncancel(Some(done.unchecked_ref()));
+    });
+    input.click();
+    Ok(promise)
 }
 
 /// Read files dropped on the page.

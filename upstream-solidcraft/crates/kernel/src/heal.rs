@@ -1,9 +1,9 @@
 //! Clean-up after operations: coplanar neighbouring faces become one face, and two straight
-//! edges meeting in line at a vertex nothing else uses become one edge (as Fusion keeps them).
+//! edges meeting in line at a vertex nothing else uses become one edge (they are kept as one).
 
 use std::collections::{BTreeSet, HashMap};
 
-use solidcraft_geom::Vec3;
+use solidcraft_geom::{Ring, Vec3};
 use truck_modeling::{self as mt, builder};
 
 use crate::body::{Solid, from_p3};
@@ -51,15 +51,7 @@ fn samples(e: &mt::Edge) -> Vec<Vec3> {
 }
 
 fn loop_area(edges: &[mt::Edge], n: Vec3) -> f64 {
-    let pts: Vec<Vec3> = edges.iter().flat_map(samples).collect();
-    let k = pts.len();
-    let mut s = Vec3::ZERO;
-    for i in 0..k {
-        if let (Some(a), Some(b)) = (pts.get(i), pts.get((i + 1) % k)) {
-            s += a.cross(*b);
-        }
-    }
-    s.dot(n) * 0.5
+    edges.iter().flat_map(samples).collect::<Ring<Vec3>>().area_vector().dot(n)
 }
 
 fn inside(p: Vec3, edges: &[mt::Edge], n: Vec3) -> bool {
@@ -120,10 +112,12 @@ fn merge_coplanar(shell: &mt::Shell, tol: f64, keep: &[Vec<Vec3>]) -> Option<(mt
             && na.dot(*nb) > 1.0 - 1e-9
             && (da - db).abs() < tol
         {
+            // The lesser root wins, so each group's root is its first face whatever order the
+            // edges (in hash order of their addresses) are met in (#707).
             let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
             if ra != rb {
-                if let Some(x) = parent.get_mut(ra) {
-                    *x = rb;
+                if let Some(x) = parent.get_mut(ra.max(rb)) {
+                    *x = ra.min(rb);
                 }
                 merged_any = true;
             }
@@ -232,11 +226,13 @@ fn merge_collinear(shell: &mt::Shell, trace: &mut Trace) -> Option<mt::Shell> {
         let (pa, pm, pb) = (from_p3(other(a).point()), from_p3(mid.point()), from_p3(other(b).point()));
         let (Some(u), Some(w)) = ((pm - pa).normalized(), (pb - pm).normalized()) else { continue };
         if u.dot(w) > 1.0 - 1e-10 {
+            // The lesser root wins: each run's root is its first edge whatever order the
+            // vertices are met in (#707).
             let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
             if ra != rb
-                && let Some(x) = parent.get_mut(ra)
+                && let Some(x) = parent.get_mut(ra.max(rb))
             {
-                *x = rb;
+                *x = ra.min(rb);
                 any = true;
             }
         }
@@ -244,7 +240,9 @@ fn merge_collinear(shell: &mt::Shell, trace: &mut Trace) -> Option<mt::Shell> {
     if !any {
         return None;
     }
-    let mut runs: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Ordered by run (and each run's ends by first use below): which end a joined edge starts
+    // from must not follow hash order, or the same heal gives a different body from run to run.
+    let mut runs: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
     for i in 0..edges.len() {
         let r = find(&mut parent, i);
         runs.entry(r).or_default().push(i);
@@ -253,14 +251,17 @@ fn merge_collinear(shell: &mt::Shell, trace: &mut Trace) -> Option<mt::Shell> {
     let mut joined: Vec<(mt::Edge, HashMap<mt::VertexID, usize>)> = Vec::new();
     let mut run_of: HashMap<mt::EdgeID, usize> = HashMap::new();
     for members in runs.values().filter(|m| m.len() > 1) {
-        let mut ends: HashMap<mt::VertexID, (usize, mt::Vertex)> = HashMap::new();
+        let mut ends: Vec<(mt::VertexID, usize, mt::Vertex)> = Vec::new();
         for i in members {
             let Some(e) = edges.get(*i) else { continue };
             for v in [e.front(), e.back()] {
-                ends.entry(v.id()).or_insert((0, v.clone())).0 += 1;
+                match ends.iter_mut().find(|(id, ..)| *id == v.id()) {
+                    Some(end) => end.1 += 1,
+                    None => ends.push((v.id(), 1, v.clone())),
+                }
             }
         }
-        let mut ends = ends.into_values().filter(|(n, _)| *n == 1).map(|(_, v)| v);
+        let mut ends = ends.into_iter().filter(|(_, n, _)| *n == 1).map(|(.., v)| v);
         let (Some(first), Some(last), None) = (ends.next(), ends.next(), ends.next()) else { continue };
         // Walk the run from one end, collecting its vertices in order.
         let mut order = vec![first.id()];
@@ -309,12 +310,13 @@ fn merge_collinear(shell: &mt::Shell, trace: &mut Trace) -> Option<mt::Shell> {
                     es.push(e.clone());
                     continue;
                 };
-                // The run's pieces become its joined edge, in this wire's direction.
-                if done.insert(r)
-                    && let Some((line, pos)) = joined.get(r)
-                {
+                // The run's pieces become its joined edge, in this wire's direction: once each
+                // way, as a seam runs along its wire both ways.
+                if let Some((line, pos)) = joined.get(r) {
                     let forward = pos.get(&e.front().id()) < pos.get(&e.back().id());
-                    es.push(if forward { line.clone() } else { line.inverse() });
+                    if done.insert((r, forward)) {
+                        es.push(if forward { line.clone() } else { line.inverse() });
+                    }
                 }
             }
             wires.push(mt::Wire::from(es));
@@ -407,7 +409,7 @@ fn exact_edges(shell: &mt::Shell, tol: f64, trace: &mut Trace) -> Option<mt::She
 
 /// Faces whose surface is flat but not a plane (a revolved line square to the axis, a swept
 /// line) get a real plane, so they merge with their coplanar neighbours and blend like planes.
-fn planar_surfaces(shell: &mt::Shell, tol: f64) -> Option<mt::Shell> {
+pub(crate) fn planar_surfaces(shell: &mt::Shell, tol: f64) -> Option<mt::Shell> {
     use mt::{BoundedCurve, ParametricCurve, ParametricSurface, ParametricSurface3D, SearchNearestParameter};
     let mut changed = false;
     let mut faces = Vec::new();
@@ -538,9 +540,9 @@ pub(crate) fn heal_traced(solid: Solid, size: f64, keep: &[Vec<Vec3>]) -> (Solid
     healed(solid, size, keep, true, false)
 }
 
-/// [`heal_traced`] that only merges coplanar neighbouring faces, leaving every edge, curve and
-/// surface as it is: for results whose geometry is already exact (a prism boolean's), where
-/// joining edges would change more than the faces split in pieces.
+/// [`heal_traced`] that only merges coplanar neighbouring faces and joins the straight edges
+/// they leave split in line (#1049), leaving every curve and surface as it is: for results
+/// whose geometry is already exact (a prism boolean's).
 pub(crate) fn merge_faces_traced(solid: Solid, size: f64, keep: &[Vec<Vec3>]) -> (Solid, Option<HealMap>) {
     healed(solid, size, keep, true, true)
 }
@@ -623,7 +625,9 @@ fn heal_shells(solid: &Solid, size: f64, keep: &[Vec<Vec3>], traced: bool, faces
             from = groups.iter().map(|g| g.iter().filter_map(|i| from.get(*i)).flatten().copied().collect()).collect();
             changed = true;
         }
-        if !faces_only && let Some(m) = merge_collinear(&cur, &mut trace) {
+        // Straight edges the merged pieces leave split at vertices nothing else uses join
+        // into one, after any boolean (#1049): later features meet one edge, not the pieces.
+        if let Some(m) = merge_collinear(&cur, &mut trace) {
             cur = m;
             changed = true;
         }
@@ -668,7 +672,8 @@ mod tests {
             .map(|k| builder::vertex(mt::Point3::new(k as f64, 0.0, 0.0)))
             .chain([builder::vertex(mt::Point3::new(n as f64, 3.0, 0.0)), builder::vertex(mt::Point3::new(0.0, 3.0, 0.0))])
             .collect();
-        let edges: Vec<mt::Edge> = pts.iter().zip(pts.iter().cycle().skip(1)).map(|(a, b)| builder::line(a, b)).collect();
+        let pts: solidcraft_geom::Ring<mt::Vertex> = pts.into();
+        let edges: Vec<mt::Edge> = pts.edges().map(|(a, b)| builder::line(a, b)).collect();
         let face = builder::try_attach_plane(&[mt::Wire::from(edges)]).expect("a plane");
         builder::tsweep(&face, mt::Vector3::new(0.0, 0.0, 2.0))
     }
