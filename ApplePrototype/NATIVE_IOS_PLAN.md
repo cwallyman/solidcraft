@@ -158,6 +158,23 @@ Each phase lists **who**, what to **read**, what to **do**, and what the **user 
   - Update the README, keeping the license notices.
 - **User tests**: a final full pass, then archive.
 
+### Phase 9: DWG import (optional; can run any time after Phase 0)
+- **Who**: Claude Code, split over several sessions: 9a, 9b, 9c.
+- **Licence rule**:
+  - No GPL code: LibreDWG and libdxfrw are GPL and can't ship in this MIT/Apache App Store app.
+  - The reference is **ACadSharp** (C#, MIT). Confirm its licence before starting, and keep its copyright notice in the new crate.
+  - First check crates.io for an existing MIT/Apache Rust DWG reader; use it if it's good enough.
+- **Read**:
+  - the existing DXF importer in `upstream-solidcraft/crates/io` (find it from the DXF import command)
+  - only the ACadSharp reader files for the step at hand
+- **Do**:
+  - **9a**: create a new crate `upstream-solidcraft/crates/dwg`. It reads the DWG header, version, and the section and object map for R2000 (AC1015) through R2018 (AC1032). Unsupported versions return a clear error.
+  - **9b**: decode the entities the DXF importer already handles (lines, arcs, circles, polylines and splines first, then text and blocks) into the importer's own entity types. Don't write a second geometry path.
+  - **9c**: add `.dwg` to the Open/Insert file types. It follows the same path as DXF, including the large-file layer split, and reports skipped entities the same way. Remove the "DWG not supported" message.
+- **User tests**:
+  - Import your own DWG files from several CAD versions, and compare each against the DXF exported from the same file.
+  - Check that an unsupported version gives a clear message.
+
 ## Token-saving notes
 
 - This file is the only shared context, so keep it short, and keep log entries short.
