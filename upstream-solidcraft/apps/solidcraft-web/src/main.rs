@@ -170,6 +170,17 @@ mod web {
     }
 
     #[wasm_bindgen::prelude::wasm_bindgen]
+    pub fn touch_set_finger_navigation(active: bool) {
+        solidcraft_ui_egui::apple_touch::set_finger_navigation(active);
+    }
+
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    pub fn touch_roll(radians: f64) {
+        solidcraft_ui_egui::apple_touch::add_roll(radians);
+        solidcraft_ui_egui::apple_touch::request_repaint();
+    }
+
+    #[wasm_bindgen::prelude::wasm_bindgen]
     pub fn touch_is_model(x: f32, y: f32) -> bool {
         solidcraft_ui_egui::apple_touch::is_model_point(x, y)
     }
@@ -660,6 +671,9 @@ mod web {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.tick_font(ctx);
             self.app.logic(ctx);
+            if solidcraft_ui_egui::apple_touch::apply_roll(&mut self.app) {
+                ctx.request_repaint();
+            }
             if let Some((x, y)) = ALIGN.with(|at| at.borrow_mut().take()) {
                 solidcraft_ui_egui::apple_touch::align_face(&mut self.app, egui::pos2(x, y) / ctx.zoom_factor());
                 ctx.request_repaint();
@@ -843,6 +857,11 @@ mod web {
                             app.load_prefs(&p);
                         }
                         app.ui.apple_touch = query().contains("apple");
+                        // The iPad starts on its own preset. Fusion was the only preset the touch
+                        // layer worked with before, and has the same mouse bindings.
+                        if app.ui.apple_touch && app.preferences.nav == "fusion" {
+                            app.preferences.nav = solidcraft_ui_egui::prefs::IPAD_NAV.into();
+                        }
                         if let Some(rs) = &cc.wgpu_render_state {
                             // eframe's web painter has no stencil buffer.
                             app.set_wgpu(rs, DEPTH_BITS, 0, 1);

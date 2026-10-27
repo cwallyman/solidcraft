@@ -16,6 +16,8 @@ struct HitState {
 
 thread_local! {
     static PENCIL_INPUT: Cell<bool> = const { Cell::new(false) };
+    static FINGER_NAVIGATION: Cell<bool> = const { Cell::new(false) };
+    static PENDING_ROLL: Cell<f64> = const { Cell::new(0.0) };
     static HIT: RefCell<Option<HitState>> = const { RefCell::new(None) };
     static LAYOUT: RefCell<Value> = const { RefCell::new(Value::Null) };
 }
@@ -29,13 +31,44 @@ pub fn pencil_input() -> bool {
     PENCIL_INPUT.with(Cell::get)
 }
 
+/// The host reports when fingers drive the camera; their gestures then follow the iPad Touch
+/// preset whatever mouse preset is chosen.
+pub fn set_finger_navigation(active: bool) {
+    FINGER_NAVIGATION.with(|state| state.set(active));
+}
+
+pub fn finger_navigation() -> bool {
+    FINGER_NAVIGATION.with(Cell::get)
+}
+
+/// A two-finger twist from the host (radians, clockwise on screen); applied on the next frame.
+pub fn add_roll(radians: f64) {
+    if radians.is_finite() {
+        PENDING_ROLL.with(|roll| roll.set(roll.get() + radians));
+    }
+}
+
+/// Roll the view by the twist gathered since the last frame.
+pub fn apply_roll(app: &mut SolveApp) -> bool {
+    let radians = PENDING_ROLL.with(|roll| roll.replace(0.0));
+    if radians == 0.0 {
+        return false;
+    }
+    app.cancel_view_animation();
+    app.cam.roll_by(radians);
+    true
+}
+
 fn rect_json(rect: Rect) -> Value {
     json!([rect.left(), rect.top(), rect.width(), rect.height()])
 }
 
 pub fn update(app: &SolveApp, ctx: &Context) {
     let view = if app.home.open { None } else { app.viewport.rect };
-    let controls: Vec<_> = ["nav:outer", "axis_view:outer"].into_iter().filter_map(scenario::rect_of).collect();
+    // Floating shell cards (ribbon, History, browser, palettes, dialogs) sit over the full-bleed
+    // viewport on its own layer, so they are listed explicitly rather than found by layer.
+    let mut controls: Vec<_> = ["nav:outer", "axis_view:outer"].into_iter().filter_map(scenario::rect_of).collect();
+    controls.extend(crate::shell::covered_rects(app));
     HIT.with(|h| {
         *h.borrow_mut() = Some(HitState { ctx: ctx.clone(), viewport: view, controls, projection: view.map(|r| viewport::projection(app, r)) })
     });

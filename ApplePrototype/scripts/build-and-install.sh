@@ -6,4 +6,3 @@ xcodebuild -project SolidCraftTest.xcodeproj -scheme SolidCraftTest \
   -configuration Debug -destination "id=$ipad_device" \
   -derivedDataPath build -allowProvisioningUpdates build
 xcrun devicectl device install app --device "$ipad_device" build/Build/Products/Debug-iphoneos/SolidCraftTest.app
-xcrun devicectl device process launch --device "$ipad_device" com.cwallyman.SolidCraftTest

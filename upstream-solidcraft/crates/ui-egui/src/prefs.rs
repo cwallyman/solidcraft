@@ -35,6 +35,8 @@ use crate::viewport::NavMode;
 pub const UNITS: [&str; 5] = ["mm", "cm", "m", "in", "ft"];
 pub const OPENSCAD_NAV: &str = "openscad";
 pub const TOUCHPAD_NAV: &str = "touchpad";
+/// The iPad app's own preset (offered only there): finger and Pencil gestures.
+pub const IPAD_NAV: &str = "ipad";
 /// A mouse button that can drag the camera.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavButton {
@@ -98,7 +100,7 @@ use NavButton::{Left, Middle, Right};
 use NavMode::{Orbit, Pan, Zoom};
 
 /// The mouse mappings. The first is the default.
-pub const NAV_PRESETS: [NavPreset; 8] = [
+pub const NAV_PRESETS: [NavPreset; 9] = [
     NavPreset {
         id: "fusion",
         label: "Fusion",
@@ -178,7 +180,18 @@ pub const NAV_PRESETS: [NavPreset; 8] = [
         reverse_zoom: false,
         bindings: &[bind(Middle, NavKeys::NONE, Pan), bind(Right, NavKeys::NONE, Orbit)],
     },
+    NavPreset {
+        id: IPAD_NAV,
+        label: "iPad Touch",
+        help: IPAD_NAV_HELP,
+        reverse_zoom: false,
+        // The touch layer sends one-finger drags as Shift+middle and two-finger drags as middle; a
+        // connected mouse or trackpad gets the same bindings.
+        bindings: &[bind(Middle, NavKeys::SHIFT, Orbit), bind(Middle, NavKeys::NONE, Pan), bind(Right, NavKeys::NONE, Orbit)],
+    },
 ];
+
+const IPAD_NAV_HELP: &str = "One finger drags to orbit, two fingers drag to pan, pinch zooms, two fingers twist to rotate; double-tap a face to look straight at it. The Pencil draws, picks and taps to add or remove from the selection; a tap on empty space clears it. A connected mouse: middle drag pans, Shift+middle orbits, right drag orbits.";
 
 impl NavPreset {
     /// Button-free motion has exact modifiers, unlike the additive drag bindings.
@@ -1160,6 +1173,9 @@ pub fn nav_mode(app: &SolveApp, button: NavButton, mods: Modifiers) -> Option<Na
     if button == NavButton::Right && crate::mouse_gesture::active(app) {
         return None;
     }
+    if crate::apple_touch::finger_navigation() {
+        return nav_preset(IPAD_NAV).mode(button, mods);
+    }
     nav_preset(&app.preferences.nav).mode(button, mods)
 }
 
@@ -1189,7 +1205,8 @@ pub fn manipulator_free_held(app: &SolveApp, m: Modifiers) -> bool {
 
 /// +1, or −1 when the wheel zooms the other way.
 pub fn zoom_sign(app: &SolveApp) -> f64 {
-    if app.preferences.zoom_reverse { -1.0 } else { 1.0 }
+    // A pinch spreads to zoom in whatever the wheel preference.
+    if app.preferences.zoom_reverse && !crate::apple_touch::finger_navigation() { -1.0 } else { 1.0 }
 }
 
 /// The model point under a screen position. Over empty space: the centre of the visible bodies

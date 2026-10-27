@@ -1,6 +1,6 @@
 {
   "origin": "local source build",
-  "base_revision": "c2a57a44ab812f929ecf18eb536d2e22fcd2ff53",
+  "base_revision": "3c62195e18be36aa8e210d524f8fb74f90197f8e",
   "modified_source": true,
   "profile": "release, Rust optimization enabled, wasm-opt disabled for prototype iteration",
   "files": [
@@ -31,7 +31,7 @@
     },
     {
       "file": "build.json",
-      "sha256": "86486d932d71d20353c51a2f79408d73f5474e321b35be18b2922230bc17bb83",
+      "sha256": "66555f3b6e595f96e85b70961bddd5fa1ff60eb4041803929e4261264b3a7d58",
       "bytes": 1113
     },
     {
@@ -61,7 +61,7 @@
     },
     {
       "file": "index.html",
-      "sha256": "68330028e279d472a6353e80ca35bc1b119cacd118e1b555eabf2bc3622705f2",
+      "sha256": "175120dae1947bffd71ba9d50edd3d82901621804d0a80df757202ec7b30d8c1",
       "bytes": 3252
     },
     {
@@ -80,18 +80,18 @@
       "bytes": 614
     },
     {
-      "file": "solidcraft-web-7dc756c37282812f.js",
-      "sha256": "20f7c1470a38abef8e1524ae97289811fc1c1c1973b99d52cccdbd4b10a261c3",
-      "bytes": 180544
+      "file": "solidcraft-web-249e08a98e0d0ca7.js",
+      "sha256": "8de6c09a57a17e8178fbeee6389cfa6130b8d1d75a3e166e097353ef2193478f",
+      "bytes": 180788
     },
     {
-      "file": "solidcraft-web-7dc756c37282812f_bg.wasm",
-      "sha256": "f65b52bdb08896355722c798fcc263a6d8f678138de7c19059178b3d776b40da",
-      "bytes": 90928956
+      "file": "solidcraft-web-249e08a98e0d0ca7_bg.wasm",
+      "sha256": "28fd064b87e2b409849b94c294084cf28f9cf3e83ca82790d4078a5e40eda201",
+      "bytes": 90792158
     },
     {
       "file": "sw.js",
-      "sha256": "921957ac9e25f73b1c79d752db839af867c55d88e76a39d78e5bc88a673491c9",
+      "sha256": "95a1374768cc803e3b80c9812c63f581f69b031b2eb12e0e616e452e41cabbbe",
       "bytes": 12682
     }
   ]

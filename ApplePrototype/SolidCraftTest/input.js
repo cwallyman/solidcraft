@@ -4,9 +4,12 @@ window.installSolidcraftInput = (canvas, report) => {
   let navigation = null, pencil = null, suspended = false, pendingOrbit = null, uiContact = null, lastTap = null;
   const ORBIT_INTENT_MS = 100;
   const ORBIT_SLOP = 6;
+  // A two-finger twist must pass this angle before it rolls, so pans and pinches stay level.
+  const TWIST_START = 0.1;
   const debug = {modelTaps:0,alignRequests:0,lastTapGap:0,lastRoute:''};
   window.solidcraftInputDiagnostics = debug;
-  let orbitMoves = 0, panMoves = 0, zoomMoves = 0, pencilStrokes = 0;
+  let orbitMoves = 0, panMoves = 0, zoomMoves = 0, rollMoves = 0, pencilStrokes = 0;
+  let twist = {total:0,rolling:false};
   const stop = event => { event.preventDefault(); event.stopImmediatePropagation(); };
   const point = event => ({clientX:event.clientX, clientY:event.clientY});
   const emit = (type, p, mode, pressed) => {
@@ -35,6 +38,10 @@ window.installSolidcraftInput = (canvas, report) => {
     hoverPoint = {clientX:x,clientY:y};
     emit('mousemove',hoverPoint,'pencil',false);
   };
+  // Once fingers navigate, the engine uses the iPad gestures whatever mouse preset is chosen,
+  // until a hardware mouse or trackpad is used. Events reach the engine a frame later, so the
+  // state is not cleared when the fingers lift.
+  const fingerNavigation = active => window.wasmBindings?.touch_set_finger_navigation?.(active);
   const releaseNavigation = () => {
     if (navigation) emit('pointerup',navigation.point,navigation.mode,false);
     navigation = null;
@@ -44,14 +51,17 @@ window.installSolidcraftInput = (canvas, report) => {
     if (points.length === 1) return {mode:'orbit',point:points[0],distance:null};
     if (points.length === 2) return {mode:'pan',
       point:{clientX:(points[0].clientX+points[1].clientX)/2,clientY:(points[0].clientY+points[1].clientY)/2},
-      distance:Math.hypot(points[0].clientX-points[1].clientX,points[0].clientY-points[1].clientY)};
+      distance:Math.hypot(points[0].clientX-points[1].clientX,points[0].clientY-points[1].clientY),
+      angle:Math.atan2(points[1].clientY-points[0].clientY,points[1].clientX-points[0].clientX)};
     return null;
   };
   const startNavigation = initial => {
     releaseNavigation();
     if (suspended || pencil) return;
     navigation = initial || measure();
+    twist = {total:0,rolling:false};
     if (navigation) {
+      fingerNavigation(true);
       emit('mousemove',navigation.point,navigation.mode,false);
       // eframe runs a frame on pointerup/down. Consume the cursor relocation
       // with the button released, so landing/centroid changes cannot rotate or pan.
@@ -60,8 +70,17 @@ window.installSolidcraftInput = (canvas, report) => {
     }
   };
   const reportNavigation = () => report({kind:'navigation',text:
-    `Touch navigation moves: ${orbitMoves+panMoves}; orbit: ${orbitMoves}; pan: ${panMoves}; pinch: ${zoomMoves}; Pencil strokes: ${pencilStrokes}`});
+    `Touch navigation moves: ${orbitMoves+panMoves}; orbit: ${orbitMoves}; pan: ${panMoves}; pinch: ${zoomMoves}; rotate: ${rollMoves}; Pencil strokes: ${pencilStrokes}`});
   const modelPoint = p => window.solidcraftIsModelPoint ? window.solidcraftIsModelPoint(p) : true;
+  // Menus and the command search close on a press outside them. A finger tap on the model is
+  // navigation, not a press, so it also presses just off the canvas, where nothing is picked.
+  const dismissOverlays = () => {
+    const rect = canvas.getBoundingClientRect();
+    const away = {clientX:rect.left-64,clientY:rect.top-64};
+    emit('mousemove',away,'ui',false);
+    emit('pointerdown',away,'ui',true);
+    emit('pointerup',away,'ui',false);
+  };
 
   for (const type of ['pointerdown','pointermove','pointerup','pointercancel']) {
     canvas.addEventListener(type,event => {
@@ -71,6 +90,7 @@ window.installSolidcraftInput = (canvas, report) => {
         if (type === 'pointerdown' && !pencil) {
           hoverPoint = null;
           window.wasmBindings?.touch_set_pencil?.(false);
+          fingerNavigation(false);
         }
         return;
       }
@@ -152,6 +172,20 @@ window.installSolidcraftInput = (canvas, report) => {
             zoomMoves++;
           }
         }
+        if (next.mode === 'pan' && navigation.angle !== undefined) {
+          // Screen angles grow clockwise, as a positive camera roll turns the picture.
+          let turn = next.angle-navigation.angle;
+          turn = Math.atan2(Math.sin(turn),Math.cos(turn));
+          twist.total += turn;
+          if (!twist.rolling && Math.abs(twist.total) > TWIST_START) {
+            twist.rolling = true;
+            turn = twist.total;
+          }
+          if (twist.rolling && Math.abs(turn) > 0.0001) {
+            window.wasmBindings?.touch_roll?.(turn);
+            rollMoves++;
+          }
+        }
         navigation = next;
       } else if ((type === 'pointerup' || type === 'pointercancel') && fingers.has(event.pointerId)) {
         const tap = type === 'pointerup' && fingers.size === 1 && pendingOrbit
@@ -159,6 +193,7 @@ window.installSolidcraftInput = (canvas, report) => {
           && Math.hypot(p.clientX-pendingOrbit.origin.clientX,p.clientY-pendingOrbit.origin.clientY) < ORBIT_SLOP;
         if (tap) {
           debug.modelTaps++;
+          dismissOverlays();
           if (lastTap) debug.lastTapGap = event.timeStamp-lastTap.time;
           if (lastTap && event.timeStamp-lastTap.time < 350 && Math.hypot(p.clientX-lastTap.point.clientX,p.clientY-lastTap.point.clientY) < 20) {
             debug.alignRequests++;
@@ -177,6 +212,9 @@ window.installSolidcraftInput = (canvas, report) => {
       }
     },{capture:true,passive:false});
   }
+  canvas.addEventListener('wheel',event => {
+    if (event.isTrusted) fingerNavigation(false);
+  },{capture:true,passive:true});
   canvas.addEventListener('pointerleave',event => {
     if (event.isTrusted && event.pointerType === 'pen' && !pencil) {
       window.solidcraftPencilHover(0,0,true);

@@ -1373,6 +1373,8 @@
   "nav.free_orbit.label": "Free orbit",
   "nav.fusion.help": "Middle drag pans, Shift+middle orbits, right drag orbits",
   "nav.inventor.help": "Middle drag pans, Shift+middle orbits, Ctrl+middle zooms, right drag orbits",
+  "nav.ipad.help": "One finger drags to orbit, two fingers drag to pan, pinch zooms, two fingers twist to rotate; double-tap a face to look straight at it. The Pencil draws, picks and taps to add or remove from the selection; a tap on empty space clears it. A connected mouse: middle drag pans, Shift+middle orbits, right drag orbits.",
+  "nav.ipad.label": "iPad Touch",
   "nav.openscad.help": "Left drag on empty space orbits, Shift+left drag box-selects, sketch geometry drags edit; right or middle drag pans, Shift+right or Shift+middle drag zooms",
   "nav.perspective.sketch": "Sketch editing uses orthographic view. Finish the sketch to switch perspective.",
   "nav.solidworks.help": "Middle drag orbits, Ctrl+middle pans, Shift+middle zooms, right drag orbits",

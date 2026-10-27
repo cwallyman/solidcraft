@@ -63,7 +63,9 @@ final class LocalWebServer {
               let data = try? Data(contentsOf: url) else {
             send(connection, status: "404 Not Found", type: "text/plain", data: Data()); return
         }
-        let types = ["html": "text/html; charset=utf-8", "js": "text/javascript", "wasm": "application/wasm", "ttf": "font/ttf", "json": "application/json"]
+        // WebKit ignores a stylesheet served with any other type, leaving the canvas unsized.
+        let types = ["html": "text/html; charset=utf-8", "js": "text/javascript", "wasm": "application/wasm", "ttf": "font/ttf", "json": "application/json",
+                     "css": "text/css", "svg": "image/svg+xml", "png": "image/png", "webmanifest": "application/manifest+json"]
         send(connection, status: "200 OK", type: types[url.pathExtension] ?? "text/plain", data: data)
     }
 

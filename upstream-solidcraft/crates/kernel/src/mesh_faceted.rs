@@ -14,8 +14,8 @@ pub fn convert_faceted_mesh(body: &Body, tolerance: f64) -> Result<Vec<Body>> {
             return Err(invalid("tolerance must be between 0.000001 and 1 mm"));
         }
         let input = body.mesh.as_ref().ok_or_else(|| invalid("select a mesh body"))?;
-        if input.triangles.len() > 5_000 {
-            return Err(invalid("mesh exceeds the 5000-triangle faceted conversion budget"));
+        if input.triangles.len() > 25_000 {
+            return Err(invalid("mesh exceeds the 25000-triangle faceted conversion budget"));
         }
         let welded = crate::mesh_convert::weld(input, tolerance)?;
         let mesh = welded.mesh.as_ref().ok_or_else(|| invalid("empty mesh"))?;
