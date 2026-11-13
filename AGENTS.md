@@ -2,6 +2,9 @@
 
 SolidCraft is a clean-room, pure-Rust parametric 3D CAD app (sketch solver, feature timeline, B-rep kernel, an egui UI that agents drive). This file is a router: the hard rules, then the skill to read for your task. Humans: CONTRIBUTING.md.
 
+## Fork testing branch
+On `browser-test`, read `FORK_WORKFLOW.md` for the fork's browser testing and upstream contribution workflow. Keep fork-only files and instructions out of upstream PRs.
+
 ## Start here
 Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelled `help wanted`, `good first issue`, `needs-triage`; architecture in `docs/architecture.md`.
 
