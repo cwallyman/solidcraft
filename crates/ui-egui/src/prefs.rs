@@ -1058,6 +1058,8 @@ preference_settings! {
     default_units: String = "mm".into(), PAGE_DESIGN;
     /// Mouse mapping: `fusion`, `solidworks` or `inventor`.
     nav: String = "fusion".into(), PAGE_NAVIGATION;
+    /// Touchscreen drags orbit/pan; off preserves the mouse mapping's selection behavior.
+    touchscreen_navigation: bool = true, PAGE_NAVIGATION => check_tr("nav.touchscreen.label");
     /// Opt in to rotation through both poles with roll, without the Shift axis-snap spring.
     /// Independent of mouse bindings; false also preserves existing saved presets' behavior.
     free_orbit: bool = false, PAGE_NAVIGATION;
@@ -1089,6 +1091,11 @@ preference_settings! {
     /// C for Cancel (#9841). Off by default: typing does nothing to the buttons, as before.
     /// A letter that fits two buttons does nothing, and a focused text field keeps the keystroke.
     dialog_first_letter_buttons: bool = false, PAGE_GENERAL => check_id("prefs.dialog_first_letter_buttons");
+    /// The Donate button (Ko-fi) at the status bar's right end. The button's × turns it off; the Help
+    /// menu, About and the start page keep their link.
+    show_donate_button: bool = true, PAGE_GENERAL => check_id("prefs.show_donate_button");
+    /// The Discord button at the status bar's right end; the × on it turns it off.
+    show_discord_button: bool = true, PAGE_GENERAL => check_id("prefs.show_discord_button");
     /// View orientation widget: original signed axes (default) or compact cube.
     navigator_style: NavigatorStyle = NavigatorStyle::default(), PAGE_NAVIGATION;
     /// The custom view gizmo's colours: the cube's (themed) or the body's own (modeled).
@@ -6818,6 +6825,8 @@ mod tests {
             ("viewport_background", json!([255, 255, 255]), PAGE_APPEARANCE),
             ("view_confirm_corner", json!(true), PAGE_LAYOUT),
             ("status_bar", json!(true), PAGE_LAYOUT),
+            ("show_donate_button", json!(false), PAGE_GENERAL),
+            ("show_discord_button", json!(false), PAGE_GENERAL),
             ("browser_eye_left", json!(true), PAGE_LAYOUT),
             ("browser_components_open", json!(true), PAGE_LAYOUT),
             ("browser_rows_start_closed", json!(true), PAGE_LAYOUT),
