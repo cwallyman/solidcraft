@@ -1058,6 +1058,8 @@ preference_settings! {
     default_units: String = "mm".into(), PAGE_DESIGN;
     /// Mouse mapping: `fusion`, `solidworks` or `inventor`.
     nav: String = "fusion".into(), PAGE_NAVIGATION;
+    /// Touchscreen drags orbit/pan; off preserves the mouse mapping's selection behavior.
+    touchscreen_navigation: bool = true, PAGE_NAVIGATION => check_tr("nav.touchscreen.label");
     /// Opt in to rotation through both poles with roll, without the Shift axis-snap spring.
     /// Independent of mouse bindings; false also preserves existing saved presets' behavior.
     free_orbit: bool = false, PAGE_NAVIGATION;
@@ -1089,6 +1091,11 @@ preference_settings! {
     /// C for Cancel (#9841). Off by default: typing does nothing to the buttons, as before.
     /// A letter that fits two buttons does nothing, and a focused text field keeps the keystroke.
     dialog_first_letter_buttons: bool = false, PAGE_GENERAL => check_id("prefs.dialog_first_letter_buttons");
+    /// The Donate button (Ko-fi) at the status bar's right end. The button's × turns it off; the Help
+    /// menu, About and the start page keep their link.
+    show_donate_button: bool = true, PAGE_GENERAL => check_id("prefs.show_donate_button");
+    /// The Discord button at the status bar's right end; the × on it turns it off.
+    show_discord_button: bool = true, PAGE_GENERAL => check_id("prefs.show_discord_button");
     /// View orientation widget: original signed axes (default) or compact cube.
     navigator_style: NavigatorStyle = NavigatorStyle::default(), PAGE_NAVIGATION;
     /// The custom view gizmo's colours: the cube's (themed) or the body's own (modeled).
@@ -1797,8 +1804,10 @@ preference_settings! {
     /// When true: Shift+click adds without removing; Primary toggles.
     /// When false (default): Shift and Primary both toggle.
     selection_shift_add_only: bool = false, PAGE_SKETCH;
-    /// In the web viewport, a pen tap toggles an item or clears the selection on empty space.
-    pen_tap_toggles_selection: bool = false, PAGE_SKETCH;
+    /// Web app Pencil mode: pen taps toggle items and a pen double-tap takes the whole body or
+    /// sketch; finger touches in the view only navigate, and a finger double-tap on a flat face
+    /// starts a sketch on it. Off (the default): pens and fingers act as the mouse does.
+    pencil_mode: bool = false, PAGE_SKETCH;
     /// Prefer movable sketch points on exact selection ties; off keeps point insertion order.
     prefer_free_sketch_points: bool = true, PAGE_SKETCH;
     /// Opt in to displaying and selecting drawn 3D curve nodes as construction references.
@@ -6816,6 +6825,8 @@ mod tests {
             ("viewport_background", json!([255, 255, 255]), PAGE_APPEARANCE),
             ("view_confirm_corner", json!(true), PAGE_LAYOUT),
             ("status_bar", json!(true), PAGE_LAYOUT),
+            ("show_donate_button", json!(false), PAGE_GENERAL),
+            ("show_discord_button", json!(false), PAGE_GENERAL),
             ("browser_eye_left", json!(true), PAGE_LAYOUT),
             ("browser_components_open", json!(true), PAGE_LAYOUT),
             ("browser_rows_start_closed", json!(true), PAGE_LAYOUT),

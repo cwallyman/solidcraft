@@ -65,6 +65,8 @@ pub enum NavMode {
 
 #[derive(Default)]
 pub struct ViewportState {
+    /// Touchscreen gesture ownership and contacts for the shared camera handler.
+    pub(crate) touch: crate::navigation::TouchNavigation,
     /// The faces the modelling kernel refuses that the window points at (a failed operation's
     /// message, a "needs repair" row under the pointer): ringed in the error colour. What this
     /// frame asks for ([`crate::refused_part::ring`]) is drawn from the next one on, so the ring
@@ -169,6 +171,7 @@ pub struct ViewportState {
     shadow: std::sync::Mutex<Option<ShadowGeometry>>,
     pub(crate) sketch_slot: SceneSlot,
     sketch_key: u64,
+    wireframe: crate::wireframe_silhouettes::Outlines,
     physical_scale: f32,
     pub(crate) display: std::sync::Mutex<crate::sketch_display::DisplayCache>,
     pub(crate) hl_slot: SceneSlot,
@@ -208,7 +211,9 @@ pub struct ViewportState {
     pub hover: Option<Hit>,
     /// The centre of the circle or arc of the sketch being edited whose edge was hovered last
     /// (sketch, point id): it is drawn, and it takes the pointer from further away
-    /// ([`WOKEN_CENTRE_PX`]), until another curve or point is hovered.
+    /// ([`WOKEN_CENTRE_PX`]), until another curve or point is hovered, until the pointer moves
+    /// past the circle's own size from the centre ([`WOKEN_CENTRE_FAR`]), or until a click on
+    /// empty space clears the selection (#16346).
     pub woken_centre: Option<(u64, String)>,
     /// The centre or midpoint most recently hovered for visual H/V tracking.
     pub(crate) tracking: crate::inference::Tracking,
@@ -234,6 +239,9 @@ pub struct ViewportState {
     /// The point the orbit under way turns around (Preferences: orbit around the cursor, or the
     /// view's centre (`navigation::view_middle`)), chosen when it begins.
     pub orbit_pivot: Option<Vec3>,
+    /// Where the view-centre orbit pivot (the camera's target while that is `None`) was on screen
+    /// when the orbit chose it; the pivot is kept while it stays there (#16091).
+    pub orbit_pivot_at: Option<egui::Pos2>,
     /// The model point a trackpad twist turns around (Orbit around: the cursor), kept while the
     /// twist goes on (see [`crate::navigation::twist_turn`]).
     pub twist_pivot: Option<Vec3>,
@@ -250,6 +258,9 @@ pub struct ViewportState {
     /// the view's centre (`navigation::view_middle`)), chosen when it starts and kept until it
     /// stops, so the model stays in view (#1044).
     pub spin_pivot: Option<Vec3>,
+    /// Where the view-centre spin pivot (the camera's target while that is `None`) was on screen
+    /// when the spin chose it.
+    pub spin_pivot_at: Option<egui::Pos2>,
     /// The 3D mouse's motion this frame, for the page showing the camera to apply with what its
     /// camera may do (`navigation::device`).
     pub device_motion: Option<crate::space_mouse::DeviceMotion>,
@@ -303,6 +314,12 @@ pub struct ViewportState {
     /// The plane the grid was last drawn on while Preferences ▸ Grid follows the view is on
     /// (#1470), kept so the choice is hysteretic near the thresholds (#1993).
     pub(crate) grid_plane: std::sync::Mutex<GridPlane>,
+    /// Pencil mode's fingers on the view (`pencil::filter`).
+    pub(crate) fingers: crate::pencil::Fingers,
+    /// The layer the view was drawn in last frame, and its axes: a finger elsewhere is on
+    /// something over the view, which takes the tap.
+    pub(crate) layer: Option<egui::LayerId>,
+    pub(crate) axes: Option<Rect>,
 }
 
 /// Something under the cursor. The control channel reports it in the selection's own form
@@ -638,6 +655,7 @@ fn base_scene_key(app: &SolveApp) -> u64 {
 fn sketch_scene_key(app: &SolveApp, proj: &Proj) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     scene_key(app).hash(&mut h);
+    app.viewport.wireframe.generation().hash(&mut h);
     app.ui.ground_shadow.hash(&mut h);
     // The grid this scene draws follows the view when the preference says so (#1470): turning it
     // on or off redraws even while the camera holds still.
@@ -942,6 +960,7 @@ fn update_refinement(app: &mut SolveApp, ctx: &egui::Context, proj: &Proj) {
     let bounds = body_bounds(app, &st);
     let mut live = std::collections::HashSet::with_capacity(st.bodies.len());
     let mut candidates = Vec::new();
+    let mut edge_steps = Vec::new();
     for (b, (name, bx)) in st.bodies.iter().zip(bounds.iter()) {
         let id = crate::display_lod::body_id(b).0;
         live.insert(id);
@@ -956,9 +975,16 @@ fn update_refinement(app: &mut SolveApp, ctx: &egui::Context, proj: &Proj) {
         };
         let err_px = crate::display_lod::error_px(q, b.body.size(), bx, on_screen, &lens);
         candidates.push(crate::display_lod::Candidate { body: b, err_px, triangles: b.mesh_in_place().0.triangles.len() });
+        // Its edges' tolerance, from the nearest it can come to the eye as the view orbits: on or
+        // off the screen alike, so orbiting needs no new edges (#16265 measured them).
+        if shown {
+            let ppm = crate::edge_detail::orbit_px_per_mm(&proj.cam, bx.min, bx.max, lens.scale);
+            edge_steps.push((id, ppm, q.chord(b.body.size())));
+        }
     }
     let busy = match app.viewport.lod.lock() {
         Ok(mut lod) => {
+            lod.update_edges(edge_steps);
             lod.update(q, candidates, &live);
             lod.stats.choose_ms = crate::now_ms() - t0;
             lod.busy()
@@ -1196,6 +1222,10 @@ struct BodyDraw {
     slot_base: u32,
     edge: crate::gpu::PaletteIndex,
     hidden_edge: crate::gpu::PaletteIndex,
+    /// The most its edges may move when simplified (mm; 0: drawn as meshed), from where the view
+    /// shows it ([`crate::edge_detail`]). Part of its block's key, not of [`BodyDraw::key`]: the
+    /// blocks keep their bodies when the view changes it.
+    edge_tol: f64,
 }
 
 impl BodyDraw {
@@ -1231,16 +1261,27 @@ impl BodyDraw {
                 out.triangle([a.0, b.0, c.0], [a.1, b.1, c.1], color(ti), class(ti));
             }
         }
-        let at = |p: Vec3| self.place.as_ref().map_or(p, |m| solidcraft_engine::doc::apply_point(m, p)).to_f32();
+        let placed = |p: Vec3| self.place.as_ref().map_or(p, |m| solidcraft_engine::doc::apply_point(m, p));
+        let at = |p: Vec3| placed(p).to_f32();
         for (ei, e) in m.edges.iter().enumerate().filter(|_| edges) {
             if !m.edge_visible(ei) || (shaded && !m.shaded_edge_visible(ei)) {
                 continue;
             }
-            for w in e.windows(2) {
-                let (a, b) = (at(w[0]), at(w[1]));
+            let mut emit = |a: [f32; 3], b: [f32; 3]| {
                 out.line(a, b, self.edge, 1.3);
                 if hidden_edges {
                     out.hidden_line(a, b, self.hidden_edge, 1.0);
+                }
+            };
+            if self.edge_tol > 0.0 && e.len() > 2 {
+                // Simplified where it stands (a placement may scale), to the view's tolerance.
+                let simplified = crate::edge_detail::simplify(&e.iter().map(|p| placed(*p)).collect::<Vec<_>>(), self.edge_tol);
+                for w in simplified.windows(2) {
+                    emit(w[0].to_f32(), w[1].to_f32());
+                }
+            } else {
+                for w in e.windows(2) {
+                    emit(at(w[0]), at(w[1]));
                 }
             }
         }
@@ -1813,6 +1854,7 @@ fn body_scene(
         let instanced =
             (!on_gpu && face_looks.is_empty()).then(|| instances.place(b, slots.instance, look, app.viewport.gpu.is_some_and(|g| g.oit))).flatten();
         let name = b.name.clone();
+        let edge_tol = if edges { app.viewport.lod.lock().map_or(0.0, |l| l.edge_tolerance(b)) } else { 0.0 };
         let body = match instanced {
             Some((mesh, place)) => BodyDraw {
                 name,
@@ -1827,6 +1869,7 @@ fn body_scene(
                 slot_base: slots.faces,
                 edge: slots.edge,
                 hidden_edge: slots.hidden_edge,
+                edge_tol,
             },
             None => BodyDraw {
                 name,
@@ -1841,10 +1884,13 @@ fn body_scene(
                 slot_base: slots.faces,
                 edge: slots.edge,
                 hidden_edge: slots.hidden_edge,
+                edge_tol,
             },
         };
         let key = body.key(shaded, edges, hidden_edges, markers);
         key.hash(&mut run_key);
+        // The edges' tolerance changes the block's bytes but not where blocks end.
+        body.edge_tol.to_bits().hash(&mut run_key);
         run.push(body);
         // Blocks end where a body's own key says, so a body added or removed changes only its
         // own block, not every block after it.
@@ -1911,6 +1957,7 @@ pub(crate) fn seam_width(order: Option<solidcraft_engine::kernel::Continuity>) -
 
 /// Rebuild the sketch scene when what it shows has changed.
 pub(crate) fn refresh_sketch_scene(app: &mut SolveApp, proj: &Proj) {
+    refresh_wireframe(app, proj);
     let sk = sketch_scene_key(app, proj);
     if sk != app.viewport.sketch_key {
         let scene = build_sketch_scene(app, proj);
@@ -1919,6 +1966,36 @@ pub(crate) fn refresh_sketch_scene(app: &mut SolveApp, proj: &Proj) {
         }
         app.viewport.sketch_key = sk;
     }
+}
+
+/// The camera changes only silhouette classification, never the body's mesh or GPU blocks.
+fn refresh_wireframe(app: &mut SolveApp, proj: &Proj) {
+    let mut outlines = std::mem::take(&mut app.viewport.wireframe);
+    if app.ui.visual_style != 2 {
+        if outlines.model().is_some() {
+            outlines.set_model(None, 0);
+        }
+        if outlines.busy() {
+            outlines.advance(&proj.cam, crate::wireframe_silhouettes::WORK_PER_FRAME, |_| None);
+        }
+    } else {
+        let key = scene_key(app);
+        let st = crate::open_meshing::shown_world(app);
+        if outlines.model() != Some(key) {
+            outlines.set_model(Some(key), st.bodies.len());
+        }
+        outlines.advance(&proj.cam, crate::wireframe_silhouettes::WORK_PER_FRAME, |index| {
+            let body = st.bodies.get(index)?;
+            if !app.body_visible(&body.name) || app.preview.effective_replaced().contains(&body.name) {
+                return None;
+            }
+            // The model scene already requested these display meshes. Reuse placements'
+            // shared triangles instead of materializing a moved copy during each drag.
+            let (mesh, placement) = shared_mesh(app, body).unwrap_or_else(|| (drawn_mesh(app, body), solidcraft_engine::doc::IDENTITY));
+            crate::wireframe_silhouettes::Source::new(mesh, placement)
+        });
+    }
+    app.viewport.wireframe = outlines;
 }
 
 /// View-dependent geometry: grid, sketch feedback and the ground shadow's visibility.
@@ -1936,6 +2013,12 @@ pub(crate) fn build_sketch_scene(app: &SolveApp, proj: &Proj) -> GpuScene {
     {
         // A hidden shadow must not keep an earlier document's whole model alive.
         *cache = None;
+    }
+    if app.ui.visual_style == 2 {
+        let color = sc.color(c4(tk.text));
+        for [a, b] in app.viewport.wireframe.segments() {
+            sc.line(a.to_f32(), b.to_f32(), color, 1.3, false);
+        }
     }
     let mut fill_budget = 131_072;
     // The open sketch's plane in the model this frame shows.
@@ -4504,6 +4587,8 @@ fn highlight_geometry_key(app: &SolveApp) -> u64 {
     (app.dialog.is_some(), app.tool.is_some()).hash(&mut h);
     // Which input is active decides what a round edge or face under the cursor stands for.
     app.dialog.as_ref().and_then(|d| d.active_input()).map(|i| i.accept).hash(&mut h);
+    // And whether Measure is open, which lights one piece of an edge a seam splits.
+    measuring_mesh_edges(app).hash(&mut h);
     solidcraft_theme::is_dark().hash(&mut h);
     solidcraft_theme::vision().hash(&mut h);
     // Two themes may share a light/dark base while drawing different geometry colours.
@@ -5352,7 +5437,9 @@ fn build_highlight_with_projection(app: &SolveApp, projection: impl FnOnce() -> 
             if let Some(b) = st.body(body) {
                 // Lit over the drawn edges (finer away from Normal display quality).
                 let m = drawn(b);
-                for i in m.circular_rim(*index) {
+                // Measure measures the piece picked of an edge a seam splits: light that piece.
+                let pieces = if measuring_mesh_edges(app) { m.circular_rim(*index) } else { edge_pieces(b, &m, *index) };
+                for i in pieces {
                     let selected = sel.iter().any(|x| matches!(x, Sel::Edge { body: b, index: j, .. } if b == body && *j == i));
                     if let Some(e) = if i == *index { edge_of(&m, i, *mid) } else { m.edges.get(i) } {
                         // A hovered edge that is picked keeps its selection highlight and only
@@ -5589,6 +5676,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     let hover_frozen = crate::navigation::hover_is_frozen(&input, app);
     let CameraInput { hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, inside, axes, pinch, pan, primary_nav, mode } =
         input;
+    app.viewport.layer = Some(ui.layer_id());
+    app.viewport.axes = Some(axes);
     app.viewport.physical_scale = ui.ctx().pixels_per_point();
     // Suppress-snap chord and manipulator-free prefs; Shift midpoint targeting while sketching.
     // Preview reselect uses Primary but is skipped while a manipulator drag is under way.
@@ -5668,7 +5757,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     if !(hover_frozen && inside) {
         app.viewport.hover = cand.as_ref().map(|c| c.0.clone());
     }
-    wake_centre(app, &hits);
+    wake_centre(app, &hits, hover, &proj);
 
     let keep = crate::tool_modifiers::keep_snap_points(crate::tool_modifiers::Held::new(
         ui.input(|i| i.modifiers),
@@ -5715,6 +5804,9 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             crate::frame_watch::step(app, "model scene");
         }
         refresh_sketch_scene(app, &proj);
+        if app.viewport.wireframe.busy() {
+            ui.ctx().request_repaint();
+        }
         let hk = highlight_key_with_projection(app, || proj);
         if hk != app.viewport.hl_key {
             let hl = build_highlight_with_projection(app, || proj);
@@ -5796,6 +5888,12 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::frame_rate::paint(app, ui, &painter, overlay_rect);
 
     // ---- interaction ----
+    // Pencil mode: a finger double-tap on a planar face sketches on it (`pencil`).
+    if let Some(p) = app.viewport.fingers.double_tap.take()
+        && app.preferences.pencil_mode
+    {
+        crate::pencil::finger_double_tap(app, &proj, p);
+    }
     // A tool's click that moved on the way (#2448) clicks where the button is let go.
     if app.viewport.tool_click && resp.drag_stopped() {
         app.viewport.tool_click = false;
@@ -5902,7 +6000,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         crate::tools::on_click(app, &proj, p, mods.shift);
     }
     if let Some(p) = hover.filter(|_| inside) {
-        let pen_select = app.preferences.pen_tap_toggles_selection && resp.clicked_by(egui::PointerButton::Primary) && app.pen_release == Some(p);
+        let pen_select = app.preferences.pencil_mode && resp.clicked_by(egui::PointerButton::Primary) && app.pen_release == Some(p);
         if app.tool.is_some() {
             crate::tools::on_hover(app, &proj, p, mods.shift);
         }
@@ -6012,6 +6110,13 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                         // the second click of a double-click, which has its own actions).
                         None if !pen_select && !add && !resp.double_clicked() && crate::select_other::cycle_click(app, &proj, p) => {}
                         None => {
+                            // Clicking empty space clears the selection, and the woken centre
+                            // sleeps with it (#16346): the cross in the ring must not outlive
+                            // the circle or arc it belongs to. A click on the centre itself
+                            // takes it, so it stays awake.
+                            if !add && !took_the_woken_centre(app, cand.as_ref()) {
+                                app.viewport.woken_centre = None;
+                            }
                             let sel = cand.and_then(|c| c.1);
                             // A pen tap on geometry toggles it. A tap on empty space clears.
                             let (add, allow_toggle) = if pen_select { (sel.is_some(), true) } else { (add, allow_toggle) };
@@ -6021,6 +6126,17 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                     }
                 }
             }
+        }
+        // A pen double-tap takes the whole body or sketch under it. Its two taps toggled the
+        // item there and back, so the selection before them gains the whole.
+        if pen_select
+            && resp.double_clicked()
+            && !held
+            && app.tool.is_none()
+            && app.dialog.is_none()
+            && let Some(items) = app.viewport.hover.as_ref().and_then(|hit| crate::pencil::whole(app, hit))
+        {
+            let _ = app.run("select.set", json!({ "items": items, "add": true }));
         }
         // Double-click a dimension: edit its value in place (a finished sketch's shown dimension
         // too, without editing the sketch).
@@ -6971,6 +7087,21 @@ pub(crate) fn picked_selection(s: &solidcraft_engine::Session, sel: &Sel) -> Vec
     grouped_selection(s, sel)
 }
 
+/// The edges of body `b` that are one edge to the user with its edge `edge`, sorted, `edge` among
+/// them: the pieces of a whole circle ([`MeshGeom::circular_rim`]) and those a curved surface's
+/// seam ending on an edge splits it into, as a ball's seam splits a slot's arc
+/// ([`solidcraft_engine::doc::ModelBody::whole_edge`], from the exact record). Only those `m`,
+/// a mesh of `b` (whose edges are the record's), has. Hover, click and box select all take an
+/// edge's pieces from here, so they agree.
+fn edge_pieces(b: &solidcraft_engine::doc::ModelBody, m: &solidcraft_engine::geom::Mesh, edge: usize) -> Vec<usize> {
+    let mut pieces = m.circular_rim(edge);
+    pieces.extend(b.whole_edge(edge));
+    pieces.sort_unstable();
+    pieces.dedup();
+    pieces.retain(|&i| m.edges.get(i).is_some());
+    pieces
+}
+
 /// Expand a visible rim or surface into the kernel pieces a command needs. The original
 /// face pick keeps its point (used by tools such as Hole and construction geometry).
 pub(crate) fn grouped_selection(s: &solidcraft_engine::Session, sel: &Sel) -> Vec<Sel> {
@@ -6979,8 +7110,11 @@ pub(crate) fn grouped_selection(s: &solidcraft_engine::Session, sel: &Sel) -> Ve
         Sel::Edge { body, index, .. } => {
             if let Some(b) = st.body(body) {
                 let m = b.mesh();
-                return m
-                    .circular_rim(*index)
+                // The picked piece first, then the others in order, as a face pick keeps its
+                // own: Measure takes the first piece of an edge a click selected.
+                let mut pieces = edge_pieces(b, &m, *index);
+                pieces.sort_by_key(|i| usize::from(i != index));
+                return pieces
                     .into_iter()
                     .filter_map(|i| m.edges.get(i).map(|e| Sel::Edge { body: body.clone(), index: i, point: polyline_mid(e) }))
                     .collect();
@@ -7014,17 +7148,19 @@ pub(crate) fn grouped_selection(s: &solidcraft_engine::Session, sel: &Sel) -> Ve
 }
 
 /// Measure keeps one entry per visible item, rather than using its two slots for kernel halves.
+/// A whole circle's pieces are one entry; a piece of an open edge a seam splits stays itself, as
+/// Measure measures that piece (the dialog keeps one piece of such an edge selected whole).
 pub(crate) fn measurement_selection(s: &solidcraft_engine::Session, sel: &Sel) -> Sel {
-    let pieces = grouped_selection(s, sel);
     let mut representative = sel.clone();
     match &mut representative {
-        Sel::Edge { index, .. } => {
-            if let Some(Sel::Edge { index: i, .. }) = pieces.first() {
-                *index = *i;
+        Sel::Edge { body, index, .. } => {
+            let st = crate::open_meshing::session_world(s);
+            if let Some(i) = st.body(body).and_then(|b| b.mesh().circular_rim(*index).first().copied()) {
+                *index = i;
             }
         }
         Sel::Face { index, .. } => {
-            if let Some(i) = pieces
+            if let Some(i) = grouped_selection(s, sel)
                 .iter()
                 .filter_map(|p| match p {
                     Sel::Face { index, .. } => Some(*index),
@@ -7114,6 +7250,7 @@ fn box_select(app: &mut SolveApp, proj: &Proj, bx: BoxSel, add: bool) {
         let scoped_bodies =
             dialog_accept.unwrap_or(BODIES) == BODIES && app.dialog.as_ref().is_none_or(|d| matches!(d.kind, crate::dialogs::Kind::Move { .. }));
         let active_bodies = if scoped_bodies { active_body_names(app) } else { None };
+        let measuring = measuring_mesh_edges(app);
         for b in &st.bodies {
             if !app.body_visible(&b.name) || (scoped_bodies && body_faded(app, b, &active_bodies)) {
                 continue;
@@ -7121,9 +7258,17 @@ fn box_select(app: &mut SolveApp, proj: &Proj, bx: BoxSel, add: bool) {
             let m = b.mesh();
             if accept & EDGES != 0 {
                 for (ei, e) in m.edges.iter().enumerate() {
-                    let rim = m.circular_rim(ei);
-                    let takes = if bx.crossing { bx.takes(&to2(e)) } else { rim.iter().all(|&i| m.edges.get(i).is_some_and(|p| bx.takes(&to2(p)))) };
-                    if edge_pickable(app, &m, ei) && takes {
+                    // A window takes an edge when all its pieces are inside: only an edge that is
+                    // itself inside is asked for them, so a marquee over a large model does not
+                    // walk every edge's record. Measure measures pieces, so there a window takes
+                    // each piece inside it, as a pick does (a whole circle still needs all its pieces).
+                    let takes = edge_pickable(app, &m, ei)
+                        && bx.takes(&to2(e))
+                        && (bx.crossing
+                            || if measuring { m.circular_rim(ei) } else { edge_pieces(b, &m, ei) }
+                                .iter()
+                                .all(|&i| m.edges.get(i).is_some_and(|p| bx.takes(&to2(p)))));
+                    if takes {
                         out.push(Sel::Edge { body: b.name.clone(), index: ei, point: polyline_mid(e) });
                     }
                 }
@@ -7204,9 +7349,13 @@ fn box_select(app: &mut SolveApp, proj: &Proj, bx: BoxSel, add: bool) {
             }
         }
     }
+    // Measure measures pieces: a box there keeps each edge piece it took alone, as a pick does
+    // (Measure still takes a whole circle's pieces as one item).
+    let measuring = measuring_mesh_edges(app);
     let mut grouped = Vec::new();
     for item in out {
-        for piece in grouped_selection(&app.session, &item) {
+        let pieces = if measuring && matches!(item, Sel::Edge { .. }) { vec![item] } else { grouped_selection(&app.session, &item) };
+        for piece in pieces {
             if !grouped.iter().any(|x| crate::selection::same_item(x, &piece)) {
                 grouped.push(piece);
             }
@@ -7446,11 +7595,17 @@ fn hover_highlight(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
 /// against 8 for other sketch points.
 const WOKEN_CENTRE_PX: f32 = 16.0;
 
+/// How far (in the sketch's own units) the pointer may be from a woken centre and still keep it
+/// awake: a fifth more than the circle or arc's own radius, so the pointer can cross the whole
+/// circle to reach the other side of it, but not wander off and leave the cross behind (#16346).
+const WOKEN_CENTRE_FAR: f64 = 1.2;
+
 /// Hovering a circle's or an arc's edge in the sketch being edited wakes its centre: drawn, and
 /// picked from further away, so a line or a dimension is easily taken to it, and it stays awake
 /// while the pointer crosses the circle's inside to it. Hovering another curve or point (but
-/// that centre) puts it back to sleep, as does leaving the sketch.
-fn wake_centre(app: &mut SolveApp, hits: &[Hit]) {
+/// that centre) puts it back to sleep, as does leaving the sketch, taking the pointer past the
+/// circle's own size from the centre, and clicking empty space (#16346).
+fn wake_centre(app: &mut SolveApp, hits: &[Hit], pointer: Option<Pos2>, proj: &Proj) {
     let Some(active) = app.session.active_sketch else {
         app.viewport.woken_centre = None;
         return;
@@ -7472,11 +7627,63 @@ fn wake_centre(app: &mut SolveApp, hits: &[Hit]) {
         Some(Hit::SketchPoint { id, .. }) if app.viewport.woken_centre.as_ref().is_some_and(|(_, w)| w == id) => {}
         Some(_) => app.viewport.woken_centre = None,
         None => {
-            if app.viewport.woken_centre.as_ref().is_some_and(|(k, _)| *k != active) {
+            // The pointer left the circle: past its own size from the centre, the centre sleeps
+            // too (#16346). Inside that range it stays awake, so the pointer can still cross
+            // the circle to take the centre from the other side.
+            let asleep = match app.viewport.woken_centre.as_ref() {
+                None => true,
+                Some((sketch, id)) => {
+                    *sketch != active || pointer_in_sketch(&st, active, proj, pointer).is_some_and(|at| past_the_centre(&st, *sketch, id, at))
+                }
+            };
+            if asleep {
                 app.viewport.woken_centre = None;
             }
         }
     }
+}
+
+/// Did the click take the woken centre itself? A click on the cross in the ring takes it and
+/// leaves it awake; any other click puts it back to sleep (#16346): the highlight belongs to
+/// the pointer's hover, not to the selection.
+fn took_the_woken_centre(app: &SolveApp, cand: Option<&(Hit, Option<Sel>)>) -> bool {
+    let Some((sketch, id)) = &app.viewport.woken_centre else { return false };
+    match cand {
+        Some((Hit::SketchPoint { sketch: s, id: i, .. }, _)) => s == sketch && i == id,
+        _ => false,
+    }
+}
+
+/// Where the pointer meets the plane of the sketch `sketch`, in the sketch's own X and Y.
+fn pointer_in_sketch(st: &solidcraft_engine::doc::ModelState, sketch: u64, proj: &Proj, pointer: Option<Pos2>) -> Option<Vec2> {
+    let at = pointer?;
+    let ss = st.sketch(sketch)?;
+    let (origin, direction) = proj.ray(at);
+    crate::sketch_cursor_readout::plane_point(&ss.plane, origin, direction)
+}
+
+/// Is the pointer at `at` in the sketch farther from the woken centre `id` than the circle or
+/// arc that owns it? Its own radius is the measure: a fifth more than it is far enough for the
+/// pointer to have left the circle (#16346).
+fn past_the_centre(st: &solidcraft_engine::doc::ModelState, sketch: u64, id: &str, at: Vec2) -> bool {
+    let Some(ss) = st.sketch(sketch) else { return false };
+    let sk = &ss.sketch;
+    let Some(centre) = sk.resolve_point(id).and_then(|i| sk.point(i)) else { return false };
+    // The widest circle or arc centred on that point: one point may be the centre of several.
+    let radius = sk
+        .curves
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match &c.kind {
+            CurveKind::Circle { c: centre, .. } | CurveKind::Arc { c: centre, .. } if sk.points.get(*centre).is_some_and(|p| p.id == id) => {
+                sk.radius(i)
+            }
+            _ => None,
+        })
+        .filter(|r| r.is_finite())
+        .max_by(f64::total_cmp);
+    let Some(radius) = radius else { return false };
+    at.dist(centre) > radius * WOKEN_CENTRE_FAR
 }
 
 /// A midpoint stays attached to its edge; hover and selection share the same marker.
@@ -8082,6 +8289,8 @@ mod tests {
             let button = |pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers };
             h.frame_with(vec![Event::ModifiersChanged(modifiers), Event::PointerMoved(pos), button(true)]);
             h.frame_with_pen(vec![button(false)], pen.then_some(pos));
+            // Out of the double-tap window: a quick second tap is a double-tap.
+            h.frames(30);
         };
 
         tap(&mut h, a, true, Modifiers::NONE);
@@ -8089,7 +8298,7 @@ mod tests {
         assert_eq!(h.app.session.selection.len(), 1, "pen replaces the selection by default");
         let only_b = h.app.session.selection.clone();
 
-        h.app.preferences.pen_tap_toggles_selection = true;
+        h.app.preferences.pencil_mode = true;
         tap(&mut h, a, true, Modifiers::NONE);
         assert_eq!(h.app.session.selection.len(), 2);
         tap(&mut h, a, true, Modifiers::NONE);
@@ -8104,6 +8313,148 @@ mod tests {
         assert_eq!(h.app.session.selection, only_b, "the following mouse click replaces the selection");
         tap(&mut h, a, false, Modifiers::SHIFT);
         assert_eq!(h.app.session.selection.len(), 2, "Shift-click still adds a pick");
+    }
+
+    /// A 10 mm box in view, with Pencil mode on.
+    fn pencil_box() -> crate::scenario::Harness {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [0, 0, 0]})).unwrap();
+        h.app.animate_fit_all();
+        h.frames(30);
+        h.app.preferences.pencil_mode = true;
+        h
+    }
+
+    fn screen(h: &mut crate::scenario::Harness, world: [f64; 3]) -> Pos2 {
+        let [x, y] = h.at(&json!({ "world": world })).unwrap();
+        pos2(x as f32, y as f32)
+    }
+
+    /// A pen tap at `pos`: the press, then the release the platform names a pen tip's.
+    fn pen_tap(h: &mut crate::scenario::Harness, pos: Pos2) {
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        h.frame_with(vec![egui::Event::PointerMoved(pos), button(true)]);
+        h.frame_with_pen(vec![button(false)], Some(pos));
+    }
+
+    /// A finger tap at `pos` as eframe's web runner reports it: `pointerdown` makes a press and
+    /// runs a frame at once (the platform reports a finger down), `touchstart` makes another
+    /// press with the touch, and `touchend` the release, the pointer gone and the touch's end.
+    fn finger_tap(h: &mut crate::scenario::Harness, pos: Pos2, id: u64) {
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let touch = |phase| egui::Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(id), phase, pos, force: None };
+        h.frame_with_taps(vec![egui::Event::PointerMoved(pos), button(true)], crate::pencil::PlatformTaps { pen_release: None, finger_down: Some(pos) });
+        h.frame_with(vec![button(true), touch(egui::TouchPhase::Start)]);
+        h.frame_with(vec![button(false), egui::Event::PointerGone, touch(egui::TouchPhase::End)]);
+    }
+
+    /// Pencil mode: a finger tap in the view selects nothing (fingers move the view); with the
+    /// preference off it selects as a click does, as before.
+    #[test]
+    fn pencil_mode_finger_taps_in_the_view_do_not_select() {
+        let mut h = pencil_box();
+        let top = screen(&mut h, [5.0, 5.0, 10.0]);
+        finger_tap(&mut h, top, 1);
+        h.frames(30);
+        assert!(h.app.session.selection.is_empty(), "{:?}", h.app.session.selection);
+        assert!(h.app.session.active_sketch.is_none());
+
+        h.app.preferences.pencil_mode = false;
+        finger_tap(&mut h, top, 2);
+        h.frames(30);
+        assert!(matches!(h.app.session.selection.as_slice(), [solidcraft_engine::Sel::Face { .. }]), "{:?}", h.app.session.selection);
+    }
+
+    /// Pencil mode: a finger double-tap on a flat face selects it and starts a sketch on it; one
+    /// on empty space, or two taps too far apart in time, do nothing.
+    #[test]
+    fn pencil_mode_finger_double_tap_on_a_face_sketches_on_it() {
+        let mut h = pencil_box();
+        let empty = h.app.viewport.rect.map(|r| r.left_top() + egui::vec2(r.width() * 0.85, r.height() * 0.8)).unwrap();
+        finger_tap(&mut h, empty, 1);
+        finger_tap(&mut h, empty, 2);
+        h.frames(30);
+        assert!(h.app.session.active_sketch.is_none(), "empty space starts no sketch");
+
+        let top = screen(&mut h, [5.0, 5.0, 10.0]);
+        finger_tap(&mut h, top, 3);
+        h.frames(40);
+        finger_tap(&mut h, top, 4);
+        h.frames(30);
+        assert!(h.app.session.active_sketch.is_none(), "two slow taps are not a double-tap");
+
+        finger_tap(&mut h, top, 5);
+        finger_tap(&mut h, top, 6);
+        h.frames(30);
+        assert!(h.app.session.active_sketch.is_some(), "a double-tap on the top face sketches on it");
+    }
+
+    /// Pencil mode: a pen double-tap selects the whole body under it, and keeps what was
+    /// selected before; on the sketch being edited it selects every curve of the sketch.
+    #[test]
+    fn pencil_mode_pen_double_tap_selects_the_whole_body_or_sketch() {
+        let mut h = pencil_box();
+        let top = screen(&mut h, [5.0, 5.0, 10.0]);
+        let side = screen(&mut h, [10.0, 5.0, 5.0]);
+        pen_tap(&mut h, top);
+        h.frames(30);
+        let top_face = h.app.session.selection.clone();
+        assert_eq!(top_face.len(), 1);
+        pen_tap(&mut h, side);
+        pen_tap(&mut h, side);
+        h.frames(30);
+        let mut want = top_face.clone();
+        want.push(solidcraft_engine::Sel::Body { name: "Body1".into() });
+        assert_eq!(h.app.session.selection, want);
+
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.app.run("sketch.line", json!({"points": [[0, 0], [20, 0]], "infer": false})).unwrap();
+        h.app.run("sketch.line", json!({"points": [[0, 10], [20, 10]], "infer": false})).unwrap();
+        h.app.cam.distance = 80.0;
+        h.frames(4);
+        h.app.preferences.pencil_mode = true;
+        let line = screen(&mut h, [10.0, 0.0, 0.0]);
+        pen_tap(&mut h, line);
+        pen_tap(&mut h, line);
+        h.frames(30);
+        assert_eq!(h.app.session.selection.len(), 2, "both lines: {:?}", h.app.session.selection);
+        assert!(h.app.session.selection.iter().all(|s| matches!(s, solidcraft_engine::Sel::SketchCurve { .. })));
+    }
+
+    /// Pencil mode keeps a finger's presses where the finger is not on the open view (a panel,
+    /// the ribbon, a window over it), drops them while it is, and survives hostile positions.
+    #[test]
+    fn pencil_mode_filter_keeps_presses_off_the_view() {
+        let mut h = pencil_box();
+        let ctx = h.ctx.clone();
+        let press = |pos| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE };
+        let frame = |events| egui::RawInput { time: Some(100.0), events, ..Default::default() };
+        let presses = |raw: &egui::RawInput| raw.events.iter().filter(|e| matches!(e, egui::Event::PointerButton { .. })).count();
+
+        let ribbon = pos2(5.0, 5.0);
+        let mut raw = frame(vec![press(ribbon)]);
+        crate::pencil::filter(&mut h.app, &ctx, &mut raw, Some(ribbon));
+        assert_eq!(presses(&raw), 1, "a finger on the ribbon clicks it");
+
+        let top = screen(&mut h, [5.0, 5.0, 10.0]);
+        let mut raw = frame(vec![press(top)]);
+        crate::pencil::filter(&mut h.app, &ctx, &mut raw, Some(top));
+        assert_eq!(presses(&raw), 0, "a finger on the view does not");
+        // Its touch events never came: presses are the pointer's again after a while.
+        let mut raw = egui::RawInput { time: Some(102.0), events: vec![press(top)], ..Default::default() };
+        crate::pencil::filter(&mut h.app, &ctx, &mut raw, None);
+        let mut raw = egui::RawInput { time: Some(102.1), events: vec![press(top)], ..Default::default() };
+        crate::pencil::filter(&mut h.app, &ctx, &mut raw, None);
+        assert_eq!(presses(&raw), 1);
+
+        for bad in [pos2(f32::NAN, 0.0), pos2(f32::INFINITY, f32::NEG_INFINITY)] {
+            let touch = |phase| egui::Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(9), phase, pos: bad, force: None };
+            let mut raw = frame(vec![press(bad), touch(egui::TouchPhase::Start), touch(egui::TouchPhase::Move), touch(egui::TouchPhase::End)]);
+            crate::pencil::filter(&mut h.app, &ctx, &mut raw, Some(bad));
+        }
     }
 
     /// A component dragged with its Move triad is drawn as a layer: its bodies' scene is built
@@ -11438,11 +11789,14 @@ mod tests {
     #[test]
     fn the_lit_face_does_not_change_while_the_view_is_rotated() {
         let mut h = crate::scenario::Harness::new();
-        h.call("engine.execute", json!({"command": "solid.box", "params": {"length": 400, "width": 400, "height": 200}}));
-        h.app.cam =
-            Camera { target: Vec3::new(200.0, 200.0, 100.0), yaw: 0.6, pitch: 0.9, roll: 0.0, distance: 700.0, fov: 0.0, up: Default::default() };
+        h.app.preferences.orbit_around = crate::prefs::OrbitAround::Origin;
+        h.call("engine.execute", json!({"command": "solid.box", "params": {"length": 400, "width": 400, "height": 200, "corner": [-200,-200,-100]}}));
+        h.app.set_origin_shown(false);
+        h.app.cam = Camera { target: Vec3::ZERO, yaw: 0.3, pitch: 0.15, roll: 0.0, distance: 700.0, fov: 0.0, up: Default::default() };
         h.frames(3);
-        let at = face_pixel(&h);
+        // A low orbit through the box centre crosses side faces without
+        // tracking a point on the top face as the camera turns.
+        let at = projection(&h.app, h.app.viewport.rect.unwrap()).to_screen(Vec3::ZERO).unwrap();
         h.call("ui.move", json!({"x": at.x, "y": at.y}));
         h.frames(2);
         let lit = face_of(&h.app.viewport.hover);
@@ -11458,8 +11812,8 @@ mod tests {
         };
         h.frame_with(vec![rotate(egui::TouchPhase::Start, egui::vec2(40.0, 0.0))]);
         let mut picked = Vec::new();
-        for step in 1..=4 {
-            h.frame_with(vec![rotate(egui::TouchPhase::Move, egui::vec2(40.0 * step as f32, 0.0))]);
+        for step in 1..=12 {
+            h.frame_with(vec![rotate(egui::TouchPhase::Move, egui::vec2(80.0, 0.0))]);
             assert_eq!(
                 face_of(&h.app.viewport.hover),
                 lit,
@@ -11593,7 +11947,7 @@ mod tests {
         for y in 2..18 {
             for x in 2..18 {
                 let at = rect.min + egui::vec2(rect.width() * x as f32 / 20.0, rect.height() * y as f32 / 20.0);
-                if crate::viewport::pick(&h.app, &proj, at).iter().any(|hit| matches!(hit, crate::viewport::Hit::Face { .. })) {
+                if matches!(candidate(&h.app, &pick(&h.app, &proj, at)), Some((Hit::Face { .. }, _))) {
                     return at;
                 }
             }
@@ -11657,6 +12011,35 @@ mod tests {
             }
             assert!(lit_faces >= 3, "{lit_faces} faces");
         }
+    }
+
+    /// A body small on the screen draws its edges with fewer segments ([`crate::edge_detail`]):
+    /// its edge step changes the scene, every point kept is one of the meshed edge's own, and
+    /// without the step the edges are drawn as meshed again.
+    #[test]
+    fn a_body_small_on_screen_draws_its_edges_with_fewer_segments_from_its_own_points() {
+        use solidcraft_engine::doc::display_quality::current;
+        let points = |lines: &[u8]| -> std::collections::HashSet<[u32; 3]> {
+            lines
+                .chunks(crate::gpu::LINE_SIZE)
+                .flat_map(|l| [0, 12].map(|at| std::array::from_fn(|i| u32::from_le_bytes(l[at + i * 4..at + i * 4 + 4].try_into().unwrap()))))
+                .collect()
+        };
+        let app = cylinder_app();
+        let body = app.session.world_state().unwrap().bodies[0].clone();
+        let id = crate::display_lod::body_id(&body).0;
+        let chord = current().chord(body.body.size());
+        let meshed = build_scene(&app).merged().lines;
+        let key = scene_key(&app);
+        // Half a pixel per millimetre: the Ø20 rims are 10 px across, simplified to a quarter pixel.
+        assert!(app.viewport.lod.lock().unwrap().update_edges([(id, Some(0.5), chord)]));
+        assert_ne!(scene_key(&app), key, "an edge step rebuilds the scene");
+        let simplified = build_scene(&app).merged().lines;
+        assert!(simplified.len() < meshed.len() / 2, "{} of {} line bytes", simplified.len(), meshed.len());
+        assert!(points(&simplified).is_subset(&points(&meshed)), "every point drawn is a point of the meshed edges");
+        // Up close (or a body that can come to the eye): drawn as meshed again.
+        assert!(app.viewport.lod.lock().unwrap().update_edges([(id, None, chord)]));
+        assert_eq!(build_scene(&app).merged().lines, meshed, "without a step the edges are as meshed");
     }
 
     fn cylinder_app() -> SolveApp {
@@ -12362,6 +12745,27 @@ mod tests {
         app.session.selection = edges;
         let d = crate::dialogs::Dialog::for_command(&app, "inspect.measure").unwrap();
         assert_eq!(d.items().len(), 1);
+        // A box in Measure, looking down on the top, takes the closed rim as one item: a crossing
+        // box touching it and a window round it alike.
+        let rim_selected = std::mem::take(&mut app.session.selection);
+        let rim = edge_indices(&rim_selected);
+        app.cam = app.cam.looking_from(Vec3::Z);
+        app.cam.target = Vec3::new(0.0, 0.0, 20.0);
+        app.cam.distance = 60.0;
+        app.ui.perspective = false;
+        let boxed = |app: &mut SolveApp, pts: Vec<Vec3>, crossing: bool| -> Vec<usize> {
+            let proj = projection(app, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
+            let screen: Vec<Pos2> = pts.iter().filter_map(|p| proj.to_screen(*p)).collect();
+            let r = Rect::from_points(&screen).expand(2.0);
+            let bx = if crossing { BoxSel::from_drag(r.right_bottom(), r.left_top()) } else { BoxSel::from_drag(r.left_top(), r.right_bottom()) };
+            app.dialog = Some(crate::dialogs::Dialog::for_command(app, "inspect.measure").unwrap());
+            box_select(app, &proj, bx, false);
+            edge_indices(&app.dialog.take().unwrap().items()).into_iter().filter(|i| rim.contains(i)).collect()
+        };
+        let mid = polyline_mid(&m.edges[rim[0]]);
+        assert_eq!(boxed(&mut app, vec![mid, mid], true).len(), 1, "a crossing box touching the rim in Measure");
+        assert_eq!(boxed(&mut app, rim.iter().flat_map(|&i| m.edges[i].clone()).collect(), false).len(), 1, "a window round the rim in Measure");
+        app.session.selection = rim_selected;
 
         let faces = m.edge_faces.iter().zip(&m.seams).find(|(_, seam)| **seam).unwrap().0;
         assert_eq!(faces.len(), 1, "the seam is inside the one wall");
@@ -12498,6 +12902,325 @@ mod tests {
                 let (_, sel) = candidate(&app, &hits).unwrap();
                 assert!(matches!(sel, Sel::Edge { index, .. } if index == top), "{hits:?}");
                 assert_eq!(grouped_selection(&app.session, &sel).len(), 1);
+            }
+        }
+    }
+
+    /// A ball of radius 12.5 resting on the origin, revolved from a half disc sketched upright on
+    /// the XZ plane, with a slot 10 wide cut from its top down to z = 15 right through it (walls at
+    /// x = ±5). The ball's seam ends on the top of the x = +5 wall's arc, so that arc is two edges
+    /// and its mirror one.
+    fn slotted_ball_app() -> SolveApp {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("sketch.create", &json!({"name": "Sketch1", "plane": {"origin": [0, 0, 0], "x_dir": [1, 0, 0], "y_dir": [0, 0, 1]}})).unwrap();
+        s.execute("sketch.line", &json!({"points": [[0, 0], [0, 25]]})).unwrap();
+        s.execute("sketch.arc.three_point", &json!({"start": [0, 0], "through": [12.5, 12.5], "end": [0, 25]})).unwrap();
+        s.execute("sketch.finish", &json!({})).unwrap();
+        s.execute("solid.revolve", &json!({"sketch": "Sketch1", "axis": "Z", "angle": "360 deg", "operation": "new", "body_name": "Ball"})).unwrap();
+        s.execute("sketch.create", &json!({"name": "Sketch2", "plane": {"origin": [0, 0, 15], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}})).unwrap();
+        s.execute("sketch.rectangle.center", &json!({"center": [0, 0], "corner": [5, 20]})).unwrap();
+        s.execute("sketch.finish", &json!({})).unwrap();
+        s.execute("solid.extrude", &json!({"sketch": "Sketch2", "distance": 15, "operation": "cut"})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.set_origin_shown(false);
+        app
+    }
+
+    /// The edges of `m` whose every point passes `on`, in index order.
+    fn mesh_edges_where(m: &solidcraft_engine::geom::Mesh, on: impl Fn(&[Vec3]) -> bool) -> Vec<usize> {
+        m.edges.iter().enumerate().filter(|(_, p)| on(p)).map(|(i, _)| i).collect()
+    }
+
+    fn edge_indices(items: &[Sel]) -> Vec<usize> {
+        let mut out: Vec<usize> = items.iter().filter_map(|x| if let Sel::Edge { index, .. } = x { Some(*index) } else { None }).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// An open arc a ball's seam splits in two is one edge to hover, click, box select and a
+    /// dialog's pick, as a whole circle's pieces are; its unsplit mirror, the floor's arcs and the
+    /// wall's lines stay single.
+    #[test]
+    fn an_arc_a_seam_splits_is_hovered_clicked_and_boxed_whole() {
+        let mut app = slotted_ball_app();
+        let st = app.session.world_state().unwrap();
+        let b = st.body("Ball").unwrap();
+        let m = b.mesh();
+        let arc_on = |x: f64| move |p: &[Vec3]| p.len() > 2 && p.iter().all(|q| (q.x - x).abs() < 1e-6);
+        let plus = mesh_edges_where(&m, arc_on(5.0));
+        let minus = mesh_edges_where(&m, arc_on(-5.0));
+        assert_eq!(plus.len(), 2, "the seam splits the x = +5 arc");
+        assert_eq!(minus.len(), 1, "the x = -5 arc is one edge");
+        let floor_arcs = mesh_edges_where(&m, |p| p.len() > 2 && p.iter().all(|q| (q.z - 15.0).abs() < 1e-6));
+        let wall_line = mesh_edges_where(&m, |p| p.len() == 2 && p.iter().all(|q| (q.x - 5.0).abs() < 1e-6 && (q.z - 15.0).abs() < 1e-6));
+        assert_eq!((floor_arcs.len(), wall_line.len()), (2, 1));
+        let edge = |index: usize| Sel::Edge { body: b.name.clone(), index, point: polyline_mid(&m.edges[index]) };
+        for &half in &plus {
+            assert_eq!(edge_indices(&grouped_selection(&app.session, &edge(half))), plus);
+        }
+        for single in minus.iter().chain(&floor_arcs).chain(&wall_line) {
+            assert_eq!(edge_indices(&grouped_selection(&app.session, &edge(*single))), vec![*single]);
+        }
+        let lines = |pieces: &[usize]| pieces.iter().map(|&i| 2 * (m.edges[i].len() - 1) * crate::gpu::LINE_SIZE).sum::<usize>();
+        for (picked, whole) in plus.iter().map(|&h| (h, plus.clone())).chain([(minus[0], minus.clone())]) {
+            // Hover lights the whole edge.
+            let mid = polyline_mid(&m.edges[picked]);
+            app.viewport.hover = Some(Hit::Edge { body: b.name.clone(), index: picked, mid, point: mid });
+            assert_eq!(build_highlight(&app).merged().lines.len(), lines(&whole), "hovering {picked}");
+            // A click selects it whole, each piece at its own middle; Ctrl/Shift-click takes it out.
+            let item = hit_sel(app.viewport.hover.as_ref().unwrap()).unwrap();
+            select(&mut app, Some(item.clone()), false, false);
+            assert_eq!(edge_indices(&app.session.selection), whole);
+            for s in &app.session.selection {
+                let Sel::Edge { index, point, .. } = s else { panic!("{s:?}") };
+                assert!(point.dist(polyline_mid(&m.edges[*index])) < 1e-9);
+            }
+            select(&mut app, Some(item), true, true);
+            assert!(app.session.selection.is_empty());
+        }
+        app.viewport.hover = None;
+        // Fillet with Tangent chain off: one pick on a half takes both, a second takes both out.
+        // With it on, the chain holds each piece once.
+        for chain in [false, true] {
+            let mut d = crate::dialogs::Dialog::for_command(&app, "solid.fillet").unwrap();
+            if let crate::dialogs::Kind::Fillet { chain: c, .. } = &mut d.kind {
+                *c = chain;
+            }
+            d.pick(&app.session, edge(plus[1]));
+            let items = edge_indices(&d.items());
+            assert!(plus.iter().all(|h| items.contains(h)), "chain {chain}: {items:?}");
+            assert_eq!(items.len(), d.items().len(), "chain {chain}: no piece twice");
+            let mut once = items.clone();
+            once.dedup();
+            assert_eq!(once, items, "chain {chain}: no piece twice");
+            if !chain {
+                assert_eq!(items, plus);
+            }
+            d.pick(&app.session, edge(plus[0]));
+            assert!(d.items().is_empty(), "chain {chain}: {:?}", d.items());
+        }
+        // Box select, looking at the x = +5 wall: a window round one half leaves it, as it leaves
+        // a piece of a circle; a window round both takes both; a crossing box touching one half
+        // takes the whole edge, as a click does.
+        app.cam = app.cam.looking_from(Vec3::X);
+        app.cam.target = Vec3::new(0.0, 0.0, 15.0);
+        app.cam.distance = 40.0;
+        app.ui.perspective = false;
+        let boxed = |app: &mut SolveApp, pts: Vec<Vec3>, crossing: bool| -> Vec<usize> {
+            let proj = projection(app, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
+            let screen: Vec<Pos2> = pts.iter().filter_map(|p| proj.to_screen(*p)).collect();
+            let r = Rect::from_points(&screen).expand(2.0);
+            let bx = if crossing { BoxSel::from_drag(r.right_bottom(), r.left_top()) } else { BoxSel::from_drag(r.left_top(), r.right_bottom()) };
+            assert_eq!(bx.crossing, crossing);
+            let mut d = crate::dialogs::Dialog::for_command(app, "solid.fillet").unwrap();
+            if let crate::dialogs::Kind::Fillet { chain, .. } = &mut d.kind {
+                *chain = false;
+            }
+            app.dialog = Some(d);
+            box_select(app, &proj, bx, false);
+            let taken = edge_indices(&app.dialog.take().unwrap().items());
+            taken.into_iter().filter(|i| plus.contains(i)).collect()
+        };
+        for &half in &plus {
+            assert!(boxed(&mut app, m.edges[half].clone(), false).is_empty(), "a window round half {half} alone");
+            let mid = polyline_mid(&m.edges[half]);
+            assert_eq!(boxed(&mut app, vec![mid, mid], true), plus, "a crossing box touching half {half}");
+        }
+        assert_eq!(boxed(&mut app, plus.iter().flat_map(|&h| m.edges[h].clone()).collect(), false), plus);
+    }
+
+    /// Measure keeps measuring the piece picked of an open edge a seam splits: a pick in its
+    /// dialog is that piece, two picks are two items, and hovering lights the piece a pick takes.
+    /// A click elsewhere selects the edge whole, the clicked piece first, which Measure takes as
+    /// its one item (#16122 leaves Measure as it was).
+    #[test]
+    fn measure_keeps_the_picked_piece_of_an_arc_a_seam_splits() {
+        let mut app = slotted_ball_app();
+        let st = app.session.world_state().unwrap();
+        let b = st.body("Ball").unwrap();
+        let m = b.mesh();
+        let plus = mesh_edges_where(&m, |p| p.len() > 2 && p.iter().all(|q| (q.x - 5.0).abs() < 1e-6));
+        assert_eq!(plus.len(), 2);
+        let edge = |index: usize| Sel::Edge { body: b.name.clone(), index, point: polyline_mid(&m.edges[index]) };
+        for &half in &plus {
+            assert_eq!(measurement_selection(&app.session, &edge(half)), edge(half));
+        }
+        let mut d = crate::dialogs::Dialog::for_command(&app, "inspect.measure").unwrap();
+        d.pick(&app.session, edge(plus[1]));
+        assert_eq!(d.items(), vec![edge(plus[1])]);
+        d.pick(&app.session, edge(plus[0]));
+        assert_eq!(edge_indices(&d.items()), plus, "the two halves are two items, as before");
+        // With Measure open, hovering a half lights that half; with it closed, the whole arc.
+        let mid = polyline_mid(&m.edges[plus[1]]);
+        app.viewport.hover = Some(Hit::Edge { body: b.name.clone(), index: plus[1], mid, point: mid });
+        let lines = |pieces: &[usize]| pieces.iter().map(|&i| 2 * (m.edges[i].len() - 1) * crate::gpu::LINE_SIZE).sum::<usize>();
+        assert_eq!(build_highlight(&app).merged().lines.len(), lines(&plus));
+        let closed = highlight_key(&app);
+        app.dialog = Some(crate::dialogs::Dialog::for_command(&app, "inspect.measure").unwrap());
+        assert_ne!(highlight_key(&app), closed);
+        assert_eq!(build_highlight(&app).merged().lines.len(), lines(&plus[1..]));
+        app.dialog = None;
+        app.viewport.hover = None;
+        for &half in plus.iter().rev() {
+            select(&mut app, Some(edge(half)), false, false);
+            assert_eq!(app.session.selection.first(), Some(&edge(half)), "the clicked piece first");
+            assert_eq!(edge_indices(&app.session.selection), plus);
+            let d = crate::dialogs::Dialog::for_command(&app, "inspect.measure").unwrap();
+            assert_eq!(d.items(), vec![edge(half)], "Measure takes the clicked half");
+        }
+        // A box in Measure, looking at the x = +5 wall, takes each piece it takes, as a pick does:
+        // a window round one half or a crossing box touching it that half alone, a window round
+        // both the two halves.
+        app.session.selection.clear();
+        app.cam = app.cam.looking_from(Vec3::X);
+        app.cam.target = Vec3::new(0.0, 0.0, 15.0);
+        app.cam.distance = 40.0;
+        app.ui.perspective = false;
+        let boxed = |app: &mut SolveApp, pts: Vec<Vec3>, crossing: bool| -> Vec<usize> {
+            let proj = projection(app, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
+            let screen: Vec<Pos2> = pts.iter().filter_map(|p| proj.to_screen(*p)).collect();
+            let r = Rect::from_points(&screen).expand(2.0);
+            let bx = if crossing { BoxSel::from_drag(r.right_bottom(), r.left_top()) } else { BoxSel::from_drag(r.left_top(), r.right_bottom()) };
+            assert_eq!(bx.crossing, crossing);
+            app.dialog = Some(crate::dialogs::Dialog::for_command(app, "inspect.measure").unwrap());
+            box_select(app, &proj, bx, false);
+            edge_indices(&app.dialog.take().unwrap().items()).into_iter().filter(|i| plus.contains(i)).collect()
+        };
+        for &half in &plus {
+            assert_eq!(boxed(&mut app, m.edges[half].clone(), false), vec![half], "a window round half {half} in Measure");
+            let mid = polyline_mid(&m.edges[half]);
+            assert_eq!(boxed(&mut app, vec![mid, mid], true), vec![half], "a crossing box touching half {half} in Measure");
+        }
+        assert_eq!(boxed(&mut app, plus.iter().flat_map(|&h| m.edges[h].clone()).collect(), false), plus, "a window round both in Measure");
+    }
+
+    /// The ball of [`slotted_ball_app`], whole, with a hole of radius 1 drilled down right
+    /// through it at (6, 0.5). The ball's seam (on y = 0) crosses the hole off its middle, so each
+    /// of the hole's rims is cut into pieces of different lengths, which are one edge to the user.
+    fn drilled_ball_app() -> SolveApp {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("sketch.create", &json!({"name": "Sketch1", "plane": {"origin": [0, 0, 0], "x_dir": [1, 0, 0], "y_dir": [0, 0, 1]}})).unwrap();
+        s.execute("sketch.line", &json!({"points": [[0, 0], [0, 25]]})).unwrap();
+        s.execute("sketch.arc.three_point", &json!({"start": [0, 0], "through": [12.5, 12.5], "end": [0, 25]})).unwrap();
+        s.execute("sketch.finish", &json!({})).unwrap();
+        s.execute("solid.revolve", &json!({"sketch": "Sketch1", "axis": "Z", "angle": "360 deg", "operation": "new", "body_name": "Ball"})).unwrap();
+        s.execute("sketch.create", &json!({"name": "Sketch2", "plane": {"origin": [0, 0, -1], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}})).unwrap();
+        s.execute("sketch.circle.center", &json!({"center": [6, 0.5], "radius": 1})).unwrap();
+        s.execute("sketch.finish", &json!({})).unwrap();
+        s.execute("solid.extrude", &json!({"sketch": "Sketch2", "distance": 30, "operation": "cut"})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.set_origin_shown(false);
+        app
+    }
+
+    /// A click on a piece of an edge a seam splits into pieces of different lengths, then
+    /// Measure: Measure measures the piece clicked, as it did before a click took the whole edge.
+    #[test]
+    fn measure_after_a_click_takes_the_clicked_piece_of_an_edge_split_unequally() {
+        let mut app = drilled_ball_app();
+        let st = app.session.world_state().unwrap();
+        let b = st.body("Ball").unwrap();
+        let m = b.mesh();
+        let top_rim = mesh_edges_where(&m, |p| p.len() > 1 && p.iter().all(|q| ((q.x - 6.0).hypot(q.y - 0.5) - 1.0).abs() < 1e-4 && q.z > 12.5));
+        let edge = |index: usize| Sel::Edge { body: b.name.clone(), index, point: polyline_mid(&m.edges[index]) };
+        let length = |i: usize| m.edges[i].windows(2).map(|w| w[0].dist(w[1])).sum::<f64>();
+        let whole = edge_indices(&grouped_selection(&app.session, &edge(top_rim[0])));
+        assert_eq!(whole, top_rim, "the top rim's pieces are one edge");
+        let shortest = *whole.iter().min_by(|a, c| length(**a).total_cmp(&length(**c))).unwrap();
+        let longest = *whole.iter().max_by(|a, c| length(**a).total_cmp(&length(**c))).unwrap();
+        assert!(length(longest) - length(shortest) > 0.1, "{:?}", whole.iter().map(|&i| length(i)).collect::<Vec<_>>());
+        let mut measured = Vec::new();
+        for piece in [longest, shortest] {
+            select(&mut app, Some(edge(piece)), false, false);
+            assert_eq!(edge_indices(&app.session.selection), whole);
+            let d = crate::dialogs::Dialog::for_command(&app, "inspect.measure").unwrap();
+            assert_eq!(edge_indices(&d.items()), vec![piece], "Measure takes the clicked piece");
+            let result = app.session.measure_items(&d.items());
+            measured.push(result["items"][0]["length_mm"].as_f64().unwrap());
+        }
+        assert!((measured[0] - length(longest)).abs() < 0.05 && (measured[1] - length(shortest)).abs() < 0.05, "{measured:?}");
+        assert!(measured[0] - measured[1] > 0.1, "{measured:?}");
+    }
+
+    /// A box's corners and the pieces Split Face makes of a box's edges are single edges to
+    /// hover and click: nothing joins edges across a corner or an authored split.
+    #[test]
+    fn corners_and_authored_splits_stay_single_to_hover_and_click() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10, "body_name": "B"})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.set_origin_shown(false);
+        let check = |app: &mut SolveApp| {
+            let st = app.session.world_state().unwrap();
+            let b = st.body("B").unwrap();
+            let m = b.mesh();
+            for (i, e) in m.edges.iter().enumerate() {
+                if !m.edge_pickable(i) {
+                    continue;
+                }
+                let item = Sel::Edge { body: b.name.clone(), index: i, point: polyline_mid(e) };
+                assert_eq!(grouped_selection(&app.session, &item), vec![item.clone()]);
+                let mid = polyline_mid(e);
+                app.viewport.hover = Some(Hit::Edge { body: b.name.clone(), index: i, mid, point: mid });
+                assert_eq!(build_highlight(app).merged().lines.len(), 2 * (e.len() - 1) * crate::gpu::LINE_SIZE, "hovering {i}");
+                select(app, Some(item.clone()), false, false);
+                assert_eq!(app.session.selection, vec![item]);
+                select(app, None, false, false);
+            }
+            app.viewport.hover = None;
+            m.edges.len()
+        };
+        let corners = check(&mut app);
+        // Split Face on the +x side half way up cuts its two upright edges in two.
+        let bounds = app.session.world_state().unwrap().body("B").unwrap().mesh().bounds();
+        let (lo, hi) = (bounds.min, bounds.max);
+        let (y, z) = ((lo.y + hi.y) / 2.0, (lo.z + hi.z) / 2.0);
+        app.session
+            .execute("solid.split_face", &json!({"body": "B", "faces": [[hi.x, y, z]], "plane": {"origin": [0, 0, z], "normal": [0, 0, 1]}}))
+            .unwrap();
+        assert!(check(&mut app) > corners, "the split adds edges");
+        // A post with a slot cut across its top, its side split through its axis 30 degrees round
+        // from x (clear of its own seam): each arc left of its top is cut in two at the split
+        // line. Its pieces stay apart there, though the side's pieces are one surface.
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("sketch.create", &json!({"name": "Sketch1", "plane": "XY"})).unwrap();
+        s.execute("sketch.circle.center", &json!({"center": [0, 0], "radius": 10})).unwrap();
+        s.execute("sketch.finish", &json!({})).unwrap();
+        s.execute("solid.extrude", &json!({"sketch": "Sketch1", "distance": 20})).unwrap();
+        s.execute("sketch.create", &json!({"name": "Sketch2", "plane": {"origin": [0, 0, 15], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}})).unwrap();
+        s.execute("sketch.rectangle.center", &json!({"center": [0, 0], "corner": [5, 20]})).unwrap();
+        s.execute("sketch.finish", &json!({})).unwrap();
+        s.execute("solid.extrude", &json!({"sketch": "Sketch2", "distance": 10, "operation": "cut"})).unwrap();
+        let name = s.world_state().unwrap().bodies[0].name.clone();
+        s.execute(
+            "solid.split_face",
+            &json!({"body": name, "faces": [[0, 10, 5]], "plane": {"origin": [0, 0, 0], "normal": [0.5, -0.8660254037844386, 0]}}),
+        )
+        .unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.set_origin_shown(false);
+        let st = app.session.world_state().unwrap();
+        let b = &st.bodies[0];
+        let m = b.mesh();
+        for side in [1.0, -1.0] {
+            let arc = mesh_edges_where(&m, |p| p.len() > 2 && p.iter().all(|q| (q.z - 20.0).abs() < 1e-6 && q.x * side > 5.0 - 1e-6));
+            assert!(arc.len() >= 2, "the split line cuts the arc at x = {}: {arc:?}", 5.0 * side);
+            for &piece in &arc {
+                let item = Sel::Edge { body: b.name.clone(), index: piece, point: polyline_mid(&m.edges[piece]) };
+                let whole = grouped_selection(&app.session, &item);
+                let off: Vec<f64> = whole
+                    .iter()
+                    .flat_map(|x| if let Sel::Edge { index, .. } = x { m.edges[*index].clone() } else { Vec::new() })
+                    .map(|q| q.x * 0.5 - q.y * 0.8660254037844386)
+                    .collect();
+                assert!(off.iter().all(|d| *d >= -1e-6) || off.iter().all(|d| *d <= 1e-6), "piece {piece} joins {whole:?} across the split");
+                let mid = polyline_mid(&m.edges[piece]);
+                app.viewport.hover = Some(Hit::Edge { body: b.name.clone(), index: piece, mid, point: mid });
+                let lines = edge_indices(&whole).iter().map(|&i| 2 * (m.edges[i].len() - 1) * crate::gpu::LINE_SIZE).sum::<usize>();
+                assert_eq!(build_highlight(&app).merged().lines.len(), lines, "hovering {piece}");
+                select(&mut app, Some(item), false, false);
+                assert_eq!(edge_indices(&app.session.selection), edge_indices(&whole));
+                select(&mut app, None, false, false);
             }
         }
     }
