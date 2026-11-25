@@ -35,7 +35,7 @@ pub struct DimBox {
 }
 
 impl DimBox {
-    fn new(label: &'static str, kind: ValueKind) -> DimBox {
+    pub(crate) fn new(label: &'static str, kind: ValueKind) -> DimBox {
         DimBox { label, kind, value: String::new(), locked: false }
     }
 }
@@ -750,6 +750,11 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
     let px = 2.0 * app.cam.half_height() / f64::from(proj.rect.height().max(1.0));
     let lv = live(app, t, e, px);
     let focus = std::mem::take(&mut t.dims_focus);
+    // The number pad (Pencil mode) types into a box in place of the keyboard.
+    let pad_place = crate::sketch_dims_pad::take_place(ui.ctx());
+    let pad_open = crate::sketch_dims_pad::is_open(ui.ctx());
+    let points = t.pts.len();
+    let mut drawn: Vec<Option<egui::Rect>> = vec![None; t.dims.len()];
     // Egui processes ordinary Tab navigation before these floating text edits are drawn.
     // Remember the box that owned the keyboard and restore a focus within this tool after
     // drawing, so the last dimension wraps to the first rather than reaching the panels.
@@ -968,9 +973,12 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
                         b.value = text.replace(INFINITE, "");
                         b.locked = true;
                     }
-                    if focus && i == 0 {
+                    if focus && i == 0 && !pad_open {
                         r.request_focus();
                     }
+                    drawn[i] = Some(r.rect);
+                    crate::sketch_dims_pad::open_on_tap(app.preferences.pencil_mode, &r, b, i, points);
+                    crate::sketch_dims_pad::hold_focus(ui, &r);
                     any_focused |= r.has_focus() || r.lost_focus();
                     if has_focus && ui.is_sizing_pass() {
                         ui.ctx().data_mut(|d| d.insert_temp(refocus, Some(id)));
@@ -994,10 +1002,11 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
         }
         ui.ctx().memory_mut(|memory| memory.request_focus(id));
     }
+    crate::sketch_dims_pad::show(ui, t, &drawn);
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     // A box waiting before the first click only places on Enter once it has the keyboard.
     let nothing = ui.ctx().memory(|m| m.focused().is_none()) && !(construction && t.pts.is_empty());
-    (enter && (any_focused || nothing)).then_some(e)
+    (pad_place || enter && (any_focused || nothing)).then_some(e)
 }
 
 /// Place measured rectangle fields nearest their edge anchors, keeping the pointer and

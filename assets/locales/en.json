@@ -3540,7 +3540,7 @@
   "prefs.parameter_list_rows": "Parameter list rows",
   "prefs.parameter_list_rows_tip": "The most parameters Down arrow lists in an empty expression box.",
   "prefs.pencil_mode": "Pencil mode",
-  "prefs.pencil_mode_tip": "In the web app: tap an item with a pen to add or remove it from the selection, double-tap it to select its whole body or sketch, and tap empty space to clear the selection. Fingers in the view only move the view, and a finger double-tap on a flat face starts a sketch on it. Buttons and panels take finger taps as usual.",
+  "prefs.pencil_mode_tip": "In the web app and on iPad: tap an item with a pen to add or remove it from the selection, double-tap it to select its whole body or sketch, and tap empty space to clear the selection. Fingers in the view only move the view, and a finger double-tap on a flat face starts a sketch on it. Buttons and panels take finger taps as usual. On iPad, a pen tap on a sketch tool's value box opens a number pad.",
   "prefs.persistent_ribbon_pressed": "Highlight active ribbon commands",
   "prefs.placement": "Placement",
   "prefs.plugin_approved": "Approved: {list}",
