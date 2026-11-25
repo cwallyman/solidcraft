@@ -4,10 +4,11 @@ use std::cell::{Cell, RefCell};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
+use objc2_foundation::{CGFloat, CGPoint, CGRect, CGSize, MainThreadMarker, NSObject, NSSet, NSString};
 use objc2_ui_kit::{
     UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
-    UIGestureRecognizerDelegate, UIGestureRecognizerState, UIKeyInput, UIPanGestureRecognizer,
+    UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
+    UIPanGestureRecognizer,
     UIPinchGestureRecognizer, UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer,
     UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
 };
@@ -15,7 +16,9 @@ use objc2_ui_kit::{
 use super::app_state::{self, EventWrapper};
 use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
-use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
+use crate::event::{
+    ElementState, Event, Force, KeyEvent, MouseButton, Touch, TouchPhase, WindowEvent,
+};
 use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKeyCode, PhysicalKey};
 use crate::platform_impl::platform::DEVICE_ID;
 use crate::platform_impl::KeyEventExtra;
@@ -31,6 +34,16 @@ pub struct WinitViewState {
     rotation_last_delta: Cell<CGFloat>,
     pinch_last_delta: Cell<CGFloat>,
     pan_last_delta: Cell<CGPoint>,
+
+    // SolidCraft: the hover recognizer (Apple Pencil and pointer hover), and where a Pencil hover
+    // last moved the cursor.
+    hover_gesture_recognizer: RefCell<Option<Retained<UIHoverGestureRecognizer>>>,
+    pencil_hover_at: Cell<Option<CGPoint>>,
+
+    // SolidCraft: whether taking keyboard focus shows the on-screen keyboard
+    // (`set_soft_keyboard`), and the empty input view that stands in for it when not.
+    soft_keyboard: Cell<bool>,
+    no_soft_keyboard: RefCell<Option<Retained<UIView>>>,
 }
 
 declare_class!(
@@ -150,6 +163,14 @@ declare_class!(
 
         #[method(touchesBegan:withEvent:)]
         fn touches_began(&self, touches: &NSSet<UITouch>, _event: Option<&UIEvent>) {
+            // SolidCraft: a touch on the view brings its window back as the key window. A
+            // presented sheet (the document picker) takes the key window and may not give it
+            // back when it is cancelled, which left the app reporting `Focused(false)`.
+            if let Some(window) = self.window() {
+                if !window.isKeyWindow() {
+                    unsafe { window.makeKeyWindow() };
+                }
+            }
             self.handle_touches(touches)
         }
 
@@ -166,6 +187,54 @@ declare_class!(
         #[method(touchesCancelled:withEvent:)]
         fn touches_cancelled(&self, touches: &NSSet<UITouch>, _event: Option<&UIEvent>) {
             self.handle_touches(touches)
+        }
+
+        // SolidCraft: hover moves the cursor; the end of a hover takes it away. A Pencil's hover
+        // (its `zOffset`, the height above the screen, is above zero; a pointer's is zero) moves
+        // the cursor only once it has gone 5 points, so a steady hand's tremor doesn't keep
+        // restarting a tooltip's delay.
+        #[method(hoverGesture:)]
+        fn hover_gesture(&self, recognizer: &UIHoverGestureRecognizer) {
+            const PENCIL_HOVER_SLOP: CGFloat = 5.0;
+            let Some(window) = self.window() else { return };
+            let window_id = RootWindowId(window.id());
+            let event = match recognizer.state() {
+                UIGestureRecognizerState::Began | UIGestureRecognizerState::Changed => {
+                    let at = unsafe { recognizer.locationInView(None) };
+                    if unsafe { recognizer.zOffset() } > 0.0 {
+                        let last = self.ivars().pencil_hover_at.get();
+                        let near = last.is_some_and(|last| {
+                            (at.x - last.x).hypot(at.y - last.y) < PENCIL_HOVER_SLOP
+                        });
+                        if near && recognizer.state() == UIGestureRecognizerState::Changed {
+                            return;
+                        }
+                        self.ivars().pencil_hover_at.set(Some(at));
+                    } else {
+                        self.ivars().pencil_hover_at.set(None);
+                    }
+                    let scale_factor = self.contentScaleFactor() as f64;
+                    WindowEvent::CursorMoved {
+                        device_id: DEVICE_ID,
+                        position: PhysicalPosition::from_logical::<(f64, f64), f64>(
+                            (at.x as f64, at.y as f64),
+                            scale_factor,
+                        ),
+                    }
+                },
+                UIGestureRecognizerState::Ended
+                | UIGestureRecognizerState::Cancelled
+                | UIGestureRecognizerState::Failed => {
+                    self.ivars().pencil_hover_at.set(None);
+                    WindowEvent::CursorLeft { device_id: DEVICE_ID }
+                },
+                _ => return,
+            };
+            let mtm = MainThreadMarker::new().unwrap();
+            app_state::handle_nonuser_event(
+                mtm,
+                EventWrapper::StaticEvent(Event::WindowEvent { window_id, event }),
+            );
         }
 
         #[method(pinchGesture:)]
@@ -321,6 +390,24 @@ declare_class!(
         fn can_become_first_responder(&self) -> bool {
             true
         }
+
+        // SolidCraft: with the on-screen keyboard off, an empty input view stands in for it, so
+        // a hardware keyboard still types (`UIKeyInput`) and nothing covers the screen.
+        #[method_id(inputView)]
+        fn input_view(&self) -> Option<Retained<UIView>> {
+            // (No early `return`: `declare_class!` wraps this body.)
+            if self.ivars().soft_keyboard.get() {
+                None
+            } else {
+                let mtm = MainThreadMarker::from(self);
+                let mut view = self.ivars().no_soft_keyboard.borrow_mut();
+                let view = view.get_or_insert_with(|| {
+                    let zero = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } };
+                    UIView::initWithFrame(mtm.alloc(), zero)
+                });
+                Some(view.clone())
+            }
+        }
     }
 
     unsafe impl NSObjectProtocol for WinitView {}
@@ -368,16 +455,42 @@ impl WinitView {
             rotation_last_delta: Cell::new(0.0),
             pinch_last_delta: Cell::new(0.0),
             pan_last_delta: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
+
+            hover_gesture_recognizer: RefCell::new(None),
+            pencil_hover_at: Cell::new(None),
+
+            soft_keyboard: Cell::new(true),
+            no_soft_keyboard: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
         this.setMultipleTouchEnabled(true);
+
+        // SolidCraft: an Apple Pencil held over the screen, or a trackpad or mouse pointer, moves
+        // the cursor (`hoverGesture:`), so buttons show their tooltips and the model highlights
+        // what is under it. winit 0.30 reports no hover on iOS.
+        let hover = unsafe {
+            UIHoverGestureRecognizer::initWithTarget_action(
+                mtm.alloc(),
+                Some(&this),
+                Some(sel!(hoverGesture:)),
+            )
+        };
+        this.addGestureRecognizer(&hover);
+        this.ivars().hover_gesture_recognizer.replace(Some(hover));
 
         if let Some(scale_factor) = window_attributes.platform_specific.scale_factor {
             this.setContentScaleFactor(scale_factor as _);
         }
 
         this
+    }
+
+    /// SolidCraft: whether keyboard focus shows the on-screen keyboard (on by default).
+    pub(crate) fn set_soft_keyboard(&self, show: bool) {
+        if self.ivars().soft_keyboard.replace(show) != show && unsafe { self.isFirstResponder() } {
+            unsafe { self.reloadInputViews() };
+        }
     }
 
     fn window(&self) -> Option<Retained<WinitUIWindow>> {
@@ -525,6 +638,35 @@ impl WinitView {
                     scale_factor as f64,
                 )
             };
+            // SolidCraft: a trackpad or mouse click (`UIApplicationSupportsIndirectInputEvents`)
+            // is a mouse's left button, not a touch: an app that tells fingers from the pen and
+            // the mouse (SolidCraft's Pencil mode) must not take it for a finger.
+            if touch_type == UITouchType::IndirectPointer {
+                let window_id = RootWindowId(window.id());
+                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::CursorMoved {
+                        device_id: DEVICE_ID,
+                        position: physical_location,
+                    },
+                }));
+                let state = match phase {
+                    TouchPhase::Started => Some(ElementState::Pressed),
+                    TouchPhase::Ended | TouchPhase::Cancelled => Some(ElementState::Released),
+                    TouchPhase::Moved => None,
+                };
+                if let Some(state) = state {
+                    touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::MouseInput {
+                            device_id: DEVICE_ID,
+                            state,
+                            button: MouseButton::Left,
+                        },
+                    }));
+                }
+                continue;
+            }
             touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
                 window_id: RootWindowId(window.id()),
                 event: WindowEvent::Touch(Touch {

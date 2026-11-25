@@ -83,6 +83,10 @@ pub struct EventResponse {
 
 // ----------------------------------------------------------------------------
 
+/// SolidCraft: the device of every Apple Pencil touch (`Event::Touch`); fingers keep their own.
+/// SolidCraft's Pencil mode reads it to tell the pen from a finger.
+pub const STYLUS_TOUCH_DEVICE: egui::TouchDeviceId = egui::TouchDeviceId(u64::MAX);
+
 /// Handles the integration between egui and a winit Window.
 ///
 /// Instantiate one of these per viewport/window.
@@ -129,6 +133,11 @@ pub struct State {
     pub accesskit: Option<accesskit_winit::Adapter>,
 
     allow_ime: bool,
+
+    /// SolidCraft: whether the on-screen keyboard shows for the focused text edit (`None`: no
+    /// text edit has focus); see `update_soft_keyboard`.
+    #[cfg(target_os = "ios")]
+    soft_keyboard: Option<bool>,
 
     /// See [`Self::set_clipboard_shortcuts`].
     clipboard_shortcuts: bool,
@@ -194,6 +203,8 @@ impl State {
             accesskit: None,
 
             allow_ime: false,
+            #[cfg(target_os = "ios")]
+            soft_keyboard: None,
             clipboard_shortcuts: true,
             ime_cursor_rect_px: None,
             old_ime_purpose: egui::IMEPurpose::Normal,
@@ -967,9 +978,28 @@ impl State {
     fn on_touch(&mut self, window: &Window, touch: &winit::event::Touch) {
         let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
 
+        // SolidCraft: an Apple Pencil's touch (winit gives its altitude; a finger's has none)
+        // comes with `STYLUS_TOUCH_DEVICE` as its device, so the app can tell the pen from a
+        // finger as its web build does from the browser's `touchType`. The pen's touch takes the
+        // emulated pointer from a finger (a palm resting on the screen) that has it.
+        let stylus = matches!(
+            touch.force,
+            Some(winit::event::Force::Calibrated {
+                altitude_angle: Some(_),
+                ..
+            })
+        );
+        if stylus && touch.phase == winit::event::TouchPhase::Started {
+            self.pointer_touch_id = None;
+        }
+
         // Emit touch event
         self.egui_input.events.push(egui::Event::Touch {
-            device_id: egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id)),
+            device_id: if stylus {
+                STYLUS_TOUCH_DEVICE
+            } else {
+                egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id))
+            },
             id: egui::TouchId::from(touch.id),
             phase: to_egui_touch_phase(touch.phase),
             pos: egui::pos2(
@@ -1223,6 +1253,31 @@ impl State {
         self.handle_platform_output_inner(window, Some(event_loop), platform_output);
     }
 
+    /// SolidCraft (iOS): show the on-screen keyboard only for a text edit the user tapped. Apps
+    /// focus text edits themselves too (SolidCraft's sketch tools focus the length box as you
+    /// draw, for typing a value); there the keyboard would cover the drawing, so it stays hidden
+    /// and a hardware keyboard still types. A tap is judged where it ends, so an app can answer a
+    /// tap on a text edit with its own input (SolidCraft's number pad) and drop the focus first.
+    #[cfg(target_os = "ios")]
+    fn update_soft_keyboard(&mut self, window: &Window, ime: Option<&egui::output::IMEOutput>) {
+        use winit::platform::ios::WindowExtIOS as _;
+        let taps: Vec<Pos2> = self.egui_ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::PointerButton { pos, pressed: false, .. } => Some(*pos),
+                    _ => None,
+                })
+                .collect()
+        });
+        // Once shown, the keyboard stays while the focus does (Tab to the next box, say).
+        let show = ime.map(|ime| self.soft_keyboard == Some(true) || taps.iter().any(|pos| ime.rect.expand(4.0).contains(*pos)));
+        if show != self.soft_keyboard {
+            self.soft_keyboard = show;
+            window.set_soft_keyboard(show.unwrap_or(false));
+        }
+    }
+
     fn handle_platform_output_inner(
         &mut self,
         window: &Window,
@@ -1277,7 +1332,13 @@ impl State {
             }
 
             profiling::scope!("set_ime_allowed");
+            #[cfg(target_os = "ios")]
+            self.update_soft_keyboard(window, ime.as_ref());
             window.set_ime_allowed(allow_ime);
+        }
+        #[cfg(target_os = "ios")]
+        if !is_toggling_ime {
+            self.update_soft_keyboard(window, ime.as_ref());
         }
 
         if let Some(ime) = ime {

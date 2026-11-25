@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The iPad app's Info.plist (docs/ios.md). Xcode fills in the $(...) build settings; then
+     packaging/ios/build-rust.sh stamps @VERSION@ (full, e.g. 0.2.0-rc.1) and @SHORT_VERSION@
+     (numeric X.Y.Z) from Cargo.toml, as packaging/macos/package.sh does for
+     assets/platforms/macos/Info.plist.in. The document types follow that file. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>SolidCraft</string>
+  <key>CFBundleName</key>
+  <string>SolidCraft</string>
+  <key>CFBundleExecutable</key>
+  <string>$(EXECUTABLE_NAME)</string>
+  <!-- io.tangencylabs.solidcraft, the macOS app's, so both can be one App Store app. A build for
+       your own iPad sets PRODUCT_BUNDLE_IDENTIFIER to an id of yours. -->
+  <key>CFBundleIdentifier</key>
+  <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@SHORT_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@SHORT_VERSION@</string>
+  <key>SolidCraftVersion</key>
+  <string>@VERSION@</string>
+  <key>CFBundleIconName</key>
+  <string>SolidCraft</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.graphics-design</string>
+  <key>LSRequiresIPhoneOS</key>
+  <true/>
+  <!-- Designs live in the app's Documents folder, shown in the Files app (src/ios_files.rs). -->
+  <key>UIFileSharingEnabled</key>
+  <true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key>
+  <true/>
+  <!-- Trackpad and mouse arrive as pointer events, with scrolling, not as touches. -->
+  <key>UIApplicationSupportsIndirectInputEvents</key>
+  <true/>
+  <!-- iPadOS 27 runs only apps that use scenes. One window scene, with no scene delegate: winit
+       puts its window in it (vendor/winit, src/platform_impl/ios/window.rs). -->
+  <key>UIApplicationSceneManifest</key>
+  <dict>
+    <key>UIApplicationSupportsMultipleScenes</key>
+    <false/>
+    <key>UISceneConfigurations</key>
+    <dict>
+      <key>UIWindowSceneSessionRoleApplication</key>
+      <array>
+        <dict>
+          <key>UISceneConfigurationName</key>
+          <string>Default</string>
+        </dict>
+      </array>
+    </dict>
+  </dict>
+  <key>UILaunchScreen</key>
+  <dict/>
+  <key>UIRequiresFullScreen</key>
+  <false/>
+  <key>UISupportedInterfaceOrientations~ipad</key>
+  <array>
+    <string>UIInterfaceOrientationPortrait</string>
+    <string>UIInterfaceOrientationPortraitUpsideDown</string>
+    <string>UIInterfaceOrientationLandscapeLeft</string>
+    <string>UIInterfaceOrientationLandscapeRight</string>
+  </array>
+  <key>ITSAppUsesNonExemptEncryption</key>
+  <false/>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>SolidCraft design</string>
+      <key>LSItemContentTypes</key>
+      <array><string>io.tangencylabs.solidcraft.design</string></array>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+    </dict>
+  </array>
+  <!-- The design type: .sc, and the older .solidcraft (docs/compatibility.md). -->
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>io.tangencylabs.solidcraft.design</string>
+      <key>UTTypeDescription</key>
+      <string>SolidCraft design</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>public.data</string><string>public.content</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>sc</string><string>solidcraft</string></array>
+        <key>public.mime-type</key>
+        <array><string>application/x-solidcraft</string></array>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>

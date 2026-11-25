@@ -438,6 +438,14 @@ fn find_system_cjk_font() -> Option<Vec<u8>> {
         }
     }
 
+    // iPadOS keeps its fonts in subfolders (Core, CoreAddition, …) of one system folder.
+    #[cfg(target_os = "ios")]
+    {
+        if let Some(bytes) = scan_dir_for_font(std::path::Path::new("/System/Library/Fonts"), 2, is_cjk_font_name) {
+            return Some(bytes);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         let search_dirs = [
@@ -626,6 +634,8 @@ fn chinese_font_dirs() -> Vec<std::path::PathBuf> {
             dirs.push(std::path::PathBuf::from(home).join("Library/Fonts"));
         }
     }
+    #[cfg(target_os = "ios")]
+    dirs.extend([std::path::PathBuf::from("/System/Library/Fonts")]);
     #[cfg(target_os = "linux")]
     {
         dirs.push(std::path::PathBuf::from("/usr/share/fonts"));

@@ -32,6 +32,13 @@ mod desktop_theme;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod desktop_transparency;
 mod device_lost;
+#[cfg(target_os = "ios")]
+mod ios_document_picker;
+#[cfg(target_os = "ios")]
+mod ios_files;
+// Built for the tests on every system: it only reads egui input.
+#[cfg(any(target_os = "ios", test))]
+mod ios_pencil;
 #[cfg(target_os = "windows")]
 mod native_crash;
 #[cfg(target_os = "macos")]
@@ -53,7 +60,9 @@ mod system_quit;
 #[cfg(any(target_os = "windows", test))]
 mod window_fit;
 
-use solidcraft_engine::{Session, io};
+use solidcraft_engine::Session;
+#[cfg(not(target_os = "ios"))]
+use solidcraft_engine::io;
 use solidcraft_ui_egui::{Services, SolveApp};
 
 /// Windows: put the restored window back inside the monitor's work area if it is out of reach
@@ -353,6 +362,8 @@ impl eframe::App for App {
         if let Some(menu) = &mut self.native_menu {
             menu.tick(&mut self.solve, ctx);
         }
+        #[cfg(target_os = "ios")]
+        ios_files::tick(&mut self.solve);
         self.solve.logic(ctx);
         // Whether the window draws while it is dragged by its title bar: winit has it at once.
         #[cfg(target_os = "windows")]
@@ -418,6 +429,13 @@ impl eframe::App for App {
             // The 3D mouse's buttons, before the app reads the frame: Esc and held modifiers join its input.
             solidcraft_ui_egui::space_mouse::buttons_hook(&mut self.solve, ctx, space_mouse.buttons(), raw);
         }
+        // iPadOS: the Pencil's taps and the fingers, for Pencil mode, as the web build's are.
+        #[cfg(target_os = "ios")]
+        {
+            let taps = ios_pencil::taps(raw);
+            self.solve.raw_input_hook_with_taps(ctx, raw, taps);
+        }
+        #[cfg(not(target_os = "ios"))]
         self.solve.raw_input_hook(raw);
     }
     /// A frame's UI: the starting page while the setup runs (in the saved language and fonts),
@@ -691,6 +709,8 @@ struct DialogFolderState {
     design: Option<String>,
 }
 
+// iPadOS keeps only `design`: its files have no dialog to remember a folder for.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 impl DialogFolder {
     /// A file was chosen in a dialog: the next one opens in its folder.
     fn chosen(&self, file: &std::path::Path) {
@@ -725,6 +745,7 @@ impl DialogFolder {
         }
     }
 
+    #[cfg(not(target_os = "ios"))]
     /// A dialog's answer as a path, its folder remembered for the next dialog.
     fn answer(&self, picked: Option<rfd::FileHandle>) -> Option<String> {
         let picked = picked?;
@@ -732,6 +753,7 @@ impl DialogFolder {
         Some(picked.path().to_string_lossy().into_owned())
     }
 
+    #[cfg(not(target_os = "ios"))]
     /// A folder picker's answer as a path. The picked folder itself is remembered, so the next
     /// dialog opens there. [`answer`] remembers a file's parent, which would open one level above
     /// a folder the user just chose.
@@ -745,6 +767,7 @@ impl DialogFolder {
         self.0.lock().ok().and_then(|state| state.folder.clone())
     }
 
+    #[cfg(not(target_os = "ios"))]
     /// The dialog, opening in the remembered folder when there is one.
     fn start(&self, dialog: rfd::AsyncFileDialog) -> rfd::AsyncFileDialog {
         match self.folder() {
@@ -756,6 +779,7 @@ impl DialogFolder {
 
 /// Linux file dialogs match patterns by case, so each extension goes in as lower and upper
 /// case, plus FreeCAD's own mixed casing.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 fn case_variants(exts: &[&str]) -> Vec<String> {
     let mut all: Vec<String> = Vec::new();
     for e in exts {
@@ -815,90 +839,7 @@ fn hidden_title_bar_ignores_clicks(alpha: f64) -> bool {
 }
 
 fn services(cc: &eframe::CreationContext<'_>, folder: &DialogFolder) -> Services {
-    let parent = rfd::AsyncFileDialog::new().set_parent(cc);
-    // The file chooser that opens may not be the desktop's own: the user is told when it does
-    // not (#10159).
-    #[cfg(target_os = "linux")]
-    let chooser_ctx = cc.egui_ctx.clone();
-    let open_parent = parent.clone();
-    let program_parent = parent.clone();
-    let file_parent = parent.clone();
-    let folder_parent = parent.clone();
-    let (open_folder, file_folder, save_folder, browse_folder) = (folder.clone(), folder.clone(), folder.clone(), folder.clone());
-    Services {
-        pick_open: Some(Box::new(move |first: &[&str]| {
-            // The chooser that opens may not be the desktop's own (#10159).
-            #[cfg(target_os = "linux")]
-            desktop_chooser::note_opening(&chooser_ctx);
-            // The file type the command reads comes first, so the picker opens on it (#1801).
-            let mut dialog = open_folder.start(open_parent.clone());
-            if !first.is_empty() {
-                let label = first.iter().map(|e| e.to_uppercase()).collect::<Vec<_>>().join(", ");
-                dialog = dialog.add_filter(label, &case_variants(first));
-            }
-            // The groups come from the format registry, so a new format joins this dialog by itself.
-            // Installed importer plugins read more kinds of file: they join "everything" and add
-            // a group of their own, named after the plugin.
-            let plugins = io::formats::plugin_open_filters();
-            let mut everything: Vec<&str> = io::formats::open_extensions(true);
-            for (_, exts) in &plugins {
-                everything.extend(exts.iter().map(String::as_str).filter(|e| !io::formats::open_extensions(true).contains(e)));
-            }
-            dialog = dialog.add_filter(solidcraft_ui_text::tr("file.open.drawing_filter"), &case_variants(&everything));
-            for (label, exts) in io::formats::import_filters(true) {
-                dialog = dialog.add_filter(label, &case_variants(&exts));
-            }
-            for (label, exts) in &plugins {
-                let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
-                dialog = dialog.add_filter(label.as_str(), &case_variants(&exts));
-            }
-            let future = dialog.add_filter("All files", &["*"]).pick_file();
-            let folder = open_folder.clone();
-            Box::pin(async move { folder.answer(future.await) })
-        })),
-        // One kind of file (the agent chat's attachments): only the types it names, as given and in
-        // lower and upper case (Linux dialogs match case; macOS allows just the listed types).
-        pick_file: Some(Box::new(move |label: &str, exts: &[&str]| {
-            let mut all: Vec<String> = Vec::new();
-            for e in exts {
-                for v in [e.to_string(), e.to_ascii_lowercase(), e.to_ascii_uppercase()] {
-                    if !all.contains(&v) {
-                        all.push(v);
-                    }
-                }
-            }
-            let all: Vec<&str> = all.iter().map(String::as_str).collect();
-            // Any other file attaches by reference, so the list is not the only choice.
-            let future = file_folder.start(file_parent.clone()).add_filter(label, &all).add_filter("All files", &["*"]).pick_file();
-            let folder = file_folder.clone();
-            Box::pin(async move { folder.answer(future.await) })
-        })),
-        pick_program: Some(Box::new(move || {
-            let dialog = program_parent.clone().set_title("Choose your slicer");
-            let dialog = if cfg!(target_os = "windows") { dialog.add_filter("Programs", &["exe"]) } else { dialog };
-            let future = dialog.pick_file();
-            Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
-        })),
-        pick_folder: Some(Box::new(move || {
-            let future = browse_folder.start(folder_parent.clone()).set_title("Choose a folder").pick_folder();
-            let folder = browse_folder.clone();
-            Box::pin(async move { folder.answer_folder(future.await) })
-        })),
-        pick_save: Some(Box::new(move |name: &str, exts: &[&str]| {
-            let dialog = save_folder.start(parent.clone()).set_file_name(name);
-            let dialog = if exts == [io::DESIGN_EXT, "json"] {
-                if name.ends_with(".json") {
-                    dialog.add_filter("Plain JSON design", &["json"]).add_filter("SolidCraft container", &[io::DESIGN_EXT])
-                } else {
-                    dialog.add_filter("SolidCraft container", &[io::DESIGN_EXT]).add_filter("Plain JSON design", &["json"])
-                }
-            } else {
-                dialog.add_filter("File", exts)
-            };
-            let future = dialog.save_file();
-            let folder = save_folder.clone();
-            Box::pin(async move { folder.answer(future.await) })
-        })),
+    let mut services = Services {
         graphics_adapters: Vec::new(),
         graphics_backend: None,
         graphics_backend_override: std::env::var(startup::WGPU_BACKEND_ENV).is_ok_and(|v| !v.trim().is_empty()),
@@ -955,7 +896,104 @@ fn services(cc: &eframe::CreationContext<'_>, folder: &DialogFolder) -> Services
         })),
         open_path: Some(Box::new(open_with::open_with_default_app)),
         open_bytes: None,
-    }
+        ..Services::default()
+    };
+    file_dialogs(&mut services, cc, folder);
+    services
+}
+
+/// iPadOS has no rfd dialogs: Documents and the Library stand in (src/ios_files.rs).
+#[cfg(target_os = "ios")]
+fn file_dialogs(services: &mut Services, _cc: &eframe::CreationContext<'_>, _folder: &DialogFolder) {
+    ios_files::install(services);
+}
+
+/// The desktop's file dialogs (rfd): Open, a file of one kind, a program, a folder, Save.
+#[cfg(not(target_os = "ios"))]
+fn file_dialogs(services: &mut Services, cc: &eframe::CreationContext<'_>, folder: &DialogFolder) {
+    let parent = rfd::AsyncFileDialog::new().set_parent(cc);
+    // The file chooser that opens may not be the desktop's own: the user is told when it does
+    // not (#10159).
+    #[cfg(target_os = "linux")]
+    let chooser_ctx = cc.egui_ctx.clone();
+    let open_parent = parent.clone();
+    let program_parent = parent.clone();
+    let file_parent = parent.clone();
+    let folder_parent = parent.clone();
+    let (open_folder, file_folder, save_folder, browse_folder) = (folder.clone(), folder.clone(), folder.clone(), folder.clone());
+    services.pick_open = Some(Box::new(move |first: &[&str]| {
+        // The chooser that opens may not be the desktop's own (#10159).
+        #[cfg(target_os = "linux")]
+        desktop_chooser::note_opening(&chooser_ctx);
+        // The file type the command reads comes first, so the picker opens on it (#1801).
+        let mut dialog = open_folder.start(open_parent.clone());
+        if !first.is_empty() {
+            let label = first.iter().map(|e| e.to_uppercase()).collect::<Vec<_>>().join(", ");
+            dialog = dialog.add_filter(label, &case_variants(first));
+        }
+        // The groups come from the format registry, so a new format joins this dialog by itself.
+        // Installed importer plugins read more kinds of file: they join "everything" and add
+        // a group of their own, named after the plugin.
+        let plugins = io::formats::plugin_open_filters();
+        let mut everything: Vec<&str> = io::formats::open_extensions(true);
+        for (_, exts) in &plugins {
+            everything.extend(exts.iter().map(String::as_str).filter(|e| !io::formats::open_extensions(true).contains(e)));
+        }
+        dialog = dialog.add_filter(solidcraft_ui_text::tr("file.open.drawing_filter"), &case_variants(&everything));
+        for (label, exts) in io::formats::import_filters(true) {
+            dialog = dialog.add_filter(label, &case_variants(&exts));
+        }
+        for (label, exts) in &plugins {
+            let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
+            dialog = dialog.add_filter(label.as_str(), &case_variants(&exts));
+        }
+        let future = dialog.add_filter("All files", &["*"]).pick_file();
+        let folder = open_folder.clone();
+        Box::pin(async move { folder.answer(future.await) })
+    }));
+    // One kind of file (the agent chat's attachments): only the types it names, as given and in
+    // lower and upper case (Linux dialogs match case; macOS allows just the listed types).
+    services.pick_file = Some(Box::new(move |label: &str, exts: &[&str]| {
+        let mut all: Vec<String> = Vec::new();
+        for e in exts {
+            for v in [e.to_string(), e.to_ascii_lowercase(), e.to_ascii_uppercase()] {
+                if !all.contains(&v) {
+                    all.push(v);
+                }
+            }
+        }
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        // Any other file attaches by reference, so the list is not the only choice.
+        let future = file_folder.start(file_parent.clone()).add_filter(label, &all).add_filter("All files", &["*"]).pick_file();
+        let folder = file_folder.clone();
+        Box::pin(async move { folder.answer(future.await) })
+    }));
+    services.pick_program = Some(Box::new(move || {
+        let dialog = program_parent.clone().set_title("Choose your slicer");
+        let dialog = if cfg!(target_os = "windows") { dialog.add_filter("Programs", &["exe"]) } else { dialog };
+        let future = dialog.pick_file();
+        Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
+    }));
+    services.pick_folder = Some(Box::new(move || {
+        let future = browse_folder.start(folder_parent.clone()).set_title("Choose a folder").pick_folder();
+        let folder = browse_folder.clone();
+        Box::pin(async move { folder.answer_folder(future.await) })
+    }));
+    services.pick_save = Some(Box::new(move |name: &str, exts: &[&str]| {
+        let dialog = save_folder.start(parent.clone()).set_file_name(name);
+        let dialog = if exts == [io::DESIGN_EXT, "json"] {
+            if name.ends_with(".json") {
+                dialog.add_filter("Plain JSON design", &["json"]).add_filter("SolidCraft container", &[io::DESIGN_EXT])
+            } else {
+                dialog.add_filter("SolidCraft container", &[io::DESIGN_EXT]).add_filter("Plain JSON design", &["json"])
+            }
+        } else {
+            dialog.add_filter("File", exts)
+        };
+        let future = dialog.save_file();
+        let folder = save_folder.clone();
+        Box::pin(async move { folder.answer(future.await) })
+    }));
 }
 
 /// HTTPS GET for the update check (docs/updates.md): certificates from the operating system, a
@@ -1273,12 +1311,13 @@ fn msaa() -> Option<u16> {
 
 /// Windows and Linux: no OS title bar; the application bar is the title bar
 /// (`solidcraft_ui_egui::titlebar`). macOS keeps its traffic lights over the integrated bar.
-const CUSTOM_TITLEBAR: bool = !cfg!(target_os = "macos");
+/// iPadOS has no window buttons: the system manages the app's windows.
+const CUSTOM_TITLEBAR: bool = !cfg!(any(target_os = "macos", target_os = "ios"));
 
 /// Linux: the window manager's own decorations (server-side, or the compositor's frame) can be
 /// asked for instead of the application bar ([`titlebar_choice`]). Elsewhere always `true`.
 fn app_titlebar_wanted() -> bool {
-    if !cfg!(all(unix, not(target_os = "macos"))) {
+    if !cfg!(all(unix, not(any(target_os = "macos", target_os = "ios")))) {
         return true;
     }
     let setting = graphics().and_then(|v| v.get("titlebar").and_then(serde_json::Value::as_str).map(str::to_string));
@@ -1596,9 +1635,9 @@ fn main() -> eframe::Result {
         wgpu_options,
         ..Default::default()
     };
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     let mut options = options;
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     let x11 = {
         // SOLIDCRAFT_WAYLAND wins over Preferences › Graphics › Window system (#3083).
         let environment = solidcraft_engine::geom::env::var("WAYLAND");
@@ -1615,7 +1654,7 @@ fn main() -> eframe::Result {
         let _ = WINDOW_SYSTEM.set(if x11 || !wayland_display { "x11" } else { "wayland" });
         x11
     };
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     if x11 {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;
@@ -2170,6 +2209,10 @@ fn no_window(
     } else {
         startup::no_window_message(&error.to_string(), settings)
     };
+    // iPadOS has no message box before the window: the log keeps the reason.
+    #[cfg(target_os = "ios")]
+    log::error!("SolidCraft could not start: {message}");
+    #[cfg(not(target_os = "ios"))]
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("SolidCraft could not start")
@@ -2180,27 +2223,27 @@ fn no_window(
 }
 
 /// Linux: the window system this run opened with (`wayland` or `x11`), for Preferences (#3083).
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 static WINDOW_SYSTEM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
 /// The window system this run uses, where there is a choice (Linux).
 fn window_system_now() -> Option<&'static str> {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     return WINDOW_SYSTEM.get().copied();
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
     None
 }
 
 /// Preferences › Graphics › Window system (`graphics.json`'s `window_system`), read before the
 /// window opens.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn window_system_preference() -> Option<String> {
     graphics().and_then(|v| v.get("window_system").and_then(serde_json::Value::as_str).map(str::to_string))
 }
 
 /// The window system preference as the `SOLIDCRAFT_WAYLAND` value it stands for: `wayland` is
 /// `1`, `x11` is `0`, and `auto` (or anything else) leaves the choice to [`prefer_x11`].
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn window_system_override(preference: Option<&str>) -> Option<&'static str> {
     match preference.map(str::trim) {
         Some("wayland") => Some("1"),
@@ -2216,7 +2259,7 @@ fn window_system_override(preference: Option<&str>) -> Option<&'static str> {
 /// `force_zero_scaling` plus `GDK_SCALE` makes the UI ~2.5× oversized, #10480). Those stay on
 /// native Wayland and give up file drops. `SOLIDCRAFT_WAYLAND=1` keeps native Wayland,
 /// `SOLIDCRAFT_WAYLAND=0` forces XWayland.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn prefer_x11(display: bool, wayland_display: bool, desktop: Option<&str>, wayland_override: Option<&str>) -> bool {
     match wayland_override.map(str::trim) {
         Some("0") => return display,
@@ -2227,7 +2270,7 @@ fn prefer_x11(display: bool, wayland_display: bool, desktop: Option<&str>, wayla
 }
 
 /// Desktops that keep Automatic on native Wayland when a Wayland socket is present.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn native_wayland_desktop(desktop: Option<&str>) -> bool {
     desktop.is_some_and(|d| {
         d.split(':').any(|name| {
@@ -2237,11 +2280,11 @@ fn native_wayland_desktop(desktop: Option<&str>) -> bool {
     })
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 const CHOOSER_NO_SESSION_BUS: &str = "file.open.portal_fallback.no_session_bus";
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 const CHOOSER_NO_PORTAL_SERVICE: &str = "file.open.portal_fallback.no_portal_service";
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 const CHOOSER_XWAYLAND: &str = "file.open.portal_fallback.xwayland";
 
 /// Whether the chooser that opens is NOT the desktop's own, and why.
@@ -2258,7 +2301,7 @@ const CHOOSER_XWAYLAND: &str = "file.open.portal_fallback.xwayland";
 ///
 /// `None` means the desktop's own chooser is the one that opens and there is nothing to say;
 /// `Some` carries the reason to report.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn desktop_chooser_fallback(dbus_session: bool, portal_service: bool, wayland_display: bool, x11_display: bool) -> Option<&'static str> {
     // Without a session bus there is no bus to reach the portal on, so the chooser is not the
@@ -2278,7 +2321,7 @@ fn desktop_chooser_fallback(dbus_session: bool, portal_service: bool, wayland_di
     None
 }
 
-#[cfg(all(test, unix, not(target_os = "macos")))]
+#[cfg(all(test, unix, not(any(target_os = "macos", target_os = "ios"))))]
 mod backend_tests {
     use super::prefer_x11;
 

@@ -1,0 +1,1 @@
+| assets/platforms/ios/Info.plist | SolidCraft contributors | original iPadOS Info.plist for the iPad app (scene manifest, document types, file sharing), written for SolidCraft beside the macOS Info.plist.in | MIT OR Apache-2.0 |

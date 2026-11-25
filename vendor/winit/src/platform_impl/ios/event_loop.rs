@@ -19,7 +19,8 @@ use objc2_ui_kit::{
     UIApplicationDidEnterBackgroundNotification, UIApplicationDidFinishLaunchingNotification,
     UIApplicationDidReceiveMemoryWarningNotification, UIApplicationMain,
     UIApplicationWillEnterForegroundNotification, UIApplicationWillResignActiveNotification,
-    UIApplicationWillTerminateNotification, UIDevice, UIScreen, UIUserInterfaceIdiom,
+    UIApplicationWillTerminateNotification, UIDevice, UISceneWillConnectNotification, UIScreen,
+    UIUserInterfaceIdiom,
 };
 
 use crate::error::EventLoopError;
@@ -150,6 +151,7 @@ pub struct EventLoop<T: 'static> {
     _did_enter_background_observer: Retained<NSObject>,
     _will_terminate_observer: Retained<NSObject>,
     _did_receive_memory_warning_observer: Retained<NSObject>,
+    _scene_will_connect_observer: Retained<NSObject>,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -255,6 +257,18 @@ impl<T: 'static> EventLoop<T> {
             },
         );
 
+        // SolidCraft: windows made before the app's window scene connected join it now
+        // (`window::scene_connected`).
+        let _scene_will_connect_observer = create_observer(
+            &center,
+            unsafe { UISceneWillConnectNotification },
+            move |notification| {
+                if let Some(scene) = unsafe { notification.object() } {
+                    super::window::scene_connected(&scene);
+                }
+            },
+        );
+
         Ok(EventLoop {
             mtm,
             sender,
@@ -267,6 +281,7 @@ impl<T: 'static> EventLoop<T> {
             _did_enter_background_observer,
             _will_terminate_observer,
             _did_receive_memory_warning_observer,
+            _scene_will_connect_observer,
         })
     }
 

@@ -47,12 +47,12 @@ solidcraft-theme = { workspace = true }
 solidcraft-space-mouse = { workspace = true }
 # "clipboard" is not a default here: eframe 0.37 builds egui-winit without it, and then every
 # Copy and Paste on the desktop silently does nothing (see src/clipboard_tests.rs).
-eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links", "clipboard"] }
+# Wayland and X11 are added for Linux and the BSDs below.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "links", "clipboard"] }
 egui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-rfd = { workspace = true }
 # Checks eframe's settings file (app.ron) before eframe reads it (src/startup.rs).
 ron = "0.12"
 # Waits for wgpu's adapter list when choosing the graphics backend before the window opens.
@@ -68,7 +68,7 @@ keyring = { version = "3.6", default-features = false, features = ["apple-native
 # domain socket on Linux and macOS, a named pipe on Windows, both local to the user.
 interprocess = "2.4"
 
-[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "ios"))'.dependencies]
 quick-xml = { workspace = true }
 # The window events eframe asks the app about before painting (`App::repaint_on_window_event`);
 # already in the tree through eframe.
@@ -127,7 +127,26 @@ libc = "0.2"
 # its signal-hook-registry is already in the tree.
 signal-hook = { version = "0.4.5", default-features = false, features = ["iterator"] }
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# Native file dialogs. iPadOS has none that rfd drives; there the Library panel and the app's
+# Documents folder stand in (docs/ios.md).
+# iPadOS: Pencil touches carry egui-winit's stylus device (src/ios_pencil.rs, built for the tests
+# everywhere). eframe builds egui-winit already; this only names it.
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "ios"))'.dependencies.egui-winit]
+workspace = true
+
+# iPadOS: the system's document picker (src/ios_document_picker.rs). The objc2 crates are the
+# macOS build's, and objc2-ui-kit is already built for winit and wgpu.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSSet", "NSString", "NSURL"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "block2", "UIApplication", "UIDocumentPickerViewController", "UIResponder", "UIScene", "UIView", "UIViewController", "UIWindow", "UIWindowScene"] }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+rfd = { workspace = true }
+
+# Linux and the BSDs (iOS is unix too, but has neither Wayland nor X11).
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))'.dependencies]
+eframe = { workspace = true, features = ["wayland", "x11"] }
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 # Bringing the window forward on X11 when a close asks about unsaved designs (src/come_forward.rs):
 # the window's id, and the window manager request winit doesn't send (MIT OR Apache-2.0; both

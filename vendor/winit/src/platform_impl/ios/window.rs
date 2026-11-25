@@ -10,7 +10,7 @@ use objc2_foundation::{
 };
 use objc2_ui_kit::{
     UIApplication, UICoordinateSpace, UIResponder, UIScreen, UIScreenOverscanCompensation,
-    UIViewController, UIWindow,
+    UIViewController, UIWindow, UIWindowScene,
 };
 use tracing::{debug, warn};
 
@@ -98,11 +98,62 @@ impl WinitUIWindow {
             _ => (),
         }
 
+        join_scene(mtm, &this);
+
         this
     }
 
     pub(crate) fn id(&self) -> WindowId {
         (self as *const Self as usize as u64).into()
+    }
+}
+
+// SolidCraft: iPadOS 27 stops an app that does not use scenes (UIKit's
+// `NoSceneLifecycleAdoption` check), and a window that belongs to no scene is never shown in one
+// that does. The app's Info.plist declares a single window scene (`UIApplicationSceneManifest`,
+// no scene delegate), and each winit window joins it: at once when the scene is connected, or
+// when it connects (`UISceneWillConnectNotification`, observed in `event_loop.rs`) for a window
+// made before that.
+thread_local! {
+    static AWAITING_SCENE: std::cell::RefCell<Vec<Retained<WinitUIWindow>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn is_window_scene(object: &AnyObject) -> bool {
+    unsafe { msg_send![object, isKindOfClass: UIWindowScene::class()] }
+}
+
+/// SolidCraft: puts `window` in the app's connected window scene, or keeps it until one connects.
+fn join_scene(mtm: MainThreadMarker, window: &Retained<WinitUIWindow>) {
+    let app = UIApplication::sharedApplication(mtm);
+    let scene = unsafe { app.connectedScenes().anyObject() }.filter(|scene| is_window_scene(scene));
+    match scene {
+        // SAFETY: checked above to be a `UIWindowScene`.
+        Some(scene) => unsafe {
+            let scene: Retained<UIWindowScene> = Retained::cast(scene);
+            window.setWindowScene(Some(&scene));
+        },
+        None => AWAITING_SCENE.with(|awaiting| awaiting.borrow_mut().push(window.clone())),
+    }
+}
+
+/// SolidCraft: a scene has connected (`UISceneWillConnectNotification`); the windows waiting for
+/// one join it, sized to it, and a visible one becomes the key window.
+pub(crate) fn scene_connected(scene: &AnyObject) {
+    if !is_window_scene(scene) {
+        return;
+    }
+    // SAFETY: checked above to be a `UIWindowScene`.
+    let scene: &UIWindowScene = unsafe { &*(scene as *const AnyObject as *const UIWindowScene) };
+    let windows = AWAITING_SCENE.with(|awaiting| std::mem::take(&mut *awaiting.borrow_mut()));
+    for window in windows {
+        unsafe {
+            window.setWindowScene(Some(scene));
+            window.setFrame(scene.coordinateSpace().bounds());
+        }
+        if !window.isHidden() {
+            window.makeKeyAndVisible();
+        }
     }
 }
 
@@ -185,11 +236,13 @@ impl Inner {
 
     pub fn inner_size(&self) -> PhysicalSize<u32> {
         let scale_factor = self.scale_factor();
-        let safe_area = self.safe_area_screen_space();
-        let size = LogicalSize {
-            width: safe_area.size.width as f64,
-            height: safe_area.size.height as f64,
-        };
+        // SolidCraft: the whole view, as `WindowEvent::Resized` reports it (view.rs) and as
+        // winit 0.31's `surface_size` does. The safe area's size (less the status bar) made
+        // egui-wgpu draw into a shorter surface that iPadOS stretched over the view, so a touch
+        // (in view points) landed below what it was drawn on. egui keeps clear of the status
+        // bar itself, from the safe-area insets egui-winit reads.
+        let frame = self.rect_to_screen_space(self.window.bounds());
+        let size = LogicalSize { width: frame.size.width as f64, height: frame.size.height as f64 };
         size.to_physical(scale_factor)
     }
 
@@ -622,6 +675,11 @@ impl Inner {
 
     pub fn set_prefers_status_bar_hidden(&self, hidden: bool) {
         self.view_controller.set_prefers_status_bar_hidden(hidden);
+    }
+
+    // SolidCraft: see `WindowExtIOS::set_soft_keyboard`.
+    pub fn set_soft_keyboard(&self, show: bool) {
+        self.view.set_soft_keyboard(show);
     }
 
     pub fn set_preferred_status_bar_style(&self, status_bar_style: StatusBarStyle) {

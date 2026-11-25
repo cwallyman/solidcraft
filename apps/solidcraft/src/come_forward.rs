@@ -119,7 +119,7 @@ impl ComeForward {
 
 /// Ask for the focus once.
 fn bring(ctx: &egui::Context, frame: &eframe::Frame, minimized: Option<bool>) {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     let raised = match x11_activate(frame) {
         Ok(sent) => sent,
         Err(e) => {
@@ -127,7 +127,7 @@ fn bring(ctx: &egui::Context, frame: &eframe::Frame, minimized: Option<bool>) {
             false
         }
     };
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
     let raised = {
         let _ = frame;
         false
@@ -154,7 +154,7 @@ fn commands(minimized: Option<bool>, raised: bool) -> Vec<egui::ViewportCommand>
 
 /// Ask the X11 window manager to activate the window as a user action. `Ok(false)`: the window
 /// isn't an X11 window (native Wayland).
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn x11_activate(frame: &eframe::Frame) -> Result<bool, String> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use x11rb::connection::Connection;

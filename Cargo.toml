@@ -161,6 +161,7 @@ eframe = { version = "0.37", default-features = false, features = ["persistence"
 # Instant/SystemTime that also work in the browser (std panics on wasm32-unknown-unknown).
 web-time = "1"
 egui-wgpu = "0.37"
+egui-winit = { version = "0.37", default-features = false }
 # the wgpu egui-wgpu uses, for compute (crates/gpu); backends come from the apps' features
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
 naga = { version = "30", default-features = false }

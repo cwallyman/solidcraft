@@ -379,6 +379,7 @@ features = [
     "UIEvent",
     "UIGeometry",
     "UIGestureRecognizer",
+    "UIHoverGestureRecognizer",
     "UITextInput",
     "UITextInputTraits",
     "UIOrientation",
@@ -386,6 +387,7 @@ features = [
     "UIPinchGestureRecognizer",
     "UIResponder",
     "UIRotationGestureRecognizer",
+    "UIScene",
     "UIScreen",
     "UIScreenMode",
     "UITapGestureRecognizer",
@@ -394,6 +396,7 @@ features = [
     "UIView",
     "UIViewController",
     "UIWindow",
+    "UIWindowScene",
 ]
 
 [target.'cfg(target_os = "macos")'.dependencies.core-graphics]

@@ -33,12 +33,12 @@ pub fn default_dir() -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).filter(|d| !d.is_empty()).map(PathBuf::from);
     let root = if cfg!(windows) {
         env("LOCALAPPDATA")?
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
         env("HOME")?.join("Library/Application Support")
     } else {
         env("XDG_DATA_HOME").or_else(|| env("HOME").map(|h| h.join(".local/share")))?
     };
-    let dir = dir_under(&long_names(&root), cfg!(windows) || cfg!(target_os = "macos"));
+    let dir = dir_under(&long_names(&root), cfg!(windows) || cfg!(any(target_os = "macos", target_os = "ios")));
     // Compatibility shim (docs/compatibility.md): autosaves made in the Flatpak sandbox under an
     // earlier app id are copied to the new folder on first launch; the old folder is left as it was.
     for old in solidcraft_io::legacy_flatpak_paths(&dir) {
@@ -51,13 +51,13 @@ pub fn default_dir() -> Option<PathBuf> {
 
 /// SolidCraft's per-user data folder (the recovery folder's parent unless
 /// `SOLIDCRAFT_RECOVERY_DIR` moves that): `%LOCALAPPDATA%\SolidCraft`,
-/// `~/Library/Application Support/SolidCraft`, or `$XDG_DATA_HOME/solidcraft`
+/// `~/Library/Application Support/SolidCraft` (macOS and iPadOS), or `$XDG_DATA_HOME/solidcraft`
 /// (`~/.local/share/solidcraft`).
 pub fn data_dir() -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).filter(|d| !d.is_empty()).map(PathBuf::from);
     if cfg!(windows) {
         Some(env("LOCALAPPDATA")?.join("SolidCraft"))
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
         Some(env("HOME")?.join("Library/Application Support/SolidCraft"))
     } else {
         Some(env("XDG_DATA_HOME").or_else(|| env("HOME").map(|h| h.join(".local/share")))?.join("solidcraft"))
@@ -72,14 +72,14 @@ pub fn cache_dir() -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).filter(|d| !d.is_empty()).map(PathBuf::from);
     if cfg!(windows) {
         Some(env("LOCALAPPDATA")?.join("SolidCraft"))
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
         Some(env("HOME")?.join("Library/Caches/SolidCraft"))
     } else {
         Some(env("XDG_CACHE_HOME").or_else(|| env("HOME").map(|h| h.join(".cache")))?.join("solidcraft"))
     }
 }
 
-/// The recovery folder under the per-user data `root`. Windows and macOS name the app's folder
+/// The recovery folder under the per-user data `root`. Windows, macOS and iPadOS name the app's folder
 /// in title case, other systems in lower case.
 fn dir_under(root: &Path, title_case: bool) -> PathBuf {
     root.join(if title_case { "SolidCraft" } else { "solidcraft" }).join("recovery")

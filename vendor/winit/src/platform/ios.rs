@@ -151,6 +151,12 @@ pub trait WindowExtIOS {
     /// is also called for you.
     fn set_prefers_status_bar_hidden(&self, hidden: bool);
 
+    /// SolidCraft: whether keyboard focus ([`Window::set_ime_allowed`]) shows the on-screen
+    /// keyboard. When `false`, a hardware keyboard still types and nothing covers the screen.
+    ///
+    /// The default is `true`.
+    fn set_soft_keyboard(&self, show: bool);
+
     /// Sets the preferred status bar style for the [`Window`].
     ///
     /// The default is system-defined.
@@ -220,6 +226,11 @@ impl WindowExtIOS for Window {
     #[inline]
     fn set_prefers_status_bar_hidden(&self, hidden: bool) {
         self.window.maybe_queue_on_main(move |w| w.set_prefers_status_bar_hidden(hidden))
+    }
+
+    #[inline]
+    fn set_soft_keyboard(&self, show: bool) {
+        self.window.maybe_queue_on_main(move |w| w.set_soft_keyboard(show))
     }
 
     #[inline]

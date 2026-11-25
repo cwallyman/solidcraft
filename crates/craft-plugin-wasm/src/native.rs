@@ -1202,6 +1202,11 @@ fn check_outer_interfaces(bytes: &[u8]) -> Result<()> {
 /// Compiles `bytes` under the host's configuration, without the cache.
 fn compile_with(bytes: &[u8], stack_bytes: usize) -> Result<(Engine, Component)> {
     check_outer_interfaces(bytes)?;
+    // iPadOS lets no app write executable memory, so Cranelift's machine code could not run
+    // (docs/ios.md). An interpreter (Pulley) would; until then, a plain answer.
+    if cfg!(target_os = "ios") {
+        return Err(trap("not supported yet: plugins on iPad"));
+    }
     let mut config = Config::new();
     config.consume_fuel(true).epoch_interruption(true).wasm_memory64(false).wasm_multi_memory(false).max_wasm_stack(stack_bytes);
     // Wasmtime refuses a Wasm stack larger than its async stack, even for synchronous calls.
