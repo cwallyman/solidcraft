@@ -8,7 +8,8 @@ use objc2_foundation::{CGFloat, CGPoint, CGRect, CGSize, MainThreadMarker, NSObj
 use objc2_ui_kit::{
     UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
     UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
-    UIPanGestureRecognizer,
+    UIPanGestureRecognizer, UIPencilInteraction, UIPencilInteractionDelegate,
+    UIPencilInteractionPhase, UIPencilInteractionSqueeze, UIPencilPreferredAction,
     UIPinchGestureRecognizer, UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer,
     UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
 };
@@ -44,6 +45,9 @@ pub struct WinitViewState {
     // (`set_soft_keyboard`), and the empty input view that stands in for it when not.
     soft_keyboard: Cell<bool>,
     no_soft_keyboard: RefCell<Option<Retained<UIView>>>,
+
+    // SolidCraft: the Apple Pencil interaction, for the squeeze (`pencilInteraction:didReceiveSqueeze:`).
+    pencil_interaction: RefCell<Option<Retained<UIPencilInteraction>>>,
 }
 
 declare_class!(
@@ -419,6 +423,21 @@ declare_class!(
         }
     }
 
+    // SolidCraft: an Apple Pencil Pro squeeze is Escape (pressed and released when the squeeze
+    // ends), so it cancels or finishes what the Pencil is doing without reaching for a key. A
+    // squeeze the user set to be ignored, or to run a system shortcut, is left alone.
+    unsafe impl UIPencilInteractionDelegate for WinitView {
+        #[method(pencilInteraction:didReceiveSqueeze:)]
+        fn pencil_squeeze(&self, _interaction: &UIPencilInteraction, squeeze: &UIPencilInteractionSqueeze) {
+            let ended = unsafe { squeeze.phase() } == UIPencilInteractionPhase::Ended;
+            let action = MainThreadMarker::new().map(|mtm| unsafe { UIPencilInteraction::preferredSqueezeAction(mtm) });
+            let wanted = !matches!(action, Some(UIPencilPreferredAction::Ignore | UIPencilPreferredAction::RunSystemShortcut));
+            if ended && wanted {
+                self.handle_named_key(NamedKey::Escape, KeyCode::Escape);
+            }
+        }
+    }
+
     unsafe impl UITextInputTraits for WinitView {
     }
 
@@ -461,6 +480,8 @@ impl WinitView {
 
             soft_keyboard: Cell::new(true),
             no_soft_keyboard: RefCell::new(None),
+
+            pencil_interaction: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
@@ -478,6 +499,13 @@ impl WinitView {
         };
         this.addGestureRecognizer(&hover);
         this.ivars().hover_gesture_recognizer.replace(Some(hover));
+
+        // SolidCraft: the Apple Pencil's squeeze (`pencilInteraction:didReceiveSqueeze:`).
+        let pencil = unsafe {
+            UIPencilInteraction::initWithDelegate(mtm.alloc(), ProtocolObject::from_ref(&*this))
+        };
+        unsafe { this.addInteraction(ProtocolObject::from_ref(&*pencil)) };
+        this.ivars().pencil_interaction.replace(Some(pencil));
 
         if let Some(scale_factor) = window_attributes.platform_specific.scale_factor {
             this.setContentScaleFactor(scale_factor as _);
@@ -715,6 +743,34 @@ impl WinitView {
                             device_id: DEVICE_ID,
                         },
                     })
+                })
+            }),
+        );
+    }
+
+    // SolidCraft: a named key pressed and released (the Pencil squeeze's Escape).
+    fn handle_named_key(&self, key: NamedKey, code: KeyCode) {
+        let Some(window) = self.window() else { return };
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let window_id = RootWindowId(window.id());
+        app_state::handle_nonuser_events(
+            mtm,
+            [ElementState::Pressed, ElementState::Released].map(|state| {
+                EventWrapper::StaticEvent(Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::KeyboardInput {
+                        device_id: DEVICE_ID,
+                        event: KeyEvent {
+                            state,
+                            logical_key: Key::Named(key),
+                            physical_key: PhysicalKey::Code(code),
+                            platform_specific: KeyEventExtra {},
+                            repeat: false,
+                            location: KeyLocation::Standard,
+                            text: None,
+                        },
+                        is_synthetic: false,
+                    },
                 })
             }),
         );

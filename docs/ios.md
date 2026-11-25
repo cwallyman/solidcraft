@@ -70,6 +70,8 @@ browser): iCloud Drive, On My iPad, or another file provider.
 - **Fingers** in the view move it: one finger orbits, two pan, pinch zooms. A **finger
   double-tap** on a flat face starts a sketch on it. Fingers on panels and buttons tap them.
 - A palm resting on the screen while the Pencil draws doesn't take over the Pencil.
+- An **Apple Pencil Pro squeeze** is Escape: it cancels the tool or the step in progress. A
+  squeeze set to be ignored or to run a shortcut (Settings › Apple Pencil) is left to iPadOS.
 - **Hovering** the Pencil (or a trackpad or mouse pointer) over a button shows its tooltip.
 - A **trackpad or mouse** click is a click, as on a computer: it replaces the selection, and
   Shift-click adds.
