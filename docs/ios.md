@@ -79,8 +79,8 @@ browser): iCloud Drive, On My iPad, or another file provider.
 ## iPad layout
 
 **iPad layout** is on by default on iPad and off on a Mac or PC (for a touch screen, turn it on).
-It is switched on Home (**iPad layout: on/off**, between Preferences and Keyboard shortcuts), in
-Preferences › Interface › Window, or with the `view.touch_layout` command. With it on, the
+It is chosen as **iPad**, after Classic, in Preferences › Layout › Panel layout (choosing another
+layout turns it off), or with the `view.touch_layout` command. With it on, the
 interface is drawn a little larger and a tap a few points beside a control still reaches it.
 
 ## Typing values

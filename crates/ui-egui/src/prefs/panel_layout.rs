@@ -104,9 +104,14 @@ fn workspace_selector(app: &mut SolveApp, ui: &mut Ui, view: &LayoutPreferencesV
     workspaces.sort_by_key(|workspace| {
         ["modelling", "sketch", "render", "review", "classic"].iter().position(|suffix| workspace.title_key.ends_with(*suffix)).unwrap_or(5)
     });
-    let labels: Vec<_> = workspaces.iter().map(|workspace| app.tr(&workspace.title_key).to_owned()).collect();
+    let mut labels: Vec<_> = workspaces.iter().map(|workspace| app.tr(&workspace.title_key).to_owned()).collect();
+    // The iPad layout is the last choice: the chosen workspace's panels, drawn larger for touch
+    // (`view.touch_layout`). Choosing a workspace turns it off.
+    let ipad = labels.len();
+    labels.push(app.tr("ui.panel_layout.workspace.ipad").to_owned());
     let options: Vec<_> = labels.iter().map(String::as_str).collect();
-    let current = workspaces.iter().position(|workspace| workspace.id == view.selected_workspace).unwrap_or(0);
+    let workspace_index = workspaces.iter().position(|workspace| workspace.id == view.selected_workspace).unwrap_or(0);
+    let current = if app.preferences.touch_layout { ipad } else { workspace_index };
     let mut selected = current;
     let mut reset = false;
     let title = app.tr("ui.panel_layout.layout_workspace").to_owned();
@@ -160,7 +165,7 @@ fn workspace_selector(app: &mut SolveApp, ui: &mut Ui, view: &LayoutPreferencesV
                     }
                 });
                 let response = reset_button(ui, reset_label, !view.default_matches);
-                let workspace = labels.get(current).map(String::as_str).unwrap_or_default();
+                let workspace = labels.get(workspace_index).map(String::as_str).unwrap_or_default();
                 let hint = solidcraft_ui_text::format("ui.panel_layout.reset_hint", &[("workspace", workspace)]);
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, response.enabled(), &hint));
                 crate::scenario::publish_target("prefs:panel_layout:reset", response.rect);
@@ -169,8 +174,15 @@ fn workspace_selector(app: &mut SolveApp, ui: &mut Ui, view: &LayoutPreferencesV
         })
     });
     if selected != current {
-        if let Some(workspace) = workspaces.get(selected) {
-            run(app, "layout.workspace.select", json!({"workspace":workspace.id}), None);
+        if selected == ipad {
+            run(app, "view.touch_layout", json!({"on":true}), None);
+        } else if let Some(workspace) = workspaces.get(selected) {
+            if current == ipad {
+                run(app, "view.touch_layout", json!({"on":false}), None);
+            }
+            if selected != workspace_index {
+                run(app, "layout.workspace.select", json!({"workspace":workspace.id}), None);
+            }
         }
     } else if reset {
         run(app, "layout.reset", json!({}), None);

@@ -2,65 +2,41 @@
   "en": {
     "cmd.view_touch_layout": "iPad Layout",
     "help.view.touch_layout": "Switches the iPad layout: the interface a little larger, and a tap near a control reaches it, for fingers and the Apple Pencil.",
-    "home.touch_layout_off": "iPad layout: off",
-    "home.touch_layout_on": "iPad layout: on",
-    "prefs.touch_layout": "iPad layout",
-    "prefs.touch_layout_note": "Draws the interface a little larger and lets a tap near a control reach it, for fingers and the Apple Pencil. On by default on iPad."
+    "ui.panel_layout.workspace.ipad": "iPad"
   },
   "ar": {
     "cmd.view_touch_layout": "تخطيط iPad",
     "help.view.touch_layout": "يبدّل تخطيط iPad: واجهة أكبر قليلًا، ونقرة قرب عنصر تحكم تصل إليه، للأصابع وApple Pencil.",
-    "home.touch_layout_off": "تخطيط iPad: متوقف",
-    "home.touch_layout_on": "تخطيط iPad: يعمل",
-    "prefs.touch_layout": "تخطيط iPad",
-    "prefs.touch_layout_note": "يرسم الواجهة أكبر قليلًا ويجعل النقرة قرب عنصر تحكم تصل إليه، للأصابع وApple Pencil. يعمل افتراضيًا على iPad."
+    "ui.panel_layout.workspace.ipad": "iPad"
   },
   "de": {
     "cmd.view_touch_layout": "iPad-Layout",
     "help.view.touch_layout": "Schaltet das iPad-Layout um: die Oberfläche etwas größer, und ein Tippen nahe einem Bedienelement erreicht es, für Finger und den Apple Pencil.",
-    "home.touch_layout_off": "iPad-Layout: aus",
-    "home.touch_layout_on": "iPad-Layout: ein",
-    "prefs.touch_layout": "iPad-Layout",
-    "prefs.touch_layout_note": "Zeichnet die Oberfläche etwas größer, und ein Tippen nahe einem Bedienelement erreicht es, für Finger und den Apple Pencil. Auf dem iPad standardmäßig ein."
+    "ui.panel_layout.workspace.ipad": "iPad"
   },
   "he": {
     "cmd.view_touch_layout": "פריסת iPad",
     "help.view.touch_layout": "מחליף את פריסת ה-iPad: ממשק גדול מעט יותר, והקשה ליד פקד מגיעה אליו, לאצבעות ול-Apple Pencil.",
-    "home.touch_layout_off": "פריסת iPad: כבויה",
-    "home.touch_layout_on": "פריסת iPad: פעילה",
-    "prefs.touch_layout": "פריסת iPad",
-    "prefs.touch_layout_note": "מציג את הממשק גדול מעט יותר ומאפשר להקשה ליד פקד להגיע אליו, לאצבעות ול-Apple Pencil. פעיל כברירת מחדל ב-iPad."
+    "ui.panel_layout.workspace.ipad": "iPad"
   },
   "ja": {
     "cmd.view_touch_layout": "iPad レイアウト",
     "help.view.touch_layout": "iPad レイアウトを切り替えます。指や Apple Pencil 向けに、画面を少し大きくし、コントロールの近くをタップしても届くようにします。",
-    "home.touch_layout_off": "iPad レイアウト: オフ",
-    "home.touch_layout_on": "iPad レイアウト: オン",
-    "prefs.touch_layout": "iPad レイアウト",
-    "prefs.touch_layout_note": "指や Apple Pencil 向けに、画面を少し大きく表示し、コントロールの近くをタップしても届くようにします。iPad では既定でオンです。"
+    "ui.panel_layout.workspace.ipad": "iPad"
   },
   "ko": {
     "cmd.view_touch_layout": "iPad 레이아웃",
     "help.view.touch_layout": "iPad 레이아웃을 전환합니다. 손가락과 Apple Pencil을 위해 화면을 조금 더 크게 하고, 컨트롤 근처를 탭해도 닿게 합니다.",
-    "home.touch_layout_off": "iPad 레이아웃: 끔",
-    "home.touch_layout_on": "iPad 레이아웃: 켬",
-    "prefs.touch_layout": "iPad 레이아웃",
-    "prefs.touch_layout_note": "손가락과 Apple Pencil을 위해 화면을 조금 더 크게 그리고, 컨트롤 근처를 탭해도 닿게 합니다. iPad에서는 기본적으로 켜져 있습니다."
+    "ui.panel_layout.workspace.ipad": "iPad"
   },
   "vi": {
     "cmd.view_touch_layout": "Bố cục iPad",
     "help.view.touch_layout": "Bật/tắt bố cục iPad: giao diện lớn hơn một chút, và chạm gần một điều khiển cũng tới được nó, cho ngón tay và Apple Pencil.",
-    "home.touch_layout_off": "Bố cục iPad: tắt",
-    "home.touch_layout_on": "Bố cục iPad: bật",
-    "prefs.touch_layout": "Bố cục iPad",
-    "prefs.touch_layout_note": "Vẽ giao diện lớn hơn một chút và cho phép chạm gần một điều khiển tới được nó, cho ngón tay và Apple Pencil. Mặc định bật trên iPad."
+    "ui.panel_layout.workspace.ipad": "iPad"
   },
   "zh": {
     "cmd.view_touch_layout": "iPad 布局",
     "help.view.touch_layout": "切换 iPad 布局：界面稍大一些，点按控件附近也能触及它，适合手指和 Apple Pencil。",
-    "home.touch_layout_off": "iPad 布局：关",
-    "home.touch_layout_on": "iPad 布局：开",
-    "prefs.touch_layout": "iPad 布局",
-    "prefs.touch_layout_note": "将界面绘制得稍大一些，点按控件附近也能触及它，适合手指和 Apple Pencil。在 iPad 上默认开启。"
+    "ui.panel_layout.workspace.ipad": "iPad"
   }
 }

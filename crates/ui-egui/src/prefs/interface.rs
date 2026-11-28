@@ -224,7 +224,6 @@ pub(super) fn layout(app: &mut SolveApp, ui: &mut egui::Ui) {
         super::panel_layout::show(app, ui);
         // Retain the section key for existing reveal/open callers.
         ui_kit::settings_section(ui, "layout", app.tr("prefs.layout_page.window"), |ui| {
-            layout_check(ui, app.tr("prefs.touch_layout"), app.tr("prefs.touch_layout_note"), &mut app.preferences.touch_layout, "touch_layout");
             ui_kit::settings_pair(
                 ui,
                 |ui| {
