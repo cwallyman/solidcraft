@@ -246,6 +246,27 @@ pub struct RibbonTabsOnlyParams {
     pub on: Option<bool>,
 }
 
+/// `view.touch_layout`: the iPad layout on or off.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TouchLayoutParams {
+    /// True turns the iPad layout on, false off; omitted switches between the two.
+    #[serde(default)]
+    pub on: Option<bool>,
+}
+
+/// What `view.touch_layout` returns: the request echoed. The window applies it to its
+/// preference; the design is not changed and nothing is added to undo.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TouchLayout {
+    /// The requested state; absent when the call asked to switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<bool>,
+    /// In the warn parameter-check mode: what the call's parameters got wrong.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub param_warnings: Vec<String>,
+}
+
 /// `view.toolbar_reset_all`: put every toolbar tab's buttons back to their defaults (#11471).
 /// It takes no parameters.
 #[derive(Debug, Deserialize, JsonSchema)]

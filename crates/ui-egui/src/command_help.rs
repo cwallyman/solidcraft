@@ -338,6 +338,7 @@ pub const DOCUMENTED: &[&str] = &[
     "view.save",
     "view.spin",
     "view.tool",
+    "view.touch_layout",
     "view.visual_style",
 ];
 

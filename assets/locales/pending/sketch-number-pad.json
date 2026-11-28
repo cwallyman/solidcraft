@@ -3,5 +3,40 @@
     "sketch.number_pad.clear": "Clear",
     "sketch.number_pad.esc": "Esc",
     "sketch.number_pad.ok": "OK"
+  },
+  "ar": {
+    "sketch.number_pad.clear": "مسح",
+    "sketch.number_pad.esc": "Esc",
+    "sketch.number_pad.ok": "موافق"
+  },
+  "de": {
+    "sketch.number_pad.clear": "Löschen",
+    "sketch.number_pad.esc": "Esc",
+    "sketch.number_pad.ok": "OK"
+  },
+  "he": {
+    "sketch.number_pad.clear": "נקה",
+    "sketch.number_pad.esc": "Esc",
+    "sketch.number_pad.ok": "אישור"
+  },
+  "ja": {
+    "sketch.number_pad.clear": "クリア",
+    "sketch.number_pad.esc": "Esc",
+    "sketch.number_pad.ok": "OK"
+  },
+  "ko": {
+    "sketch.number_pad.clear": "지우기",
+    "sketch.number_pad.esc": "Esc",
+    "sketch.number_pad.ok": "확인"
+  },
+  "vi": {
+    "sketch.number_pad.clear": "Xóa",
+    "sketch.number_pad.esc": "Esc",
+    "sketch.number_pad.ok": "OK"
+  },
+  "zh": {
+    "sketch.number_pad.clear": "清除",
+    "sketch.number_pad.esc": "Esc",
+    "sketch.number_pad.ok": "确定"
   }
 }

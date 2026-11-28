@@ -392,6 +392,7 @@ pub mod tool_modifiers;
 pub mod toolbar;
 pub mod toolbar_custom;
 pub mod tools;
+mod touch;
 pub use solidcraft_ui_kit as ui_kit;
 #[cfg(test)]
 mod ui_kit_guard_tests;
@@ -1910,6 +1911,9 @@ impl SolveApp {
                     let on = v.get("on").and_then(Value::as_bool).unwrap_or(!self.preferences.ribbon_tabs_only);
                     self.preferences.ribbon_tabs_only = on;
                     self.ui.ribbon_open = false;
+                }
+                "view.touch_layout" => {
+                    self.preferences.touch_layout = v.get("on").and_then(Value::as_bool).unwrap_or(!self.preferences.touch_layout);
                 }
                 // An edit OK'd on a feature behind the history marker changes nothing in the view:
                 // say why, or the edit looks as if it had silently failed (#8100).

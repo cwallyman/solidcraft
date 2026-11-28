@@ -781,6 +781,8 @@ enum FileAction {
     ViewDxf,
     Properties,
     Settings,
+    /// Switch the iPad layout (`view.touch_layout`).
+    TouchLayout,
     Shortcuts,
     Crashes,
     About,
@@ -940,6 +942,11 @@ fn rail(app: &SolveApp) -> Vec<start_page::RailItem<'_, FileAction>> {
         if index == 4 || index == 8 {
             rail.push(start_page::RailItem::Separator);
         }
+        // The iPad layout's switch sits between Preferences and Keyboard shortcuts (on by default
+        // on iPad; off elsewhere, for a touch screen Mac or PC).
+        if id == "home:shortcuts" {
+            rail.push(start_page::RailItem::Entry(touch_layout_entry(app, busy)));
+        }
         rail.push(start_page::RailItem::Entry(start_page::RailEntry {
             id: id.into(),
             label,
@@ -962,6 +969,19 @@ fn rail(app: &SolveApp) -> Vec<start_page::RailItem<'_, FileAction>> {
         }));
     }
     rail
+}
+
+/// Home's switch for the iPad layout, saying whether it is on.
+fn touch_layout_entry(app: &SolveApp, busy: bool) -> start_page::RailEntry<'_, FileAction> {
+    let key = if app.preferences.touch_layout { "home.touch_layout_on" } else { "home.touch_layout_off" };
+    start_page::RailEntry {
+        id: "home:touch_layout".into(),
+        label: app.tr(key).into(),
+        shortcut: String::new().into(),
+        selected: false,
+        enabled: !busy,
+        chosen: FileAction::TouchLayout,
+    }
 }
 
 fn start_body(app: &SolveApp) -> start_page::Start<'_, FileAction> {
@@ -1255,6 +1275,11 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, action: FileAction) {
             app.start("document.metadata");
         }
         FileAction::Settings => crate::prefs::open_at(app, 0),
+        FileAction::TouchLayout => {
+            if let Err(e) = app.run("view.touch_layout", serde_json::json!({})) {
+                app.set_status(e.to_string(), true);
+            }
+        }
         FileAction::Shortcuts => {
             app.keymap.open = true;
             app.keymap.read_only = true;

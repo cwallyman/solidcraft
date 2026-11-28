@@ -76,6 +76,13 @@ browser): iCloud Drive, On My iPad, or another file provider.
 - A **trackpad or mouse** click is a click, as on a computer: it replaces the selection, and
   Shift-click adds.
 
+## iPad layout
+
+**iPad layout** is on by default on iPad and off on a Mac or PC (for a touch screen, turn it on).
+It is switched on Home (**iPad layout: on/off**, between Preferences and Keyboard shortcuts), in
+Preferences › Interface › Window, or with the `view.touch_layout` command. With it on, the
+interface is drawn a little larger and a tap a few points beside a control still reaches it.
+
 ## Typing values
 
 While a sketch tool draws, its value boxes (Length, Angle, Width…) stay beside the shape and keep

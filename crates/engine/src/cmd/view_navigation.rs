@@ -11,8 +11,8 @@ use crate::schema::view_navigation::{
     LayoutResult, NavigateParams, NavigateResult, NavigationBarParams, NavigationBarResult, NavigationTool, NavigatorParams, NormalToParams,
     PerspectiveParams, PerspectiveResult, PresetQuality, RenderBrowser, RenderFocus, RenderLive, RenderPanelVisibilityParams,
     RenderPanelVisibilityResult, RenderSelect, RenderStageParams, RenderStageResult, RibbonTabsOnly, RibbonTabsOnlyParams, StandardViewParams,
-    TabStep, TabStepParams, ToolParams, ToolResult, ToolbarResetAll, ToolbarResetAllParams, VisualStyle, VisualStyleParams, VisualStyleResult,
-    ZoomTool,
+    TabStep, TabStepParams, ToolParams, ToolResult, ToolbarResetAll, ToolbarResetAllParams, TouchLayout, TouchLayoutParams, VisualStyle,
+    VisualStyleParams, VisualStyleResult, ZoomTool,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{Result, Sel, Session};
@@ -29,6 +29,7 @@ const TAB_STEP_CONTRACT: TypedContract<TabStepParams> = TypedContract::new();
 const STANDARD_VIEW_CONTRACT: TypedContract<StandardViewParams> = TypedContract::new();
 const NORMAL_TO_CONTRACT: TypedContract<NormalToParams> = TypedContract::new();
 const RIBBON_TABS_ONLY_CONTRACT: TypedContract<RibbonTabsOnlyParams> = TypedContract::new();
+const TOUCH_LAYOUT_CONTRACT: TypedContract<TouchLayoutParams> = TypedContract::new();
 const TOOLBAR_RESET_ALL_CONTRACT: TypedContract<ToolbarResetAllParams> = TypedContract::new();
 const LAYOUT_CONTRACT: TypedContract<LayoutParams> = TypedContract::new();
 const HISTORY_LAYOUT_CONTRACT: TypedContract<HistoryLayoutParams> = TypedContract::new();
@@ -114,6 +115,9 @@ CommandSpec::new("view.navigator", "Custom View Navigator", crate::checked!("vie
 CommandSpec::new("view.ribbon_tabs_only", "Ribbon Tabs Only", crate::checked!("view.ribbon_tabs_only", ribbon_tabs_only))
     .icon("chevron").noundo().doc_only().contract(&RIBBON_TABS_ONLY_CONTRACT).output(output_schema_for::<RibbonTabsOnly>)
     .params("on?: bool (omitted: switch) → on?; fold the ribbon to its tab row, a tab click shows its panels over the view (window setting)"),
+CommandSpec::new("view.touch_layout", "iPad Layout", crate::checked!("view.touch_layout", touch_layout))
+    .icon("chevron").noundo().doc_only().contract(&TOUCH_LAYOUT_CONTRACT).output(output_schema_for::<TouchLayout>)
+    .params("on?: bool (omitted: switch) → on?; the iPad layout: larger controls that a tap near them reaches (window setting)"),
 CommandSpec::new("view.toolbar_reset_all", "Reset All Toolbar Tabs", crate::checked!("view.toolbar_reset_all", toolbar_reset_all))
     .icon("restore").noundo().doc_only().contract(&TOOLBAR_RESET_ALL_CONTRACT).output(output_schema_for::<ToolbarResetAll>)
     .params("{} → {}; put the buttons of every toolbar tab back to their defaults (window setting; hidden tabs stay hidden); never asks"),
@@ -405,6 +409,18 @@ fn ribbon_tabs_only(_s: &mut Session, p: &Value) -> Result<Value> {
     };
     let request: RibbonTabsOnlyParams = serde_json::from_value(p).map_err(|e| bad(cmd, e.to_string()))?;
     serde_json::to_value(RibbonTabsOnly { on: request.on, param_warnings: Vec::new() }).map_err(|e| crate::EngineError::Other(e.to_string()))
+}
+
+/// `view.touch_layout`: check the request and echo it; the window switches its iPad layout.
+fn touch_layout(_s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "view.touch_layout";
+    let p = match p {
+        Value::Null => json!({}),
+        Value::Object(_) => p.clone(),
+        _ => return Err(bad(cmd, "parameters must be an object")),
+    };
+    let request: TouchLayoutParams = serde_json::from_value(p).map_err(|e| bad(cmd, e.to_string()))?;
+    serde_json::to_value(TouchLayout { on: request.on, param_warnings: Vec::new() }).map_err(|e| crate::EngineError::Other(e.to_string()))
 }
 
 /// `view.toolbar_reset_all`: check that the call has no parameters. The window then resets its
@@ -794,6 +810,18 @@ mod tests {
         let normal = s.execute("view.normal_to", &json!({})).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(!normal.contains("a drawing is open"), "{normal}");
         assert_eq!((s.doc.to_json(), s.undo.len()), (before, undo));
+    }
+
+    #[test]
+    fn touch_layout_echoes_the_request_without_editing_the_design() {
+        let mut s = Session::default();
+        assert_eq!(s.execute("view.touch_layout", &json!({})).unwrap(), json!({}));
+        for on in [true, false] {
+            assert_eq!(s.execute("view.touch_layout", &json!({"on": on})).unwrap(), json!({"on": on}));
+        }
+        for params in [json!({"on": "yes"}), json!({"other": true}), json!(3)] {
+            assert!(s.execute("view.touch_layout", &params).is_err(), "{params}");
+        }
     }
 
     #[test]

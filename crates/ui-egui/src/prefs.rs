@@ -1588,6 +1588,10 @@ preference_settings! {
     /// click shows its panels over the view until a command starts or the pointer leaves them.
     /// Off by default: the whole ribbon shows. `view.ribbon_tabs_only` switches it.
     ribbon_tabs_only: bool = false, PAGE_LAYOUT;
+    /// iPad layout: the interface a little larger, and a tap near a control (not only on it)
+    /// counts, for fingers and the Apple Pencil. On by default on iPad, which is new; off
+    /// elsewhere, as before. Home's rail and Settings › Layout switch it.
+    touch_layout: bool = cfg!(target_os = "ios"), PAGE_LAYOUT;
     /// Constraints pinned to the sketch ribbon's Constrain panel are drawn as small cells in its
     /// constraint grid, like the default six. Off: they are full-size buttons, as before.
     pinned_constraints_in_grid: bool = true, PAGE_LAYOUT;
@@ -2890,7 +2894,8 @@ pub fn apply(app: &mut SolveApp, ctx: &egui::Context) {
     }
     // Scaling while the pointer is held moves the slider under the pointer, feeding a
     // different value back into it. Commit the layout change after the drag ends.
-    let z = app.preferences.ui_scale.clamp(0.5, 2.5);
+    let z = app.preferences.ui_scale.clamp(0.5, 2.5) * crate::touch::scale(app.preferences.touch_layout);
+    crate::touch::apply(ctx, app.preferences.touch_layout);
     if z.is_finite() && !ctx.input(|i| i.pointer.any_down()) && (ctx.zoom_factor() - z).abs() > 1e-3 {
         ctx.set_zoom_factor(z);
     }

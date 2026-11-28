@@ -1984,7 +1984,8 @@ fn an_organizations_policy_says_managed_by_in_the_bar_preferences_and_about() {
 #[test]
 fn the_links_stay_in_help_about_and_home_when_the_pills_are_off() {
     let mut h = Harness::new();
-    h.call("ui.resize", json!({"width":1280,"height":720}));
+    // Tall enough for Home's whole rail: at 720 the last link scrolls below the window.
+    h.call("ui.resize", json!({"width":1280,"height":800}));
     h.call("ui.prefs", json!({"show_donate_button": false, "show_discord_button": false}));
     h.app.home.open = false;
     h.settle();
